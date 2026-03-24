@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 1/6] moe-flash: add eval callback for expert routing
+Subject: [PATCH 1/7] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 2/6] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 2/7] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 3/6] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 3/7] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 4/6] moe-flash: add io_uring expert reads with staging buffers
+Subject: [PATCH 4/7] moe-flash: add io_uring expert reads with staging buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
 with LLAMA_FLASH_MOE_IOURING=1 and built with -DGGML_IOURING=ON:
@@ -1211,7 +1211,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 5/6] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 5/7] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1297,7 +1297,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 6/6] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 6/7] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1767,6 +1767,39 @@ index d0d02bead..9efff7012 100644
      // Close file descriptors
      for (auto & layer : ctx->layers) {
          for (auto & expert : layer.experts) {
+-- 
+2.51.1
+
+
+From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 02:25:26 +0000
+Subject: [PATCH 7/7] moe-flash: fall back to HF_SOURCE env for GGUF path
+
+---
+ src/llama-moe-flash.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index 9efff7012..f79ae43bd 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -881,7 +881,15 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     (void)want_iouring; // may be unused if not compiled with GGML_USE_IOURING
+ 
+     // GGUF path for page cache warming mode (Phase 3)
++    // Try LLAMA_FLASH_MOE_GGUF_PATH first, fall back to HF_SOURCE
+     const char * gguf_path_env = getenv("LLAMA_FLASH_MOE_GGUF_PATH");
++    if (gguf_path_env && gguf_path_env[0] == '$') {
++        // Env var substitution didn't resolve (ordering issue), ignore
++        gguf_path_env = nullptr;
++    }
++    if (!gguf_path_env) {
++        gguf_path_env = getenv("HF_SOURCE");
++    }
+     ctx->gguf_warmcache = false;
+     ctx->gguf_src.fd = -1;
+ 
 -- 
 2.51.1
 
