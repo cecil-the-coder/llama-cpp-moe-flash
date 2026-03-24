@@ -58,3 +58,8 @@ RUN ldconfig
 # Verify the patched binary has moe-flash
 RUN llama-server --version 2>&1 | head -1 && \
     nm -D /lib64/libllama.so.0 | grep -q moe_flash && echo "moe-flash symbols: OK"
+
+# Default env vars for MoE flash expert streaming
+ENV LLAMA_ARG_CPU_MOE=1
+ENV LLAMA_FLASH_MOE_ENABLED=1
+ENV LLAMA_FLASH_MOE_IOURING=1
