@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 1/9] moe-flash: add eval callback for expert routing
+Subject: [PATCH 01/10] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 2/9] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 02/10] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 3/9] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 03/10] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,8 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 4/9] moe-flash: add io_uring expert reads with staging buffers
+Subject: [PATCH 04/10] moe-flash: add io_uring expert reads with staging
+ buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
 with LLAMA_FLASH_MOE_IOURING=1 and built with -DGGML_IOURING=ON:
@@ -1211,7 +1212,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 5/9] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 05/10] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1297,7 +1298,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 6/9] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 06/10] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1774,7 +1775,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 7/9] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 07/10] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1807,7 +1808,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 8/9] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 08/10] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2210,7 +2211,7 @@ index 59af6bdab..f1504c256 100644
 From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 03:19:38 +0000
-Subject: [PATCH 9/9] moe-flash: add multi-shard GGUF support
+Subject: [PATCH 09/10] moe-flash: add multi-shard GGUF support
 
 Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
 merging their MoE layer maps. Each layer tracks which shard fd to use
@@ -2457,6 +2458,52 @@ index c47fafa2c..f531fc6d7 100644
  
      // Close file descriptors
      for (auto & layer : ctx->layers) {
+-- 
+2.51.1
+
+
+From 175feb3698e0092869eed00c8955c4da8e37a8fa Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 07:29:05 +0000
+Subject: [PATCH 10/10] ggml-vulkan: enable buffer_from_host_ptr when
+ external_memory_host is available
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Vulkan backend hardcodes buffer_from_host_ptr=false despite having
+a working VK_EXT_external_memory_host implementation. This forces the
+model loader to allocate a SEPARATE Vulkan buffer and memcpy all weight
+data into it, doubling memory usage.
+
+On UMA systems (e.g., AMD Strix Halo), this causes OOM for large models:
+228 GB model → 228 GB mmap + 228 GB Vulkan copy = 456 GB on 125 GB RAM.
+
+With this fix, the model loader uses buffer_from_host_ptr to wrap the
+mmap'd GGUF data directly as a Vulkan buffer — zero copy, zero additional
+memory. The VK_EXT_external_memory_host import creates a Vulkan memory
+object backed by the existing mmap pages.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 61d112c50..8714c50d3 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -14942,10 +14942,11 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
+     props->type        = ggml_backend_vk_device_get_type(dev);
+     props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
+     ggml_backend_vk_device_get_memory(dev, &props->memory_free, &props->memory_total);
++    auto device = ggml_vk_get_device(ctx->device);
+     props->caps = {
+         /* .async                 = */ true,
+         /* .host_buffer           = */ true,
+-        /* .buffer_from_host_ptr  = */ false,
++        /* .buffer_from_host_ptr  = */ device->external_memory_host,
+         /* .events                = */ true,
+     };
+ }
 -- 
 2.51.1
 
