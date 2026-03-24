@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 01/13] moe-flash: add eval callback for expert routing
+Subject: [PATCH 01/14] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 02/13] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 02/14] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 03/13] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 03/14] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 04/13] moe-flash: add io_uring expert reads with staging
+Subject: [PATCH 04/14] moe-flash: add io_uring expert reads with staging
  buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
@@ -1212,7 +1212,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 05/13] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 05/14] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1298,7 +1298,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 06/13] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 06/14] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1775,7 +1775,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 07/13] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 07/14] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1808,7 +1808,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 08/13] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 08/14] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2211,7 +2211,7 @@ index 59af6bdab..f1504c256 100644
 From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 03:19:38 +0000
-Subject: [PATCH 09/13] moe-flash: add multi-shard GGUF support
+Subject: [PATCH 09/14] moe-flash: add multi-shard GGUF support
 
 Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
 merging their MoE layer maps. Each layer tracks which shard fd to use
@@ -2465,7 +2465,7 @@ index c47fafa2c..f531fc6d7 100644
 From 175feb3698e0092869eed00c8955c4da8e37a8fa Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 07:29:05 +0000
-Subject: [PATCH 10/13] ggml-vulkan: enable buffer_from_host_ptr when
+Subject: [PATCH 10/14] ggml-vulkan: enable buffer_from_host_ptr when
  external_memory_host is available
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2511,7 +2511,7 @@ index 61d112c50..8714c50d3 100644
 From 2e2670c5d00622e51f0d5f45f424d430c7b2ec47 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:10:41 +0000
-Subject: [PATCH 11/13] ggml-vulkan: add GTT size check and fallback for
+Subject: [PATCH 11/14] ggml-vulkan: add GTT size check and fallback for
  buffer_from_host_ptr
 
 On UMA systems, imported host memory counts against the GTT limit.
@@ -2584,7 +2584,7 @@ index 6cc28eff2..a458a441a 100644
 From 59501d0daa5deccfa8ce939223dcd145e8e262b5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:22:15 +0000
-Subject: [PATCH 12/13] llama-model: disable mmap prefetch when model exceeds
+Subject: [PATCH 12/14] llama-model: disable mmap prefetch when model exceeds
  available memory
 
 The model loader calls posix_madvise(MADV_WILLNEED) on the entire
@@ -2649,7 +2649,7 @@ index a458a441a..3da3c9574 100644
 From ddac10b9cfaf76c0f8a51c9d22c1d797f85ce589 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 11:59:58 +0000
-Subject: [PATCH 13/13] ggml-vulkan: fix buffer_from_host_ptr size alignment
+Subject: [PATCH 13/14] ggml-vulkan: fix buffer_from_host_ptr size alignment
  and remove GTT check
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2705,6 +2705,125 @@ index 7438cf34f..a8db4c66d 100644
      vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
  
      if (!buf) {
+-- 
+2.51.1
+
+
+From e18056cb7e1970f6c26cf2b3b73fc306b5c06986 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 12:49:00 +0000
+Subject: [PATCH 14/14] ggml-vulkan: lazy import of CPU expert buffers on UMA
+ for GPU MUL_MAT_ID
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two changes that together allow --cpu-moe expert matmul to run on Vulkan GPU:
+
+1. supports_buft: On UMA with external_memory_host, report support for CPU
+   host buffers. This makes the scheduler route MUL_MAT_ID to Vulkan
+   instead of CPU, even when expert weights are on CPU buffer (--cpu-moe).
+
+2. mul_mat_id: When src0 (expert weights) is on CPU buffer and not found
+   in pinned_memory, lazily import via buffer_from_host_ptr. The import
+   is cached in pinned_memory for subsequent calls. On UMA, this wraps
+   existing mmap'd pages as a Vulkan buffer with zero data movement.
+
+The result: with --cpu-moe, expert tensors load as mmap (no Vulkan
+allocation, fits any model size) but MUL_MAT_ID runs on the Vulkan GPU
+(importing each expert tensor on first access). Imports that exceed GTT
+will fail, causing an abort — graceful degradation TBD.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 44 ++++++++++++++++++++++++----
+ 1 file changed, 39 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a8db4c66d..5d7003591 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8092,6 +8092,9 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
+     }
+ }
+ 
++// Forward declaration (defined later, needed for lazy CPU buffer import on UMA)
++static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
++
+ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+     VK_LOG_DEBUG("ggml_vk_mul_mat_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
+     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
+@@ -8125,7 +8128,11 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     const uint64_t n_as = ne02;
+ 
+     ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+-    ggml_backend_vk_buffer_context * src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
++    // src0 may be on a CPU buffer (--cpu-moe on UMA). Only cast if it's a Vulkan buffer.
++    ggml_backend_vk_buffer_context * src0_buf_ctx = nullptr;
++    if (src0->buffer && src0->buffer->buft && src0->buffer->buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
++        src0_buf_ctx = (ggml_backend_vk_buffer_context *)src0->buffer->context;
++    }
+     ggml_backend_vk_buffer_context * src1_buf_ctx = (ggml_backend_vk_buffer_context *)src1->buffer->context;
+     ggml_backend_vk_buffer_context * ids_buf_ctx = (ggml_backend_vk_buffer_context *)ids->buffer->context;
+ 
+@@ -8144,6 +8151,22 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
+         ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
+         ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
++
++        // On UMA with --cpu-moe: expert tensors are on CPU buffer, not in pinned_memory.
++        // Try to import them via VK_EXT_external_memory_host (zero-copy on UMA).
++        // The import is cached in pinned_memory for subsequent calls.
++        if (d_Qx == nullptr && src0->data != nullptr && ctx->device->external_memory_host) {
++            size_t src0_nbytes = ggml_nbytes(src0);
++            vk_buffer imported = ggml_vk_buffer_from_host_ptr(ctx->device, src0->data, src0_nbytes);
++            if (imported) {
++                // Register in pinned_memory so ggml_vk_host_get finds it next time
++                std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
++                ctx->device->pinned_memory.push_back(std::make_tuple(imported->ptr, src0_nbytes, imported));
++                d_Qx = imported;
++                qx_buf_offset = 0;
++            }
++        }
++
+         src0_uma = d_Qx != nullptr;
+         src1_uma = d_Qy != nullptr;
+         ids_uma = d_ids != nullptr;
+@@ -8269,6 +8292,10 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     vk_buffer d_Y;
+     uint64_t y_buf_offset = 0;
+     if (!src0_uma) {
++        if (src0_buf_ctx == nullptr) {
++            // src0 is on CPU and UMA import failed — can't run on Vulkan
++            GGML_ABORT("MUL_MAT_ID: src0 on CPU but Vulkan import failed on UMA");
++        }
+         d_Qx = src0_buf_ctx->dev_buffer;
+         qx_buf_offset = vk_tensor_offset(src0) + src0->view_offs;
+         GGML_ASSERT(d_Qx != nullptr);
+@@ -15488,14 +15515,21 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+ }
+ 
+ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+-    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
+-        return false;
++    if (buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
++        ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
++        ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
++        return buft_ctx->device->idx == ctx->device;
+     }
+ 
++    // On UMA with external_memory_host, Vulkan can access CPU host buffers directly
++    // by lazily importing them. This allows MUL_MAT_ID with --cpu-moe to run on GPU.
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+-    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
++    auto device = ggml_vk_get_device(ctx->device);
++    if (device->uma && device->external_memory_host && ggml_backend_buft_is_host(buft)) {
++        return true;
++    }
+ 
+-    return buft_ctx->device->idx == ctx->device;
++    return false;
+ }
+ 
+ static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
 -- 
 2.51.1
 
