@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 01/11] moe-flash: add eval callback for expert routing
+Subject: [PATCH 01/12] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 02/11] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 02/12] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 03/11] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 03/12] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 04/11] moe-flash: add io_uring expert reads with staging
+Subject: [PATCH 04/12] moe-flash: add io_uring expert reads with staging
  buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
@@ -1212,7 +1212,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 05/11] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 05/12] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1298,7 +1298,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 06/11] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 06/12] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1775,7 +1775,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 07/11] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 07/12] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1808,7 +1808,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 08/11] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 08/12] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2211,7 +2211,7 @@ index 59af6bdab..f1504c256 100644
 From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 03:19:38 +0000
-Subject: [PATCH 09/11] moe-flash: add multi-shard GGUF support
+Subject: [PATCH 09/12] moe-flash: add multi-shard GGUF support
 
 Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
 merging their MoE layer maps. Each layer tracks which shard fd to use
@@ -2465,7 +2465,7 @@ index c47fafa2c..f531fc6d7 100644
 From 175feb3698e0092869eed00c8955c4da8e37a8fa Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 07:29:05 +0000
-Subject: [PATCH 10/11] ggml-vulkan: enable buffer_from_host_ptr when
+Subject: [PATCH 10/12] ggml-vulkan: enable buffer_from_host_ptr when
  external_memory_host is available
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2511,7 +2511,7 @@ index 61d112c50..8714c50d3 100644
 From 2e2670c5d00622e51f0d5f45f424d430c7b2ec47 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:10:41 +0000
-Subject: [PATCH 11/11] ggml-vulkan: add GTT size check and fallback for
+Subject: [PATCH 11/12] ggml-vulkan: add GTT size check and fallback for
  buffer_from_host_ptr
 
 On UMA systems, imported host memory counts against the GTT limit.
@@ -2577,6 +2577,71 @@ index 6cc28eff2..a458a441a 100644
              ggml_backend_buffer_t buf;
              if (ml.no_alloc) {
                  buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+-- 
+2.51.1
+
+
+From 59501d0daa5deccfa8ce939223dcd145e8e262b5 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 08:22:15 +0000
+Subject: [PATCH 12/12] llama-model: disable mmap prefetch when model exceeds
+ available memory
+
+The model loader calls posix_madvise(MADV_WILLNEED) on the entire
+mmap'd file, paging in all data into the page cache. For models
+larger than RAM (e.g., 228 GB on 125 GB), this causes OOM.
+
+Check MemAvailable from /proc/meminfo and skip prefetch when the
+total model size exceeds it. Expert data is then paged in on demand
+during inference, which works correctly with --cpu-moe since only
+the selected experts (e.g., 8/256 = 3%) are accessed per token.
+---
+ src/llama-model.cpp | 32 +++++++++++++++++++++++++++++++-
+ 1 file changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a458a441a..3da3c9574 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -7489,7 +7489,37 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+ 
+     ml.done_getting_tensors();
+ 
+-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    // Disable mmap prefetch if model is larger than available memory.
++    // Prefetching pages in the entire model, which OOMs for models > RAM.
++    // With --cpu-moe, experts stay mmap'd and are paged in on demand.
++    bool do_prefetch = true;
++    {
++        size_t model_size = 0;
++        for (const auto & file : ml.files) {
++            model_size += file->size();
++        }
++        size_t mem_available = 0;
++#if defined(__linux__)
++        // Read MemAvailable from /proc/meminfo
++        FILE * meminfo = fopen("/proc/meminfo", "r");
++        if (meminfo) {
++            char line[256];
++            while (fgets(line, sizeof(line), meminfo)) {
++                if (strncmp(line, "MemAvailable:", 13) == 0) {
++                    mem_available = strtoull(line + 13, nullptr, 10) * 1024; // kB to bytes
++                    break;
++                }
++            }
++            fclose(meminfo);
++        }
++#endif
++        if (mem_available > 0 && model_size > mem_available) {
++            LLAMA_LOG_INFO("%s: model size (%.1f GiB) exceeds available memory (%.1f GiB), disabling mmap prefetch\n",
++                    __func__, model_size / (1024.0 * 1024.0 * 1024.0), mem_available / (1024.0 * 1024.0 * 1024.0));
++            do_prefetch = false;
++        }
++    }
++    ml.init_mappings(do_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
 -- 
 2.51.1
 
