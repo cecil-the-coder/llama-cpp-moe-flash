@@ -360,6 +360,7 @@ or implement the staging buffer approach from the original design.
 | glm-4-7-flash | 17 GB | Prefetch thread | 88.5 | **59.0** | Zero overhead confirmed |
 | glm-4-7-flash | 17 GB | Eval callback | — | **25.3** | 2.3x slower (serialized) |
 | qwen3-235b-a22b | 80 GB | Baseline (no flash) | 18.2 | **20.9** | Fits in RAM |
+| qwen3-235b-a22b | 80 GB | buffer_from_host_ptr (full Vulkan) | 16.3 | **20.4** | Zero-copy mmap import |
 | qwen3-235b-a22b | 80 GB | Prefetch thread | 18.3 | **21.0** | Zero overhead |
 | qwen3-235b-a22b | 80 GB | Eval callback | 13.4 | **3.0** | 7x slower |
 | qwen3-235b-a22b | 80 GB | Fadvise (pre-graph) | 17.8 | **14.0** | 21K syscalls overhead |
@@ -379,14 +380,24 @@ or implement the staging buffer approach from the original design.
    - `--no-warmup` (skip initial forward pass that OOMs)
 
 4. **buffer_from_host_ptr** fix (alignment + conditional enable) allows zero-copy mmap
-   import on UMA for models ≤ GTT (120 GB). Needs validation on qwen3-235b.
+   import on UMA for models ≤ GTT (120 GB). **Validated on qwen3-235b (80 GB): 20.4 t/s
+   matching baseline 20.9 t/s.** Zero additional memory allocation.
 
-5. **Models > GTT** (228 GB on 120 GB GTT) can't import via buffer_from_host_ptr.
-   Need staging buffer approach or per-layer import for GPU expert matmul.
+5. **Models > GTT** (228 GB on 120 GB GTT) can't import full model via buffer_from_host_ptr.
+   `--cpu-moe` keeps experts on CPU mmap (no GTT consumption). Expert matmul runs on CPU.
+   GPU expert matmul requires either scheduler modification or staging buffer approach.
 
-6. **GPU memory on UMA** (Strix Halo):
+6. **GPU expert matmul attempted and reverted**: Changed `supports_buft` to accept CPU
+   host buffers on UMA and added lazy `buffer_from_host_ptr` import in
+   `ggml_vk_tensor_subbuffer`. Caused SIGSEGV because many Vulkan functions cast
+   `buffer->context` to `ggml_backend_vk_buffer_context *` without checking buffer type.
+   The approach needs to modify the scheduler's copy path instead of the Vulkan dispatch.
+
+7. **GPU memory on UMA** (Strix Halo):
    - Single memory heap: 125 GB (= physical RAM)
    - Single type: DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT + HOST_CACHED
    - GTT limit: 120 GB (kernel param `amdgpu.gttsize=122880`)
    - VRAM carve-out: 512 MB
    - Vulkan budget: 125 GB, but kernel limits to 120 GB GTT
+   - `VK_EXT_external_memory_host` supported: yes (import host ptrs as Vulkan buffers)
+   - `minImportedHostPointerAlignment`: 4096 bytes

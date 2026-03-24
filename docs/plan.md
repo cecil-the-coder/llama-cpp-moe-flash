@@ -215,13 +215,24 @@ expert tensors to CPU.
     but the destination buffer must be full-size for shader indexing
   - vkAllocateMemory for the full-size copy buffer exceeds GTT/kernel limits
 
-  **Approaches (in order of complexity):**
-  1. Per-layer `buffer_from_host_ptr` import/release: import ~1.5 GB for one layer's
-     expert tensor, dispatch MUL_MAT_ID, release. Never >1.5 GB of extra GTT.
-  2. Compact staging buffer + shader indirection: 8-slot staging buffer, remap expert
-     IDs to dense indices 0-7. Requires GLSL shader changes.
-  3. Modify gallocr to allocate expert copy buffer at K×expert_size instead of
-     N×expert_size. Requires scheduler + shader changes for dense indexing.
+  **Attempted and reverted: lazy import in tensor_subbuffer + supports_buft**
+  Changed `supports_buft` to return true for CPU host buffers on UMA, and added
+  lazy `buffer_from_host_ptr` import in `ggml_vk_tensor_subbuffer`. This caused
+  SIGSEGV because changing backend routing breaks tensor buffer context assumptions
+  throughout the Vulkan codebase (many functions cast `buffer->context` to
+  `ggml_backend_vk_buffer_context *` without checking buffer type).
+
+  **Next approaches (in order of feasibility):**
+  1. **Scheduler copy path with buffer_from_host_ptr destination**: In the scheduler's
+     selective MoE copy (ggml-backend.cpp:1480-1564), use `buffer_from_host_ptr` to
+     wrap the mmap'd expert tensor as the copy DESTINATION. Since source == destination
+     on UMA, the selective copy becomes a no-op. The full-size buffer allocation uses
+     import instead of `vkAllocateMemory` — no new memory. This only modifies
+     `ggml-backend.cpp`, not the Vulkan dispatch code.
+  2. **Compact staging buffer + dense ID remapping**: Allocate K-slot staging buffer,
+     memcpy used experts, remap IDs. Requires shader changes.
+  3. **Per-layer import in a custom op handler**: Register a custom `MUL_MAT_ID`
+     handler for UMA that imports, dispatches, releases per layer.
 
 ---
 
