@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 01/16] moe-flash: add eval callback for expert routing
+Subject: [PATCH 01/17] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 02/16] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 02/17] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 03/16] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 03/17] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 04/16] moe-flash: add io_uring expert reads with staging
+Subject: [PATCH 04/17] moe-flash: add io_uring expert reads with staging
  buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
@@ -1212,7 +1212,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 05/16] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 05/17] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1298,7 +1298,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 06/16] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 06/17] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1775,7 +1775,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 07/16] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 07/17] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1808,7 +1808,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 08/16] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 08/17] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2211,7 +2211,7 @@ index 59af6bdab..f1504c256 100644
 From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 03:19:38 +0000
-Subject: [PATCH 09/16] moe-flash: add multi-shard GGUF support
+Subject: [PATCH 09/17] moe-flash: add multi-shard GGUF support
 
 Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
 merging their MoE layer maps. Each layer tracks which shard fd to use
@@ -2465,7 +2465,7 @@ index c47fafa2c..f531fc6d7 100644
 From 175feb3698e0092869eed00c8955c4da8e37a8fa Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 07:29:05 +0000
-Subject: [PATCH 10/16] ggml-vulkan: enable buffer_from_host_ptr when
+Subject: [PATCH 10/17] ggml-vulkan: enable buffer_from_host_ptr when
  external_memory_host is available
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2511,7 +2511,7 @@ index 61d112c50..8714c50d3 100644
 From 2e2670c5d00622e51f0d5f45f424d430c7b2ec47 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:10:41 +0000
-Subject: [PATCH 11/16] ggml-vulkan: add GTT size check and fallback for
+Subject: [PATCH 11/17] ggml-vulkan: add GTT size check and fallback for
  buffer_from_host_ptr
 
 On UMA systems, imported host memory counts against the GTT limit.
@@ -2584,7 +2584,7 @@ index 6cc28eff2..a458a441a 100644
 From 59501d0daa5deccfa8ce939223dcd145e8e262b5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:22:15 +0000
-Subject: [PATCH 12/16] llama-model: disable mmap prefetch when model exceeds
+Subject: [PATCH 12/17] llama-model: disable mmap prefetch when model exceeds
  available memory
 
 The model loader calls posix_madvise(MADV_WILLNEED) on the entire
@@ -2649,7 +2649,7 @@ index a458a441a..3da3c9574 100644
 From ddac10b9cfaf76c0f8a51c9d22c1d797f85ce589 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 11:59:58 +0000
-Subject: [PATCH 13/16] ggml-vulkan: fix buffer_from_host_ptr size alignment
+Subject: [PATCH 13/17] ggml-vulkan: fix buffer_from_host_ptr size alignment
  and remove GTT check
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2712,7 +2712,7 @@ index 7438cf34f..a8db4c66d 100644
 From e18056cb7e1970f6c26cf2b3b73fc306b5c06986 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 12:49:00 +0000
-Subject: [PATCH 14/16] ggml-vulkan: lazy import of CPU expert buffers on UMA
+Subject: [PATCH 14/17] ggml-vulkan: lazy import of CPU expert buffers on UMA
  for GPU MUL_MAT_ID
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2831,7 +2831,7 @@ index a8db4c66d..5d7003591 100644
 From 0b289f8981114c3ddba73ef67b802b60bd24879b Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 15:43:28 +0000
-Subject: [PATCH 15/16] ggml-vulkan: move lazy import to tensor_subbuffer for
+Subject: [PATCH 15/17] ggml-vulkan: move lazy import to tensor_subbuffer for
  all MUL_MAT paths
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2915,7 +2915,7 @@ index 5d7003591..cb7834f50 100644
 From 478431a89cfc0d22fee60fd82bccdb5f95b75d3c Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 16:54:50 +0000
-Subject: [PATCH 16/16] revert: remove lazy import and supports_buft changes
+Subject: [PATCH 16/17] revert: remove lazy import and supports_buft changes
  (causing SIGSEGV)
 
 ---
@@ -3035,6 +3035,87 @@ index cb7834f50..a8db4c66d 100644
  }
  
  static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
+-- 
+2.51.1
+
+
+From 4f8831825ecdcbc93172d363756f536691aa2e2c Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 18:17:20 +0000
+Subject: [PATCH 17/17] llama: allow Vulkan_Host buffer import on UMA for
+ --cpu-moe experts
+
+Two changes that together enable GPU expert matmul with --cpu-moe on UMA:
+
+1. llama-model-loader.cpp: Skip the host-buffer-to-CPU downgrade when
+   the device supports buffer_from_host_ptr (UMA with external_memory_host).
+   Expert tensors stay on Vulkan_Host instead of plain CPU.
+
+2. llama-model.cpp: Allow buffer_from_host_ptr for host buffer type
+   (not just the default device buffer type). This imports the mmap'd
+   expert data as Vulkan host memory, registered in pinned_memory.
+
+Result: --cpu-moe expert tensors are on Vulkan_Host (GPU-accessible via
+pinned_memory) instead of plain CPU. The scheduler routes MUL_MAT_ID to
+Vulkan because the buffer type is Vulkan-compatible. The data is imported
+via buffer_from_host_ptr (zero-copy on UMA).
+
+If import fails (exceeds GTT), falls back to alloc+copy. If that fails
+too, the model loader falls back to the non-import path.
+---
+ src/llama-model-loader.cpp | 19 ++++++++++++++-----
+ src/llama-model.cpp        |  3 ++-
+ 2 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 413f34c22..8d50e5c4d 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1147,14 +1147,23 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+             }
+         }
+ 
+-        // avoid using a host buffer when using mmap
++        // avoid using a host buffer when using mmap — except on UMA where
++        // host buffers are GPU-accessible and can be imported via buffer_from_host_ptr
+         auto * buft_dev = ggml_backend_buft_get_device(buft);
+         if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+-            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+-            if (!cpu_dev) {
+-                throw std::runtime_error("no CPU backend found");
++            ggml_backend_dev_props dev_props;
++            ggml_backend_dev_get_props(buft_dev, &dev_props);
++            if (!dev_props.caps.buffer_from_host_ptr) {
++                // Non-UMA or no external memory host: downgrade to plain CPU
++                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
++                if (!cpu_dev) {
++                    throw std::runtime_error("no CPU backend found");
++                }
++                buft = ggml_backend_dev_buffer_type(cpu_dev);
+             }
+-            buft = ggml_backend_dev_buffer_type(cpu_dev);
++            // On UMA with buffer_from_host_ptr: keep as Vulkan_Host so the
++            // buffer gets imported via buffer_from_host_ptr and registered
++            // in pinned_memory, making it GPU-accessible for MUL_MAT_ID.
+         }
+ 
+         if (buft != buft_list->front().second) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3da3c9574..11c5cd23e 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -7554,9 +7554,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+         ggml_backend_dev_get_props(dev, &props);
+         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
++        bool is_host_buft = buft == ggml_backend_dev_host_buffer_type(dev);
+ 
+         std::vector<ggml_backend_buffer_ptr> bufs;
+-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && (is_default_buft || is_host_buft)) {
+             GGML_ASSERT(!ml.no_alloc);
+             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
 -- 
 2.51.1
 
