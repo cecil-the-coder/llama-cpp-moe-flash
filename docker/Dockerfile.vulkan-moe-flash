@@ -39,11 +39,22 @@ RUN dnf install -y --setopt=install_weak_deps=False liburing && dnf clean all
 # Fix ld symlink
 RUN ln -sf /usr/bin/ld.bfd /usr/bin/ld 2>/dev/null || true
 
-# Copy built artifacts over the existing binaries
-COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/bin/llama-server
-COPY --from=builder /build/llama.cpp/build/bin/libllama.so* /lib64/
-COPY --from=builder /build/llama.cpp/build/bin/libggml*.so* /lib64/
-COPY --from=builder /build/llama.cpp/build/bin/libmtmd.so* /lib64/
+# Remove ALL old llama.cpp libraries (including versioned names like .so.0.0.8298)
+RUN rm -f /usr/bin/llama-server && \
+    find /lib64 -name 'libllama.so*' -delete && \
+    find /lib64 -name 'libggml*.so*' -delete && \
+    find /lib64 -name 'libmtmd.so*' -delete
 
-# Verify
-RUN llama-server --version
+# Install patched binary and libraries
+COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/bin/llama-server
+COPY --from=builder /build/llama.cpp/build/bin/libllama.so.0   /lib64/libllama.so.0
+COPY --from=builder /build/llama.cpp/build/bin/libggml.so.0    /lib64/libggml.so.0
+COPY --from=builder /build/llama.cpp/build/bin/libggml-base.so.0   /lib64/libggml-base.so.0
+COPY --from=builder /build/llama.cpp/build/bin/libggml-cpu.so.0    /lib64/libggml-cpu.so.0
+COPY --from=builder /build/llama.cpp/build/bin/libggml-vulkan.so.0 /lib64/libggml-vulkan.so.0
+COPY --from=builder /build/llama.cpp/build/bin/libmtmd.so.0   /lib64/libmtmd.so.0
+RUN ldconfig
+
+# Verify the patched binary has moe-flash
+RUN llama-server --version 2>&1 | head -1 && \
+    nm -D /lib64/libllama.so.0 | grep -q moe_flash && echo "moe-flash symbols: OK"
