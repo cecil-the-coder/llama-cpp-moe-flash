@@ -197,13 +197,22 @@ expert tensors to CPU.
   Vulkan uses 10.7 GB (8.5% of GTT). Expert matmul on CPU.
 
 - [ ] **P3.7** — Get expert matmul on Vulkan GPU
-  Current bottleneck: `--cpu-moe` routes MUL_MAT_ID to CPU backend because expert
-  tensors are on `ggml_backend_cpu_buffer_type`. On UMA, CPU memory IS GPU-accessible.
-  Approaches:
-  1. Register CPU mmap'd expert buffers as Vulkan host memory (pinned_memory)
-  2. Use `--override-tensor` with Vulkan_Host buffer type instead of CPU
-  3. Patch scheduler to route MUL_MAT_ID to Vulkan when UMA + host-accessible
-  4. Implement staging buffer copy: small Vulkan buffer, copy used experts per token
+  Current: `--cpu-moe` routes MUL_MAT_ID to CPU (1.37 t/s). Expert matmul on GPU
+  would be significantly faster.
+
+  **Tested and failed:**
+  - Full `buffer_from_host_ptr` import (228 GB): OOMs the node. Kernel can't handle
+    228 GB of VK_EXT_external_memory_host imports on 125 GB RAM, even with the
+    alignment fix and prefetch disabled.
+
+  **Remaining approach: Staging buffer per MUL_MAT_ID dispatch**
+  - Allocate a Vulkan staging buffer (~120 MB for top-8 experts)
+  - In `ggml_vk_mul_mat_id_q_f16`, detect CPU-resident src0 on UMA
+  - Read the routing IDs, memcpy only used experts from mmap into staging
+  - Bind staging as d_Qx for the shader dispatch
+  - On UMA, memcpy is ~200 GB/s → 120 MB in ~0.6ms
+  - This adds ~0.6ms per layer (61 layers × 0.6ms = ~37ms/token overhead)
+  - With GPU matmul speedup (10-50x vs CPU), net result should be much faster
 
 ---
 
