@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 01/19] moe-flash: add eval callback for expert routing
+Subject: [PATCH 01/20] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 02/19] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 02/20] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 03/19] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 03/20] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 04/19] moe-flash: add io_uring expert reads with staging
+Subject: [PATCH 04/20] moe-flash: add io_uring expert reads with staging
  buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
@@ -1212,7 +1212,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 05/19] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 05/20] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1298,7 +1298,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 06/19] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 06/20] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1775,7 +1775,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 07/19] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 07/20] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1808,7 +1808,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 08/19] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 08/20] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2211,7 +2211,7 @@ index 59af6bdab..f1504c256 100644
 From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 03:19:38 +0000
-Subject: [PATCH 09/19] moe-flash: add multi-shard GGUF support
+Subject: [PATCH 09/20] moe-flash: add multi-shard GGUF support
 
 Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
 merging their MoE layer maps. Each layer tracks which shard fd to use
@@ -2465,7 +2465,7 @@ index c47fafa2c..f531fc6d7 100644
 From 175feb3698e0092869eed00c8955c4da8e37a8fa Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 07:29:05 +0000
-Subject: [PATCH 10/19] ggml-vulkan: enable buffer_from_host_ptr when
+Subject: [PATCH 10/20] ggml-vulkan: enable buffer_from_host_ptr when
  external_memory_host is available
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2511,7 +2511,7 @@ index 61d112c50..8714c50d3 100644
 From 2e2670c5d00622e51f0d5f45f424d430c7b2ec47 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:10:41 +0000
-Subject: [PATCH 11/19] ggml-vulkan: add GTT size check and fallback for
+Subject: [PATCH 11/20] ggml-vulkan: add GTT size check and fallback for
  buffer_from_host_ptr
 
 On UMA systems, imported host memory counts against the GTT limit.
@@ -2584,7 +2584,7 @@ index 6cc28eff2..a458a441a 100644
 From 59501d0daa5deccfa8ce939223dcd145e8e262b5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:22:15 +0000
-Subject: [PATCH 12/19] llama-model: disable mmap prefetch when model exceeds
+Subject: [PATCH 12/20] llama-model: disable mmap prefetch when model exceeds
  available memory
 
 The model loader calls posix_madvise(MADV_WILLNEED) on the entire
@@ -2649,7 +2649,7 @@ index a458a441a..3da3c9574 100644
 From ddac10b9cfaf76c0f8a51c9d22c1d797f85ce589 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 11:59:58 +0000
-Subject: [PATCH 13/19] ggml-vulkan: fix buffer_from_host_ptr size alignment
+Subject: [PATCH 13/20] ggml-vulkan: fix buffer_from_host_ptr size alignment
  and remove GTT check
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2712,7 +2712,7 @@ index 7438cf34f..a8db4c66d 100644
 From e18056cb7e1970f6c26cf2b3b73fc306b5c06986 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 12:49:00 +0000
-Subject: [PATCH 14/19] ggml-vulkan: lazy import of CPU expert buffers on UMA
+Subject: [PATCH 14/20] ggml-vulkan: lazy import of CPU expert buffers on UMA
  for GPU MUL_MAT_ID
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2831,7 +2831,7 @@ index a8db4c66d..5d7003591 100644
 From 0b289f8981114c3ddba73ef67b802b60bd24879b Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 15:43:28 +0000
-Subject: [PATCH 15/19] ggml-vulkan: move lazy import to tensor_subbuffer for
+Subject: [PATCH 15/20] ggml-vulkan: move lazy import to tensor_subbuffer for
  all MUL_MAT paths
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2915,7 +2915,7 @@ index 5d7003591..cb7834f50 100644
 From 478431a89cfc0d22fee60fd82bccdb5f95b75d3c Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 16:54:50 +0000
-Subject: [PATCH 16/19] revert: remove lazy import and supports_buft changes
+Subject: [PATCH 16/20] revert: remove lazy import and supports_buft changes
  (causing SIGSEGV)
 
 ---
@@ -3042,7 +3042,7 @@ index cb7834f50..a8db4c66d 100644
 From 4f8831825ecdcbc93172d363756f536691aa2e2c Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 18:17:20 +0000
-Subject: [PATCH 17/19] llama: allow Vulkan_Host buffer import on UMA for
+Subject: [PATCH 17/20] llama: allow Vulkan_Host buffer import on UMA for
  --cpu-moe experts
 
 Two changes that together enable GPU expert matmul with --cpu-moe on UMA:
@@ -3123,7 +3123,7 @@ index 3da3c9574..11c5cd23e 100644
 From 12b16d2d0c008c794e62313c11b892278069c4d8 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 18:40:00 +0000
-Subject: [PATCH 18/19] ggml-vulkan: supports_buft accepts Vulkan_Host buffers
+Subject: [PATCH 18/20] ggml-vulkan: supports_buft accepts Vulkan_Host buffers
 
 The scheduler creates unnecessary graph splits between Vulkan0 and
 Vulkan_Host buffers (190 splits for qwen3-235b with --cpu-moe).
@@ -3173,7 +3173,7 @@ index a8db4c66d..a7b79c0f1 100644
 From 39b237c79012aca24305fbce956363bc27558e07 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 18:52:18 +0000
-Subject: [PATCH 19/19] revert: supports_buft for Vulkan_Host (causes SIGSEGV
+Subject: [PATCH 19/20] revert: supports_buft for Vulkan_Host (causes SIGSEGV
  with single-split graph)
 
 ---
@@ -3207,6 +3207,90 @@ index a7b79c0f1..a8db4c66d 100644
  
 -    return false;
 +    return buft_ctx->device->idx == ctx->device;
+ }
+ 
+ static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
+-- 
+2.51.1
+
+
+From 0b8f4d65940ea81bb4e5d296ee3e313e369c3e30 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 19:45:40 +0000
+Subject: [PATCH 20/20] ggml-vulkan: proper Vulkan buffer context for
+ Vulkan_Host buffers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Root cause of SIGSEGV with supports_buft for Vulkan_Host: the host
+buffer alloc created a CPU buffer context (ggml_backend_cpu_buffer_from_ptr)
+but dispatch code casts to ggml_backend_vk_buffer_context.
+
+Fix: when ggml_vk_host_malloc succeeds, look up the pinned vk_buffer
+and create a proper ggml_backend_vk_buffer_context with dev_buffer.
+This makes Vulkan_Host buffers indistinguishable from regular Vulkan
+buffers to the dispatch code.
+
+Combined with supports_buft returning true for Vulkan_Host, this
+should eliminate graph splits (190 → ~2) and enable full GPU speed
+for --cpu-moe expert matmul.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 34 ++++++++++++++++++++++++----
+ 1 file changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a8db4c66d..e510a92ce 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -13411,6 +13411,25 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+     }
+ 
++    // Look up the pinned vk_buffer that ggml_vk_host_malloc registered
++    vk_buffer vk_buf = nullptr;
++    size_t buf_offset = 0;
++    ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
++
++    if (vk_buf) {
++        // Create a proper Vulkan buffer context so that the dispatch code
++        // can cast buffer->context to ggml_backend_vk_buffer_context.
++        // This is critical for supports_buft to work without SIGSEGV.
++        // Copy (not move) the shared_ptr — pinned_memory also holds a reference
++        vk_buffer vk_buf_copy = vk_buf;
++        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(
++            vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
++
++        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
++        return buffer;
++    }
++
++    // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
+     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+     buffer->buft = buft;
+     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
+@@ -15488,14 +15507,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+ }
+ 
+ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+-    if (buft->iface.get_name != ggml_backend_vk_buffer_type_name) {
+-        return false;
++    if (buft->iface.get_name == ggml_backend_vk_buffer_type_name) {
++        ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
++        ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
++        return buft_ctx->device->idx == ctx->device;
+     }
+ 
+-    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+-    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
++    // Vulkan_Host buffers now use ggml_backend_vk_buffer_context (with dev_buffer),
++    // so they can be safely used in Vulkan dispatch without graph splits.
++    if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
++        return true;
++    }
+ 
+-    return buft_ctx->device->idx == ctx->device;
++    return false;
  }
  
  static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
