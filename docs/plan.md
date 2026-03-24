@@ -237,36 +237,29 @@ expert tensors to CPU.
      `buf_ctx->dev_buffer` + `vk_tensor_offset` should work, but something
      in non-MoE ops fails.
 
-  **Recommended next approach: Targeted scheduler modification**
+  **Implemented approach: MUL_MAT_ID offload in scheduler (patch 0002)**
 
-  Instead of `supports_buft` (which globally merges all ops), modify the
-  scheduler's `ggml_backend_sched_backend_id_from_cur` (ggml-backend.cpp:820)
-  to specifically route `MUL_MAT_ID` to Vulkan when:
-  - Device is UMA (`device->uma`)
-  - Expert weights are on Vulkan_Host buffer type
-  - The op is `GGML_OP_MUL_MAT_ID`
+  Key insight: the existing `op_offload` mechanism in `backend_id_from_cur`
+  already routes CPU weights to GPU, but gated by `offload_op()` which
+  requires `batch_size >= 32`. For MUL_MAT_ID during single-token generation,
+  `ne[2] = 1` (batch dimension), so it never triggers.
 
-  This is a ~10-line change in `ggml-backend.cpp` that keeps all non-MoE ops
-  on their natural backend (avoiding the SIGSEGV) while routing ONLY expert
-  matmul to GPU.
+  The fix: after the batch-size-gated offload loop, add unconditional GPU
+  offload specifically for `GGML_OP_MUL_MAT_ID`. Expert weights stay on plain
+  CPU buffer (from `--cpu-moe`), no Vulkan_Host needed. The scheduler's
+  selective expert copy (lines 1480-1564) copies only used experts from
+  CPU → Vulkan compute buffer.
 
-  The Vulkan_Host buffer has a proper `ggml_backend_vk_buffer_context` (from
-  our fix), so `MUL_MAT_ID` dispatch can access `src0_buf_ctx->dev_buffer`
-  correctly. Non-MoE ops never see Vulkan_Host buffers.
+  Also reverted `supports_buft` for Vulkan_Host (SIGSEGV source).
 
-  **Implementation steps:**
-  1. In `ggml_backend_sched_backend_id_from_cur`, after the weight-based
-     backend check at line 828, add: if `tensor->op == GGML_OP_MUL_MAT_ID`
-     and `src->buffer->buft` is Vulkan_Host, return the Vulkan backend ID.
-  2. The scheduler will then create graph splits at MUL_MAT_ID boundaries
-     (a few splits per layer, not 190 — more like 2-4 per MoE layer).
-  3. The selective expert copy path (lines 1480-1564) will copy used experts
-     from Vulkan_Host → Vulkan compute buffer for the dispatch.
-  4. On UMA, the copy is host→host memcpy (~200 GB/s) — ~0.5ms per layer.
+  Changes:
+  - `ggml/src/ggml-backend.cpp:837-847`: MUL_MAT_ID offload (8 lines)
+  - `ggml/src/ggml-vulkan/ggml-vulkan.cpp:15517-15520`: removed supports_buft for Vulkan_Host
+  - Patch: `patches/0002-moe-gpu-expert-offload.patch`
 
-  **Expected result:** Similar to the 190-split config (~9 t/s) but potentially
-  faster because fewer splits and the scheduler's MoE copy optimization handles
-  the data transfer efficiently.
+  **Status: needs deployment testing on cluster**
+  Expected: scheduler creates graph splits at MoE boundaries (~2-4 per layer),
+  selective expert copy handles data transfer, MUL_MAT_ID runs on Vulkan GPU.
 
 ---
 

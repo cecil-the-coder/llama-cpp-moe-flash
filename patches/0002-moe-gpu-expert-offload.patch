@@ -1,0 +1,39 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index bc57df20b..a8260165e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -834,6 +834,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+                         return b;
+                     }
+                 }
++                // MUL_MAT_ID (MoE expert matmul) benefits from GPU regardless of batch size.
++                // The scheduler's selective expert copy handles the host->device data transfer,
++                // copying only the experts selected by the routing tensor.
++                if (tensor->op == GGML_OP_MUL_MAT_ID) {
++                    for (int b = 0; b < src_backend_id; b++) {
++                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
++                            SET_CAUSE(tensor, "1.moe");
++                            return b;
++                        }
++                    }
++                }
+             }
+             SET_CAUSE(tensor, "1.wgt%d", i);
+             return src_backend_id;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index e510a92ce..f3cd5deef 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15513,12 +15513,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+         return buft_ctx->device->idx == ctx->device;
+     }
+ 
+-    // Vulkan_Host buffers now use ggml_backend_vk_buffer_context (with dev_buffer),
+-    // so they can be safely used in Vulkan dispatch without graph splits.
+-    if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
+-        return true;
+-    }
+-
+     return false;
+ }
+ 

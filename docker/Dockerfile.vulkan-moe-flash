@@ -16,7 +16,9 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 COPY patches/0001-moe-flash-complete.patch /build/
-RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch
+COPY patches/0002-moe-gpu-expert-offload.patch /build/
+RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
+    && git apply /build/0002-moe-gpu-expert-offload.patch
 
 # Build with Vulkan + io_uring
 RUN cd /build/llama.cpp && cmake -B build \
