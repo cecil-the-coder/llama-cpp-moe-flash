@@ -180,17 +180,30 @@ expert tensors to CPU.
   Three modes: prefetch (default), fadvise, callback.
 
 - [x] **P3.3** — Force expert tensors to CPU backend
-  **No code changes needed!** llama.cpp b8298 already has `--cpu-moe` / `LLAMA_ARG_CPU_MOE=1`
-  which uses regex `\.ffn_(up|down|gate)_(ch|)exps` to override expert tensor buffer type
-  to `ggml_backend_cpu_buffer_type()`. Added to flash backend env vars.
-  On UMA, the Vulkan `MUL_MAT_ID` shader accesses CPU-resident tensors via host
-  pointers (`ggml_vk_host_get` at ggml-vulkan.cpp:8143).
+  llama.cpp b8298 has `--cpu-moe` / `LLAMA_ARG_CPU_MOE=1`. Expert tensors stay on CPU
+  mmap, only 7.4 GB non-expert weights go to Vulkan. MUL_MAT_ID runs on CPU.
 
-- [ ] **P3.4** — Benchmark DeepSeek-R1-0528 (228 GB) with `--cpu-moe`
-  With CPU_MOE: expert tensors stay mmap'd (~210 GB), only non-expert weights (~15 GB)
-  + KV cache (~5 GB) + staging go into Vulkan. Model should load without OOM.
-  Prefetch thread warms page cache for expert pages during inference.
-  Measure: load time, generation TPS, page fault rate, comparison to baseline.
+- [x] **P3.4** — Disable mmap prefetch for models > RAM
+  Added check: if model size > MemAvailable, skip `posix_madvise(MADV_WILLNEED)`.
+  Without this, the prefetch pages in all 228 GB → OOM.
+
+- [x] **P3.5** — Enable `buffer_from_host_ptr` with GTT-aware fallback
+  Set `buffer_from_host_ptr = device->external_memory_host` in Vulkan backend caps.
+  Added size check: skip import if it would exceed GTT (with 8 GB headroom).
+  Added fallback in model loader: if import fails, fall back to alloc+copy.
+
+- [x] **P3.6** — Benchmark DeepSeek-R1-0528 (228 GB)
+  **Working at 1.37 t/s** with --cpu-moe + --no-warmup + disabled prefetch.
+  Vulkan uses 10.7 GB (8.5% of GTT). Expert matmul on CPU.
+
+- [ ] **P3.7** — Get expert matmul on Vulkan GPU
+  Current bottleneck: `--cpu-moe` routes MUL_MAT_ID to CPU backend because expert
+  tensors are on `ggml_backend_cpu_buffer_type`. On UMA, CPU memory IS GPU-accessible.
+  Approaches:
+  1. Register CPU mmap'd expert buffers as Vulkan host memory (pinned_memory)
+  2. Use `--override-tensor` with Vulkan_Host buffer type instead of CPU
+  3. Patch scheduler to route MUL_MAT_ID to Vulkan when UMA + host-accessible
+  4. Implement staging buffer copy: small Vulkan buffer, copy used experts per token
 
 ---
 

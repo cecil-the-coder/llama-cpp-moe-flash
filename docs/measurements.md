@@ -293,17 +293,60 @@ Generation: 50 tokens @ 1.31 t/s (766 ms/tok)
 ```
 The prefetch thread was active, warming page cache for expert regions.
 
-### Vulkan test (--n-gpu-layers all) — OOM
-**Node crashed.** llama.cpp allocates ALL tensors as Vulkan buffers at load time.
-On UMA, Vulkan buffers consume real RAM: 228 GB Vulkan allocation on 125 GB = OOM.
+### Vulkan test (--n-gpu-layers all, no cpu-moe) — OOM
 
-**Root cause**: The Vulkan backend doesn't distinguish between expert tensors (which
-could be streamed) and non-expert tensors (which must be resident). It tries to
-allocate the full 228 GB model in GPU memory.
+**Node crashed.** Two root causes identified:
 
-**Fix needed**: Force expert tensors (`ffn_*_exps`) to CPU backend so they remain as
-mmap-only. Non-expert weights (~15 GB) + KV cache (~5 GB) + staging = ~20 GB in Vulkan.
-On UMA, CPU-resident tensors are still GPU-accessible via host pointers.
+1. **Vulkan `buffer_from_host_ptr` hardcoded to false** (ggml-vulkan.cpp:14948).
+   Despite having `VK_EXT_external_memory_host` support, the backend forces a full
+   memcpy of all model weights into new Vulkan buffers. 228 GB mmap + 228 GB copy = OOM.
+
+2. **mmap prefetch pages in entire model** (llama-model.cpp:7492).
+   `init_mappings(true)` calls `posix_madvise(MADV_WILLNEED)` on all 228 GB, forcing
+   the kernel to read the entire model from NVMe into page cache — exceeds 125 GB RAM.
+
+3. **GTT limit**: Even with zero-copy `buffer_from_host_ptr`, the 120 GB GTT pool
+   can't hold 228 GB of imported buffers. The RADV driver accounts imported host
+   memory against GTT.
+
+### Working configuration: --cpu-moe + --no-warmup + prefetch disabled
+
+Three patches that together enable 228 GB on 125 GB RAM:
+
+| Fix | What it does |
+|---|---|
+| **Disable mmap prefetch** for models > RAM | Skips `MADV_WILLNEED` when model > MemAvailable. Pages fault on demand instead of all at once. |
+| **`--cpu-moe`** (built-in llama.cpp) | Expert tensors (`ffn_*_exps`) stay on CPU mmap. Only 7.4 GB non-expert weights go to Vulkan. |
+| **`--no-warmup`** | Skips the initial forward pass. Without this, warmup pages in too many expert pages and OOMs. |
+
+```
+Memory layout:
+  Vulkan0 model buffer:   7,409 MB  (non-expert weights)
+  CPU_Mapped buffers:   228,597 MB  (expert weights, mmap'd, not prefetched)
+  Vulkan0 KV cache:        154 MB  (MLA compressed, tiny)
+  Vulkan0 compute:       3,099 MB
+  Vulkan_Host compute:      44 MB
+  Total Vulkan/GTT:     10,706 MB  (8.5% of 120 GB GTT)
+```
+
+### Results (Vulkan + cpu-moe + no-warmup, image f7bbf5f)
+
+```
+Prompt: 10 tokens @ 1.13 t/s
+Generation: 50 tokens @ 1.37 t/s (728 ms/tok)
+```
+
+Compared to CPU-only (1.31 t/s), the Vulkan path is marginally faster (1.37 t/s)
+because attention and routing run on GPU while expert matmul runs on CPU.
+
+**Limitation**: Expert matmul runs on CPU (~9 GB/s bandwidth to expert data from page
+cache) instead of Vulkan GPU (~200 GB/s GTT bandwidth on UMA). This is because
+`--cpu-moe` puts expert tensors on `ggml_backend_cpu_buffer_type`, causing the
+scheduler to route `MUL_MAT_ID` to the CPU backend.
+
+**Next step**: Get expert matmul on Vulkan GPU. On UMA, CPU memory is physically
+GPU-accessible. Need to either register CPU expert buffers as Vulkan host memory,
+or implement the staging buffer approach from the original design.
 
 ---
 
