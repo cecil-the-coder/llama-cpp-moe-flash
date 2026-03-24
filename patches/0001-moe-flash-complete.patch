@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 01/12] moe-flash: add eval callback for expert routing
+Subject: [PATCH 01/13] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 02/12] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 02/13] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 03/12] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 03/13] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 04/12] moe-flash: add io_uring expert reads with staging
+Subject: [PATCH 04/13] moe-flash: add io_uring expert reads with staging
  buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
@@ -1212,7 +1212,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 05/12] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 05/13] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1298,7 +1298,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 06/12] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 06/13] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1775,7 +1775,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 07/12] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 07/13] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1808,7 +1808,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 08/12] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 08/13] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2211,7 +2211,7 @@ index 59af6bdab..f1504c256 100644
 From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 03:19:38 +0000
-Subject: [PATCH 09/12] moe-flash: add multi-shard GGUF support
+Subject: [PATCH 09/13] moe-flash: add multi-shard GGUF support
 
 Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
 merging their MoE layer maps. Each layer tracks which shard fd to use
@@ -2465,7 +2465,7 @@ index c47fafa2c..f531fc6d7 100644
 From 175feb3698e0092869eed00c8955c4da8e37a8fa Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 07:29:05 +0000
-Subject: [PATCH 10/12] ggml-vulkan: enable buffer_from_host_ptr when
+Subject: [PATCH 10/13] ggml-vulkan: enable buffer_from_host_ptr when
  external_memory_host is available
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2511,7 +2511,7 @@ index 61d112c50..8714c50d3 100644
 From 2e2670c5d00622e51f0d5f45f424d430c7b2ec47 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:10:41 +0000
-Subject: [PATCH 11/12] ggml-vulkan: add GTT size check and fallback for
+Subject: [PATCH 11/13] ggml-vulkan: add GTT size check and fallback for
  buffer_from_host_ptr
 
 On UMA systems, imported host memory counts against the GTT limit.
@@ -2584,7 +2584,7 @@ index 6cc28eff2..a458a441a 100644
 From 59501d0daa5deccfa8ce939223dcd145e8e262b5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 08:22:15 +0000
-Subject: [PATCH 12/12] llama-model: disable mmap prefetch when model exceeds
+Subject: [PATCH 12/13] llama-model: disable mmap prefetch when model exceeds
  available memory
 
 The model loader calls posix_madvise(MADV_WILLNEED) on the entire
@@ -2642,6 +2642,69 @@ index a458a441a..3da3c9574 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
+-- 
+2.51.1
+
+
+From ddac10b9cfaf76c0f8a51c9d22c1d797f85ce589 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 11:59:58 +0000
+Subject: [PATCH 13/13] ggml-vulkan: fix buffer_from_host_ptr size alignment
+ and remove GTT check
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The import was failing because the mmap'd region size wasn't aligned to
+minImportedHostPointerAlignment (4096). Round up the size instead of
+rejecting — the mmap'd region extends to the page boundary.
+
+Remove the overly conservative GTT headroom check. Let vkAllocateMemory
+determine if the import fits. On UMA with external_memory_host, imports
+wrap existing pages without allocating new memory.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 18 ++++--------------
+ 1 file changed, 4 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 7438cf34f..a8db4c66d 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15565,13 +15565,13 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+         return {};
+     }
+ 
++    const size_t align = device->min_imported_host_pointer_alignment;
+     uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
+-    if (uptr & (device->min_imported_host_pointer_alignment - 1)) {
+-        return {};
+-    }
+-    if (size & (device->min_imported_host_pointer_alignment - 1)) {
++    if (uptr & (align - 1)) {
+         return {};
+     }
++    // Round up size to alignment (the mmap'd region extends to page boundary)
++    size = (size + align - 1) & ~(align - 1);
+ 
+     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
+ 
+@@ -15592,16 +15592,6 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     auto device = ggml_vk_get_device(ctx->device);
+ 
+-    // Check if the import would exceed available device memory (GTT on UMA)
+-    // Leave headroom for KV cache, compute buffers, etc.
+-    size_t free_mem = 0, total_mem = 0;
+-    ggml_backend_vk_device_get_memory(dev, &free_mem, &total_mem);
+-    const size_t headroom = 8ull * 1024 * 1024 * 1024; // 8 GB for KV cache + compute
+-    if (size + headroom > free_mem) {
+-        VK_LOG_DEBUG("ggml_backend_vk_device_buffer_from_host_ptr: size " << size/(1024*1024) << " MiB exceeds free " << free_mem/(1024*1024) << " MiB (headroom " << headroom/(1024*1024) << " MiB), skipping import");
+-        return {};
+-    }
+-
+     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+ 
+     if (!buf) {
 -- 
 2.51.1
 
