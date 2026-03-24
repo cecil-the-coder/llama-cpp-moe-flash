@@ -21,7 +21,7 @@ index bc57df20b..a8260165e 100644
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..1ce500724 100644
+index e510a92ce..66a7f1cab 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
@@ -109,7 +109,7 @@ index e510a92ce..1ce500724 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -15513,10 +15577,13 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,10 +15577,14 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
@@ -120,7 +120,8 @@ index e510a92ce..1ce500724 100644
 +    // On UMA with VK_EXT_external_memory_host, Vulkan can dynamically import
 +    // host buffer memory (e.g. mmap'd CPU weights) for zero-copy GPU access.
 +    // This eliminates graph splits for MoE expert weights on CPU.
-+    if (buft == ggml_backend_cpu_buffer_type()) {
++    // Matches both ggml_backend_cpu_buffer_type and cpu_buffer_from_ptr_type (CPU_Mapped).
++    if (ggml_backend_buft_is_host(buft)) {
 +        ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
 +        auto device = ggml_vk_get_device(ctx->device);
 +        return device->uma && device->external_memory_host;
