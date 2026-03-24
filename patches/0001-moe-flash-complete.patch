@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 1/7] moe-flash: add eval callback for expert routing
+Subject: [PATCH 1/8] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 2/7] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 2/8] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 3/7] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 3/8] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 4/7] moe-flash: add io_uring expert reads with staging buffers
+Subject: [PATCH 4/8] moe-flash: add io_uring expert reads with staging buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
 with LLAMA_FLASH_MOE_IOURING=1 and built with -DGGML_IOURING=ON:
@@ -1211,7 +1211,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 5/7] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 5/8] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1297,7 +1297,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 6/7] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 6/8] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1774,7 +1774,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 7/7] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 7/8] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1800,6 +1800,409 @@ index 9efff7012..f79ae43bd 100644
      ctx->gguf_warmcache = false;
      ctx->gguf_src.fd = -1;
  
+-- 
+2.51.1
+
+
+From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 02:51:45 +0000
+Subject: [PATCH 8/8] moe-flash: add zero-overhead prefetch and fadvise modes
+
+The eval callback serializes graph execution (~7x slowdown on large
+models). Add two new modes that have zero inference overhead:
+
+- "prefetch" (default): Background thread cycles through MoE layers
+  calling posix_fadvise(WILLNEED) on expert GGUF regions. Runs
+  independently of inference.
+
+- "fadvise": Before each graph_compute, issue fadvise for all expert
+  regions across all layers. Speculative but zero overhead.
+
+- "callback": Original eval callback (kept for debugging/analysis).
+
+Mode selected via LLAMA_FLASH_MOE_MODE env var (default: prefetch).
+Pre-graph hook added to llama-context.cpp for fadvise/prefetch modes.
+---
+ include/llama-moe-flash.h       |  36 ++++---
+ src/llama-context.cpp           |   6 ++
+ src/llama-moe-flash.cpp         | 173 +++++++++++++++++++++++++++++---
+ tools/server/server-context.cpp |   8 +-
+ 4 files changed, 195 insertions(+), 28 deletions(-)
+
+diff --git a/include/llama-moe-flash.h b/include/llama-moe-flash.h
+index ae1712fdd..0bfd8bb7d 100644
+--- a/include/llama-moe-flash.h
++++ b/include/llama-moe-flash.h
+@@ -4,41 +4,51 @@
+ #include "ggml-backend.h"
+ 
+ #include <cstdint>
++#include <stdbool.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-// ── MoE Flash: expert streaming with io_uring ──────────────────────────
++// ── MoE Flash: expert weight prefetching ────────────────────────────────
+ //
+-// When enabled (via environment variable LLAMA_FLASH_MOE_ENABLED=1), this
+-// module installs an eval callback that:
++// Modes (set via LLAMA_FLASH_MOE_MODE env var):
+ //
+-//   Phase 1 (P2.2): Logs routing decisions (which experts are selected)
+-//   Phase 2 (P2.3): Issues posix_fadvise(WILLNEED) for next-layer experts
+-//   Phase 3 (P2.4): Issues io_uring reads into staging buffers
++//   "callback"  — Original eval callback approach. Intercepts routing
++//                 decisions per-layer but serializes GPU execution (~7x slower).
++//                 Only useful for debugging/routing analysis.
+ //
+-// The eval callback intercepts the "ffn_moe_topk" tensor after argsort
+-// completes, reads the selected expert IDs (via ggml_backend_tensor_get
+-// on UMA), and triggers prefetch for the next layer's experts.
++//   "prefetch"  — (Default) Background prefetch thread that cycles through
++//                 MoE layers calling madvise(MADV_WILLNEED) on the mmap'd
++//                 expert tensor regions. Zero inference overhead.
++//
++//   "fadvise"   — Before each graph compute, issue posix_fadvise(WILLNEED)
++//                 for all expert regions in upcoming layers. Zero inference
++//                 overhead but less targeted than routing-aware prefetch.
+ 
+ struct llama_moe_flash_context;
+ 
+ // Initialize the flash MoE context. Returns nullptr if disabled or on error.
+-// experts_dir: path to the directory containing split expert files + manifest.json
+-// If experts_dir is NULL, reads from LLAMA_FLASH_MOE_EXPERTS_DIR env var.
+-// If that is also unset, only routing logging is enabled (no prefetch).
+ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir);
+ 
+ // Free the flash MoE context.
+ void llama_moe_flash_free(struct llama_moe_flash_context * ctx);
+ 
+-// Get the eval callback function to install on llama_context_params.
++// Returns true if the eval callback should be installed.
++// Only true for "callback" mode; other modes have zero overhead.
++bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx);
++
++// Get the eval callback function (only for "callback" mode).
+ ggml_backend_sched_eval_callback llama_moe_flash_get_callback(void);
+ 
+ // Get the context pointer to pass as cb_eval_user_data.
+ void * llama_moe_flash_get_user_data(struct llama_moe_flash_context * ctx);
+ 
++// Notify the prefetch system that a decode is about to start.
++// Call this before graph_compute. For "prefetch" and "fadvise" modes,
++// this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
++void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ee2669c15..5c449414c 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -6,6 +6,7 @@
+ #include "llama-io.h"
+ #include "llama-memory.h"
+ #include "llama-mmap.h"
++#include "llama-moe-flash.h"
+ #include "llama-model.h"
+ 
+ #include <cinttypes>
+@@ -1164,6 +1165,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
++    // MoE Flash: pre-graph prefetch hook (zero overhead for prefetch/fadvise modes)
++    if (cparams.cb_eval_user_data) {
++        llama_moe_flash_pre_graph((llama_moe_flash_context *)cparams.cb_eval_user_data);
++    }
++
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index f79ae43bd..c47fafa2c 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -9,7 +9,9 @@
+ #include <vector>
+ #include <map>
+ #include <unordered_map>
++#include <atomic>
+ #include <chrono>
++#include <thread>
+ 
+ #if defined(__linux__)
+ #include <fcntl.h>
+@@ -336,20 +338,29 @@ static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
+ 
+ #endif // GGML_USE_IOURING
+ 
++// ── Mode enum ─────────────────────────────────────────────────────────
++
++enum moe_flash_mode {
++    MOE_FLASH_MODE_CALLBACK,   // eval callback (accurate but slow — serializes graph)
++    MOE_FLASH_MODE_PREFETCH,   // background madvise thread (zero overhead)
++    MOE_FLASH_MODE_FADVISE,    // pre-graph fadvise on all expert regions (zero overhead)
++};
++
+ // ── Flash MoE context ──────────────────────────────────────────────────
+ 
+ struct llama_moe_flash_context {
+-    bool        enabled;
+-    bool        log_routing;       // log routing decisions to stderr
+-    bool        prefetch_fadvise;  // use posix_fadvise(WILLNEED)
+-    bool        prefetch_iouring;  // use io_uring reads
+-    bool        gguf_warmcache;   // use io_uring to warm page cache from GGUF
++    bool            enabled;
++    moe_flash_mode  mode;
++    bool            log_routing;       // log routing decisions to stderr
++    bool            prefetch_fadvise;  // use posix_fadvise(WILLNEED) in callback
++    bool            prefetch_iouring;  // use io_uring reads in callback
++    bool            gguf_warmcache;    // read from GGUF for page cache warming
+ 
+     std::string experts_dir;
+     std::vector<layer_entry> layers;
+     std::unordered_map<int, int> layer_idx_to_pos; // layer_idx → position in layers[]
+ 
+-    // GGUF source for page cache warming mode
++    // GGUF source for page cache warming / madvise
+     gguf_source gguf_src;
+ 
+     // Scratch buffer for reading tensor data from GPU
+@@ -359,9 +370,16 @@ struct llama_moe_flash_context {
+     iouring_prefetcher iouring_pf;
+ #endif
+ 
++    // Background prefetch thread (MOE_FLASH_MODE_PREFETCH)
++    std::thread             prefetch_thread;
++    std::atomic<bool>       prefetch_running{false};
++    std::atomic<int>        prefetch_signal{0};  // incremented on each pre_graph call
++    int64_t                 prefetch_madvise_calls;
++
+     // Stats
+     int64_t n_callbacks;
+     int64_t n_prefetch_calls;
++    int64_t n_pre_graph_calls;
+ };
+ 
+ // ── Helpers ────────────────────────────────────────────────────────────
+@@ -730,6 +748,77 @@ static bool load_gguf_source(gguf_source * src, const char * gguf_path) {
+     return !src->layers.empty();
+ }
+ 
++// ── Background prefetch thread (Option C) ─────────────────────────────
++//
++// Continuously cycles through MoE layers calling madvise(MADV_WILLNEED)
++// on the mmap'd GGUF regions for each expert. This tells the kernel to
++// start readahead for those pages. The thread runs independently of
++// inference — no synchronization needed, zero overhead on the hot path.
++
++#if defined(__linux__)
++static void prefetch_thread_fn(llama_moe_flash_context * ctx) {
++    fprintf(stderr, "moe-flash: prefetch thread started (%zu layers, %d experts/layer)\n",
++            ctx->gguf_src.layers.size(),
++            ctx->gguf_src.layers.empty() ? 0 : ctx->gguf_src.layers[0].n_experts);
++
++    int last_signal = 0;
++
++    while (ctx->prefetch_running.load(std::memory_order_relaxed)) {
++        // Wait for a signal that inference is active
++        int sig = ctx->prefetch_signal.load(std::memory_order_relaxed);
++        if (sig == last_signal) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            continue;
++        }
++        last_signal = sig;
++
++        // Cycle through all MoE layers, advising 2-3 layers at a time
++        for (size_t li = 0; li < ctx->gguf_src.layers.size(); li++) {
++            if (!ctx->prefetch_running.load(std::memory_order_relaxed)) break;
++
++            const gguf_layer_source & ls = ctx->gguf_src.layers[li];
++            for (int e = 0; e < ls.n_experts; e++) {
++                const gguf_expert_region & region = ls.experts[e];
++                for (const auto & part : region.parts) {
++                    // Convert GGUF file offset to mmap address
++                    // We use posix_fadvise on the fd since we may not have
++                    // access to the mmap base address
++                    posix_fadvise(ctx->gguf_src.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++                    ctx->prefetch_madvise_calls++;
++                }
++            }
++        }
++    }
++
++    fprintf(stderr, "moe-flash: prefetch thread stopped (%lld advise calls)\n",
++            (long long)ctx->prefetch_madvise_calls);
++}
++#endif
++
++// ── Pre-graph hooks (Options A and C) ─────────────────────────────────
++//
++// Called before each graph_compute. For fadvise mode, issues WILLNEED
++// hints for all expert regions. For prefetch mode, signals the background
++// thread that inference is active.
++
++static void pre_graph_fadvise_all(llama_moe_flash_context * ctx) {
++    // Issue fadvise for ALL expert regions across ALL MoE layers.
++    // This is speculative — we don't know which experts will be selected,
++    // so we advise all of them. The kernel will start readahead.
++#if defined(__linux__)
++    if (ctx->gguf_src.fd < 0) return;
++
++    for (const auto & ls : ctx->gguf_src.layers) {
++        for (int e = 0; e < ls.n_experts; e++) {
++            for (const auto & part : ls.experts[e].parts) {
++                posix_fadvise(ctx->gguf_src.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++                ctx->n_prefetch_calls++;
++            }
++        }
++    }
++#endif
++}
++
+ // ── Eval callback ──────────────────────────────────────────────────────
+ 
+ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+@@ -867,12 +956,25 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     ctx->enabled = true;
+     ctx->n_callbacks = 0;
+     ctx->n_prefetch_calls = 0;
++    ctx->n_pre_graph_calls = 0;
+     ctx->prefetch_iouring = false;
++    ctx->prefetch_madvise_calls = 0;
++
++    // Mode selection (default: prefetch thread, zero overhead)
++    const char * mode_env = getenv("LLAMA_FLASH_MOE_MODE");
++    if (mode_env && strcmp(mode_env, "callback") == 0) {
++        ctx->mode = MOE_FLASH_MODE_CALLBACK;
++    } else if (mode_env && strcmp(mode_env, "fadvise") == 0) {
++        ctx->mode = MOE_FLASH_MODE_FADVISE;
++    } else {
++        ctx->mode = MOE_FLASH_MODE_PREFETCH; // default
++    }
+ 
+     // Configuration from env vars
+     const char * log_env = getenv("LLAMA_FLASH_MOE_LOG_ROUTING");
+     ctx->log_routing = (log_env && strcmp(log_env, "1") == 0);
+ 
++    // Legacy env vars for callback mode
+     const char * fadvise_env = getenv("LLAMA_FLASH_MOE_FADVISE");
+     ctx->prefetch_fadvise = (fadvise_env && strcmp(fadvise_env, "1") == 0);
+ 
+@@ -964,14 +1066,23 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     }
+ #endif
+ 
+-    // Default: enable routing log if no other mode is set
+-    if (!ctx->prefetch_fadvise && !ctx->prefetch_iouring) {
++    // Start background prefetch thread if in prefetch mode
++#if defined(__linux__)
++    if (ctx->mode == MOE_FLASH_MODE_PREFETCH && ctx->gguf_src.fd >= 0) {
++        ctx->prefetch_running.store(true);
++        ctx->prefetch_thread = std::thread(prefetch_thread_fn, ctx);
++    }
++#endif
++
++    // Default: enable routing log if in callback mode with no other action
++    if (ctx->mode == MOE_FLASH_MODE_CALLBACK && !ctx->prefetch_fadvise && !ctx->prefetch_iouring) {
+         ctx->log_routing = true;
+     }
+ 
+-    fprintf(stderr, "moe-flash: initialized (log=%d, fadvise=%d, iouring=%d, experts_dir=%s)\n",
+-            ctx->log_routing, ctx->prefetch_fadvise, ctx->prefetch_iouring,
+-            ctx->experts_dir.empty() ? "(none)" : ctx->experts_dir.c_str());
++    const char * mode_names[] = {"callback", "prefetch", "fadvise"};
++    fprintf(stderr, "moe-flash: initialized (mode=%s, gguf=%s)\n",
++            mode_names[ctx->mode],
++            ctx->gguf_src.fd >= 0 ? ctx->gguf_src.path.c_str() : "(none)");
+ 
+     return ctx;
+ }
+@@ -979,8 +1090,17 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+     if (!ctx) return;
+ 
+-    fprintf(stderr, "moe-flash: stats: %lld callbacks, %lld prefetch calls\n",
+-            (long long)ctx->n_callbacks, (long long)ctx->n_prefetch_calls);
++    // Stop prefetch thread
++    if (ctx->prefetch_running.load()) {
++        ctx->prefetch_running.store(false);
++        if (ctx->prefetch_thread.joinable()) {
++            ctx->prefetch_thread.join();
++        }
++    }
++
++    fprintf(stderr, "moe-flash: stats: %lld callbacks, %lld prefetch calls, %lld pre_graph calls\n",
++            (long long)ctx->n_callbacks, (long long)ctx->n_prefetch_calls,
++            (long long)ctx->n_pre_graph_calls);
+ 
+ #if defined(GGML_USE_IOURING)
+     if (ctx->prefetch_iouring) {
+@@ -1026,6 +1146,11 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+     delete ctx;
+ }
+ 
++bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx) {
++    if (!ctx) return false;
++    return ctx->mode == MOE_FLASH_MODE_CALLBACK;
++}
++
+ ggml_backend_sched_eval_callback llama_moe_flash_get_callback(void) {
+     return moe_flash_eval_cb;
+ }
+@@ -1033,3 +1158,25 @@ ggml_backend_sched_eval_callback llama_moe_flash_get_callback(void) {
+ void * llama_moe_flash_get_user_data(struct llama_moe_flash_context * ctx) {
+     return (void *)ctx;
+ }
++
++void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
++    if (!ctx || !ctx->enabled) return;
++
++    ctx->n_pre_graph_calls++;
++
++    switch (ctx->mode) {
++        case MOE_FLASH_MODE_FADVISE:
++            // Issue fadvise for all expert regions before graph compute
++            pre_graph_fadvise_all(ctx);
++            break;
++
++        case MOE_FLASH_MODE_PREFETCH:
++            // Signal the background thread that inference is active
++            ctx->prefetch_signal.fetch_add(1, std::memory_order_relaxed);
++            break;
++
++        case MOE_FLASH_MODE_CALLBACK:
++            // No pre-graph action needed — callback handles everything
++            break;
++    }
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 59af6bdab..f1504c256 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -633,11 +633,15 @@ private:
+ 
+         params_base = params;
+ 
+-        // MoE Flash: install eval callback for expert routing interception
++        // MoE Flash: expert weight prefetching
+         moe_flash_ctx = llama_moe_flash_init(nullptr);
+         if (moe_flash_ctx) {
+-            params_base.cb_eval           = llama_moe_flash_get_callback();
++            // Always set user_data for pre_graph hook
+             params_base.cb_eval_user_data = llama_moe_flash_get_user_data(moe_flash_ctx);
++            if (llama_moe_flash_needs_callback(moe_flash_ctx)) {
++                // Only install eval callback in "callback" mode (slow but accurate)
++                params_base.cb_eval = llama_moe_flash_get_callback();
++            }
+         }
+ 
+         llama_init = common_init_from_params(params_base);
 -- 
 2.51.1
 

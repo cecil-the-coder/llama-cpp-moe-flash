@@ -212,6 +212,57 @@ essentially zero latency to the inference path.
 
 ---
 
+## P4 — Full Stack Testing on qwen3-235b-a22b
+
+Model: **qwen3-235b-a22b** Q2_K (80 GB, 2 GGUF shards, 94 layers, 92 MoE, 128 experts, top-8)
+
+### Baseline (no flash, llamacpp-vulkan-moe)
+
+```
+Prompt: 12 tokens @ 18.2 t/s (54.9 ms/tok)
+Generation: 200 tokens @ 20.9 t/s (47.9 ms/tok)
+TTFT (cold start): 82.8s
+```
+
+### Flash with eval callback (llamacpp-vulkan-moe-flash, io_uring warmcache)
+
+```
+Prompt: 12 tokens @ 13.4 t/s (74.6 ms/tok)
+Generation: 200 tokens @ 3.0 t/s (330.1 ms/tok)
+io_uring: 55 MoE layers loaded (shard 1 only), 128 experts/layer
+```
+
+### Eval Callback Overhead Analysis
+
+| Mode | Generation t/s | ms/token | Slowdown |
+|---|---|---|---|
+| Baseline (no callback) | 20.9 | 47.9 | 1.0x |
+| glm-4-7-flash w/ callback | 25.3 (was 59) | 39.5 | 2.3x |
+| **qwen3-235b w/ callback** | **3.0** (was 20.9) | **330.1** | **7.0x** |
+
+**Root cause**: The `ggml_backend_sched` eval callback path (ggml-backend.cpp:1585-1622)
+serializes graph execution. For each node where callback returns `ask=true`:
+1. Compute a subgraph up to that node
+2. `ggml_backend_synchronize()` — wait for GPU
+3. Call observe callback with data
+4. Resume next subgraph
+
+With 92 MoE layers, each containing routing + expert matmul nodes, this creates ~184
+GPU sync points per token instead of running the entire graph as one submission.
+
+**Conclusion**: The `cb_eval` approach is too expensive for production use on large
+models. Need a mechanism that doesn't serialize the graph.
+
+### Alternative Approaches to Evaluate
+
+| Option | Mechanism | Overhead | Accuracy |
+|---|---|---|---|
+| A: Speculative fadvise | `posix_fadvise(WILLNEED)` on all expert regions before graph | Zero | Low (reads all experts, not just top-k) |
+| B: Lightweight callback | Return `ask=false` always, use separate mechanism | Near-zero | Needs different data path |
+| C: madvise prefetch thread | `madvise(MADV_WILLNEED)` on mmap regions from bg thread | Zero | Can be targeted if we get routing info cheaply |
+
+---
+
 ## Summary
 
 | Metric | Value | Notes |
