@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 01/10] moe-flash: add eval callback for expert routing
+Subject: [PATCH 01/11] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 02/10] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 02/11] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 03/10] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 03/11] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 04/10] moe-flash: add io_uring expert reads with staging
+Subject: [PATCH 04/11] moe-flash: add io_uring expert reads with staging
  buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
@@ -1212,7 +1212,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 05/10] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 05/11] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1298,7 +1298,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 06/10] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 06/11] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1775,7 +1775,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 07/10] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 07/11] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1808,7 +1808,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 08/10] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 08/11] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2211,7 +2211,7 @@ index 59af6bdab..f1504c256 100644
 From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 03:19:38 +0000
-Subject: [PATCH 09/10] moe-flash: add multi-shard GGUF support
+Subject: [PATCH 09/11] moe-flash: add multi-shard GGUF support
 
 Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
 merging their MoE layer maps. Each layer tracks which shard fd to use
@@ -2465,7 +2465,7 @@ index c47fafa2c..f531fc6d7 100644
 From 175feb3698e0092869eed00c8955c4da8e37a8fa Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 07:29:05 +0000
-Subject: [PATCH 10/10] ggml-vulkan: enable buffer_from_host_ptr when
+Subject: [PATCH 10/11] ggml-vulkan: enable buffer_from_host_ptr when
  external_memory_host is available
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -2504,6 +2504,79 @@ index 61d112c50..8714c50d3 100644
          /* .events                = */ true,
      };
  }
+-- 
+2.51.1
+
+
+From 2e2670c5d00622e51f0d5f45f424d430c7b2ec47 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 08:10:41 +0000
+Subject: [PATCH 11/11] ggml-vulkan: add GTT size check and fallback for
+ buffer_from_host_ptr
+
+On UMA systems, imported host memory counts against the GTT limit.
+If the mmap region exceeds available device memory (with headroom),
+skip the import and fall back to the regular alloc+copy path.
+
+Also adds a fallback in the model loader: if buffer_from_host_ptr
+returns null, fall through to the standard allocation path instead
+of throwing an exception.
+
+This allows:
+- Small models: zero-copy import via buffer_from_host_ptr (fast)
+- Large models with --cpu-moe: experts on CPU (no import), non-expert
+  tensors fall back to alloc+copy if import fails
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 10 ++++++++++
+ src/llama-model.cpp                  | 10 ++++++++--
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8714c50d3..7438cf34f 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15592,6 +15592,16 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     auto device = ggml_vk_get_device(ctx->device);
+ 
++    // Check if the import would exceed available device memory (GTT on UMA)
++    // Leave headroom for KV cache, compute buffers, etc.
++    size_t free_mem = 0, total_mem = 0;
++    ggml_backend_vk_device_get_memory(dev, &free_mem, &total_mem);
++    const size_t headroom = 8ull * 1024 * 1024 * 1024; // 8 GB for KV cache + compute
++    if (size + headroom > free_mem) {
++        VK_LOG_DEBUG("ggml_backend_vk_device_buffer_from_host_ptr: size " << size/(1024*1024) << " MiB exceeds free " << free_mem/(1024*1024) << " MiB (headroom " << headroom/(1024*1024) << " MiB), skipping import");
++        return {};
++    }
++
+     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+ 
+     if (!buf) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 6cc28eff2..a458a441a 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -7542,12 +7542,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                 if (buf == nullptr) {
+-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
++                    // buffer_from_host_ptr failed (e.g., exceeds device memory limit)
++                    // Fall back to allocating a new buffer and copying data
++                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s (size %.1f MiB), falling back to copy\n",
++                            __func__, ggml_backend_buft_name(buft), (last - first) / (1024.0 * 1024.0));
++                    buf_map.clear();
++                    bufs.clear();
++                    goto fallback_alloc;
+                 }
+                 bufs.emplace_back(buf);
+                 buf_map.emplace(idx, buf);
+             }
+-        } else {
++        } else { fallback_alloc:
+             ggml_backend_buffer_t buf;
+             if (ml.no_alloc) {
+                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
 -- 
 2.51.1
 
