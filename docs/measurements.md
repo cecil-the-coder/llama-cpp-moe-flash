@@ -271,6 +271,42 @@ per graph compute). The callback mode serializes GPU execution via
 
 ---
 
+## DeepSeek-R1-0528 671B Q2_K (228 GB, 5 shards)
+
+### Multi-shard loading
+```
+detected 5 GGUF shards
+loaded GGUF shard: 12 MoE layers, 256 experts/layer
+loaded GGUF shard: 12 MoE layers, 256 experts/layer
+loaded GGUF shard: 12 MoE layers, 256 experts/layer
+loaded GGUF shard: 13 MoE layers, 256 experts/layer
+loaded GGUF shard: 12 MoE layers, 256 experts/layer
+total after merging 5 shards: 58 MoE layers
+io_uring staging: 128 MB (16 slots × 8 MB), max expert size=6.3 MB
+```
+
+### CPU-only test (--n-gpu-layers 0)
+Model loaded successfully despite being 1.82x RAM (228 GB / 125 GB).
+```
+Prompt: 10 tokens @ 0.88 t/s
+Generation: 50 tokens @ 1.31 t/s (766 ms/tok)
+```
+The prefetch thread was active, warming page cache for expert regions.
+
+### Vulkan test (--n-gpu-layers all) — OOM
+**Node crashed.** llama.cpp allocates ALL tensors as Vulkan buffers at load time.
+On UMA, Vulkan buffers consume real RAM: 228 GB Vulkan allocation on 125 GB = OOM.
+
+**Root cause**: The Vulkan backend doesn't distinguish between expert tensors (which
+could be streamed) and non-expert tensors (which must be resident). It tries to
+allocate the full 228 GB model in GPU memory.
+
+**Fix needed**: Force expert tensors (`ffn_*_exps`) to CPU backend so they remain as
+mmap-only. Non-expert weights (~15 GB) + KV cache (~5 GB) + staging = ~20 GB in Vulkan.
+On UMA, CPU-resident tensors are still GPU-accessible via host pointers.
+
+---
+
 ## Summary
 
 | Metric | Value | Notes |

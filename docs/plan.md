@@ -150,37 +150,47 @@ approach works on Linux (flash-moe found it neutral on macOS; Linux behavior may
 
 ## Phase 3: Vulkan Integration
 
-### Architecture Decision
+### Architecture Evolution
 
-**Chose page cache warming over vkCmdCopyBuffer.** Analysis of the UMA architecture
-revealed that io_uring reads from the GGUF file automatically populate the page cache.
-Since the model tensors are mmap'd from the same file, the mmap'd access finds the
-data already resident — zero page faults, zero Vulkan changes needed.
+**Phase 3a (completed): Page cache warming** — works when model fits in RAM.
+io_uring reads warm the page cache so mmap'd tensor access doesn't page-fault.
+Zero Vulkan changes, zero inference overhead with prefetch thread.
 
-This is simpler and more correct than the original vkCmdCopyBuffer design:
-- No Vulkan buffer management, no shader changes, no copy overhead
-- Works with the existing mmap-based tensor access path unchanged
-- Staging buffers are only used as read targets (data is discarded)
-- The kernel's page cache is the "staging area"
+**Phase 3b (in progress): Expert tensor offloading** — needed when model > RAM.
+DeepSeek-R1-0528 (228 GB) OOM'd because llama.cpp allocates ALL tensors (including
+expert weights) as Vulkan buffers at load time. On UMA, Vulkan buffers consume real
+RAM, so 228 GB of Vulkan allocations on 125 GB RAM = OOM.
+
+The fix: **keep expert tensors on CPU (mmap-only), don't allocate them in Vulkan**.
+Only non-expert weights (~15 GB), KV cache (~5 GB), and staging buffers (~128 MB)
+go into Vulkan memory. Expert data is streamed from mmap/disk on demand.
+
+This requires modifying how llama.cpp assigns tensors to backends — either via the
+existing `--override-tensor` mechanism or by patching the model loader to force
+expert tensors to CPU.
 
 ### Tasks
 
 - [x] **P3.1** — Page cache warming via GGUF offset reads
-  Implemented `load_gguf_source()` that parses the GGUF header to find expert tensor
-  offsets. io_uring reads from the GGUF at those offsets into staging buffers. The reads
-  warm the page cache; the staging data is discarded.
-  Enabled with `LLAMA_FLASH_MOE_GGUF_PATH=/path/to/model.gguf`.
-  Tested: 64 MB staging, 12 GB read, **368 µs avg wait** (page cache).
+  Implemented `load_gguf_source()` + multi-shard support + prefetch thread.
+  Works for models that fit in RAM. Zero overhead (21 t/s = baseline on qwen3-235b).
 
-- [x] **P3.2** — vkCmdCopyBuffer not needed
-  Page cache warming eliminates the need for Vulkan buffer copies entirely.
-  The mmap'd tensor access works unchanged — data is in page cache.
+- [x] **P3.2** — Zero-overhead prefetch mode
+  Background thread with `posix_fadvise(WILLNEED)` — no eval callback needed.
+  Three modes: prefetch (default), fadvise, callback.
 
-- [ ] **P3.3** — (Deferred) Shader indirection for true zero-copy
-  Only needed if page cache warming proves insufficient under extreme memory pressure.
-  With warm cache, the expert data goes: NVMe → page cache → mmap → GPU read.
-  With shader indirection, it would go: NVMe → staging → GPU read (one fewer copy).
-  Unlikely to matter on UMA where page cache → GPU is a direct memory read.
+- [x] **P3.3** — Force expert tensors to CPU backend
+  **No code changes needed!** llama.cpp b8298 already has `--cpu-moe` / `LLAMA_ARG_CPU_MOE=1`
+  which uses regex `\.ffn_(up|down|gate)_(ch|)exps` to override expert tensor buffer type
+  to `ggml_backend_cpu_buffer_type()`. Added to flash backend env vars.
+  On UMA, the Vulkan `MUL_MAT_ID` shader accesses CPU-resident tensors via host
+  pointers (`ggml_vk_host_get` at ggml-vulkan.cpp:8143).
+
+- [ ] **P3.4** — Benchmark DeepSeek-R1-0528 (228 GB) with `--cpu-moe`
+  With CPU_MOE: expert tensors stay mmap'd (~210 GB), only non-expert weights (~15 GB)
+  + KV cache (~5 GB) + staging go into Vulkan. Model should load without OOM.
+  Prefetch thread warms page cache for expert pages during inference.
+  Measure: load time, generation TPS, page fault rate, comparison to baseline.
 
 ---
 
