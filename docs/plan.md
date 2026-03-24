@@ -196,74 +196,112 @@ expert tensors to CPU.
   **Working at 1.37 t/s** with --cpu-moe + --no-warmup + disabled prefetch.
   Vulkan uses 10.7 GB (8.5% of GTT). Expert matmul on CPU.
 
-- [ ] **P3.7** — Validate buffer_from_host_ptr on qwen3-235b (80 GB < 120 GB GTT)
-  Test the buffer_from_host_ptr + alignment fix on a model that fits in GTT.
-  If 80 GB imports successfully, we have zero-copy Vulkan with full GPU matmul.
-  This validates the fix before tackling models > GTT.
+- [x] **P3.7** — Validate buffer_from_host_ptr on qwen3-235b (80 GB < 120 GB GTT)
+  **Validated: 20.4 t/s** — matches 20.9 t/s baseline. Zero-copy mmap import works
+  perfectly for models ≤ GTT. Model loads with zero additional memory allocation.
+  The alignment fix (round up to 4K) was needed for the import to succeed.
 
-- [ ] **P3.8** — Get expert matmul on Vulkan GPU for models > GTT
-  Current: `--cpu-moe` routes MUL_MAT_ID to CPU (1.37 t/s on DeepSeek 671B).
+- [~] **P3.8** — Get expert matmul on Vulkan GPU for models > GTT
 
-  **Tested and failed:**
-  - Full `buffer_from_host_ptr` import (228 GB): kernel OOM. Even with alignment
-    fix and prefetch disabled, importing 228 GB exceeds what the kernel allows.
+  **Current state (stable, deployed as image `998a216`):**
+  `--cpu-moe` with plain CPU buffers. Expert matmul on CPU. 9.5 t/s (qwen3-235b Q2_K).
+  Models > GTT work with `--no-warmup` + disabled mmap prefetch.
 
-  **Root cause analysis:**
-  - Scheduler already offloads MUL_MAT_ID to Vulkan when src0 is on CPU host buffer
-  - Scheduler allocates `input_cpy` at FULL expert tensor size (~46 GB per shard)
-  - Selective copy (ggml-backend.cpp:1480-1564) only copies used experts (8/256)
-    but the destination buffer must be full-size for shader indexing
-  - vkAllocateMemory for the full-size copy buffer exceeds GTT/kernel limits
+  **What was attempted and why it failed:**
 
-  **Attempted and reverted: lazy import in tensor_subbuffer + supports_buft**
-  Changed `supports_buft` to return true for CPU host buffers on UMA, and added
-  lazy `buffer_from_host_ptr` import in `ggml_vk_tensor_subbuffer`. This caused
-  SIGSEGV because changing backend routing breaks tensor buffer context assumptions
-  throughout the Vulkan codebase (many functions cast `buffer->context` to
-  `ggml_backend_vk_buffer_context *` without checking buffer type).
+  1. **Full buffer_from_host_ptr import (228 GB):** Kernel OOM — importing 228 GB
+     via VK_EXT_external_memory_host exceeds what the kernel allows on 125 GB RAM.
 
-  **Next approaches (in order of feasibility):**
-  1. **Scheduler copy path with buffer_from_host_ptr destination**: In the scheduler's
-     selective MoE copy (ggml-backend.cpp:1480-1564), use `buffer_from_host_ptr` to
-     wrap the mmap'd expert tensor as the copy DESTINATION. Since source == destination
-     on UMA, the selective copy becomes a no-op. The full-size buffer allocation uses
-     import instead of `vkAllocateMemory` — no new memory. This only modifies
-     `ggml-backend.cpp`, not the Vulkan dispatch code.
-  2. **Compact staging buffer + dense ID remapping**: Allocate K-slot staging buffer,
-     memcpy used experts, remap IDs. Requires shader changes.
-  3. **Per-layer import in a custom op handler**: Register a custom `MUL_MAT_ID`
-     handler for UMA that imports, dispatches, releases per layer.
+  2. **Vulkan_Host buffer type for experts (image `a888d75`):**
+     Changed model loader to keep experts on Vulkan_Host instead of CPU. Expert
+     data allocated via `ggml_vk_host_malloc` + alloc+copy from mmap. Expert
+     MUL_MAT_ID routes to Vulkan BUT with 190 graph splits → 9.0 t/s (slower
+     than baseline due to sync overhead).
+
+  3. **supports_buft for Vulkan_Host (image `c265012`):**
+     Made `ggml_backend_vk_device_supports_buft` return true for Vulkan_Host.
+     Eliminated graph splits (190→1). BUT caused SIGSEGV during warmup.
+
+     Root cause of SIGSEGV: Vulkan_Host `alloc_buffer` originally created a
+     **CPU buffer context** (`ggml_backend_cpu_buffer_from_ptr` at line 13414).
+     We fixed this to create a proper `ggml_backend_vk_buffer_context` with
+     `dev_buffer` from the pinned memory. However, with supports_buft=true,
+     ALL ops (not just MUL_MAT_ID) run in one Vulkan split. The crash happens
+     BEFORE MUL_MAT_ID — in attention or early ops that process the Vulkan_Host
+     output buffer or intermediate tensors.
+
+     Key finding: `vk_tensor_offset` uses `tensor->data - vk_ptr_base` (where
+     vk_ptr_base = 0x1000). ALL Vulkan buffer tensors get virtual pointers at
+     0x1000+offset. `ggml_vk_host_get` searches pinned_memory by ACTUAL host
+     pointer — so it never finds these virtual pointers. The fallback to
+     `buf_ctx->dev_buffer` + `vk_tensor_offset` should work, but something
+     in non-MoE ops fails.
+
+  **Recommended next approach: Targeted scheduler modification**
+
+  Instead of `supports_buft` (which globally merges all ops), modify the
+  scheduler's `ggml_backend_sched_backend_id_from_cur` (ggml-backend.cpp:820)
+  to specifically route `MUL_MAT_ID` to Vulkan when:
+  - Device is UMA (`device->uma`)
+  - Expert weights are on Vulkan_Host buffer type
+  - The op is `GGML_OP_MUL_MAT_ID`
+
+  This is a ~10-line change in `ggml-backend.cpp` that keeps all non-MoE ops
+  on their natural backend (avoiding the SIGSEGV) while routing ONLY expert
+  matmul to GPU.
+
+  The Vulkan_Host buffer has a proper `ggml_backend_vk_buffer_context` (from
+  our fix), so `MUL_MAT_ID` dispatch can access `src0_buf_ctx->dev_buffer`
+  correctly. Non-MoE ops never see Vulkan_Host buffers.
+
+  **Implementation steps:**
+  1. In `ggml_backend_sched_backend_id_from_cur`, after the weight-based
+     backend check at line 828, add: if `tensor->op == GGML_OP_MUL_MAT_ID`
+     and `src->buffer->buft` is Vulkan_Host, return the Vulkan backend ID.
+  2. The scheduler will then create graph splits at MUL_MAT_ID boundaries
+     (a few splits per layer, not 190 — more like 2-4 per MoE layer).
+  3. The selective expert copy path (lines 1480-1564) will copy used experts
+     from Vulkan_Host → Vulkan compute buffer for the dispatch.
+  4. On UMA, the copy is host→host memcpy (~200 GB/s) — ~0.5ms per layer.
+
+  **Expected result:** Similar to the 190-split config (~9 t/s) but potentially
+  faster because fewer splits and the scheduler's MoE copy optimization handles
+  the data transfer efficiently.
 
 ---
 
 ## Phase 4: Integration with inference-budget-controller
 
-Wire the flash MoE capability into the Kubernetes deployment.
+### Status: Mostly complete
 
-### Tasks
+- [x] **P4.1** — Container image with CI/CD
+  Image: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:<sha>`
+  GitHub Actions workflow builds on push to `patches/` or `docker/`.
+  Dockerfile: multi-stage from `kyuz0/amd-strix-halo-toolboxes:vulkan-radv`.
+  Baked env vars: `LLAMA_ARG_CPU_MOE=1`, `LLAMA_FLASH_MOE_ENABLED=1`, `LLAMA_FLASH_MOE_IOURING=1`.
 
-- [ ] **P4.1** — Build patched llama.cpp into container image
-  - Update `docker.io/kyuz0/amd-strix-halo-toolboxes` Dockerfile to include patched
-    llama.cpp with `GGML_IOURING=ON`
+- [x] **P4.2** — InferenceBackend CRD: `llamacpp-vulkan-moe-flash`
+  Created in `eh-ops-private/kubernetes/infrastructure/inference/backends/`.
+  Includes IPC_LOCK capability for io_uring. Image tag updated via git.
 
-- [ ] **P4.2** — Add new `InferenceBackend`: `llamacpp-vulkan-moe-flash`
-  - Extends `llamacpp-vulkan-moe` with additional env vars:
-    ```yaml
-    env:
-    - name: LLAMA_FLASH_MOE_EXPERTS_DIR
-      value: /models/$(MODEL_NAME)/experts
-    - name: LLAMA_FLASH_MOE_ENABLED
-      value: "1"
-    ```
+- [x] **P4.3** — Deployed models
+  - qwen3-235b-a22b Q2_K (80 GB): on `llamacpp-vulkan-moe-flash` backend
+  - qwen3-235b-a22b-q4km (133 GB): downloaded, not yet tested stable
+  - deepseek-r1-0528 Q2_K (228 GB): downloaded, works with manual pod + --no-warmup
+  - glm-4-7-flash (17 GB): on flash backend for testing
 
-- [ ] **P4.3** — Pre-split expert files during model download
-  - Add a post-download job step in the controller that runs `split_experts.py`
-  - Store split experts alongside model GGUF on the PVC
+- [x] **P4.4** — Budget tracking: set memory request to ~30Gi for flash models
+  (actual mmap'd model doesn't count against budget; only KV + compute + staging)
 
-- [ ] **P4.4** — Update budget tracking
-  - Flash MoE models only need staging pool memory (< 500 MB) in GTT, not full model size
-  - Update `InferenceModel` resource spec to declare `flashMode: true`
-  - Controller uses staging size (not full model size) for budget tracking
+- [ ] **P4.5** — Fix Flux reconciliation for Helm-based models
+  The `models/` directory has HelmRelease YAMLs but HelmReleases aren't being
+  rendered. Models are actually managed via `models-crd/` raw InferenceModel CRDs.
+  Need to update `models-crd/` files for backend changes, not `models/`.
+
+- [ ] **P4.6** — Add `--no-warmup` to backend args
+  The controller constructs CLI args from `_helpers.tpl`. Need to add `--no-warmup`
+  for the flash backend to prevent OOM during warmup on large models.
+  Currently only works via manual pod or env var.
 
 ---
 

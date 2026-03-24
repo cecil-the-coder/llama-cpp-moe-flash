@@ -60,14 +60,37 @@ Per-token I/O for streaming (cold NVMe read, no page cache):
 generation), or with a much faster NVMe. With a warm cache these models are 1-5 tok/s
 territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB/s SSD.
 
+## Results
+
+| Model | Size | RAM | Config | Gen t/s |
+|---|---|---|---|---|
+| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full Vulkan (buffer_from_host_ptr) | **20.4** |
+| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | --cpu-moe (expert matmul on CPU) | **9.5** |
+| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | --cpu-moe + --no-warmup | **1.37** |
+
+**Models ≤ GTT (120 GB):** Zero-copy Vulkan via `buffer_from_host_ptr`. Full baseline speed.
+
+**Models > GTT:** `--cpu-moe` keeps expert tensors mmap'd on CPU. Works for any model size.
+Expert matmul runs on CPU (~0.45x baseline). Getting GPU expert matmul is the open problem.
+
+### Patches applied to llama.cpp b8298
+
+| Patch | Purpose |
+|---|---|
+| `buffer_from_host_ptr = device->external_memory_host` | Enable zero-copy mmap import on UMA |
+| Size alignment fix in `ggml_vk_buffer_from_host_ptr` | Round up to 4K alignment |
+| Model loader fallback | If import fails, fall back to alloc+copy |
+| Disable mmap prefetch for models > RAM | Prevent OOM from `posix_madvise(MADV_WILLNEED)` |
+| Vulkan_Host buffer context fix | Proper `ggml_backend_vk_buffer_context` instead of CPU |
+| Prefetch thread + io_uring staging | Background page cache warming |
+
 ## Documents
 
-- [`docs/findings.md`](docs/findings.md) — key lessons from flash-moe's 58 experiments and
-  what transfers to Linux/io_uring
-- [`docs/architecture.md`](docs/architecture.md) — llama.cpp internals: how MoE execution
-  works, where the hook points are
-- [`docs/design.md`](docs/design.md) — full io_uring expert prefetcher design
-- [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking
+- [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking (current status)
+- [`docs/measurements.md`](docs/measurements.md) — all benchmark results and analysis
+- [`docs/findings.md`](docs/findings.md) — key lessons from flash-moe's 58 experiments
+- [`docs/architecture.md`](docs/architecture.md) — llama.cpp internals
+- [`docs/design.md`](docs/design.md) — io_uring expert prefetcher design (original)
 
 ## Container Image
 

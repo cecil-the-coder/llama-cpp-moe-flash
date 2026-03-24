@@ -364,20 +364,35 @@ or implement the staging buffer approach from the original design.
 | qwen3-235b-a22b | 80 GB | Prefetch thread | 18.3 | **21.0** | Zero overhead |
 | qwen3-235b-a22b | 80 GB | Eval callback | 13.4 | **3.0** | 7x slower |
 | qwen3-235b-a22b | 80 GB | Fadvise (pre-graph) | 17.8 | **14.0** | 21K syscalls overhead |
-| qwen3-235b-a22b | 80 GB | cpu-moe + prefetch | 16.5 | **9.4** | Expert matmul on CPU |
+| qwen3-235b-a22b | 80 GB | cpu-moe (plain CPU) | 16.5 | **9.5** | Expert matmul on CPU |
+| qwen3-235b-a22b | 80 GB | cpu-moe (Vulkan_Host, 190 splits) | 18.6 | **9.0** | GPU expert matmul, split overhead |
+| qwen3-235b-a22b | 80 GB | cpu-moe (Vulkan_Host, supports_buft) | — | **SIGSEGV** | 1 split but crashes in non-MoE ops |
 | DeepSeek-R1-0528 | 228 GB | CPU-only | 0.88 | **1.31** | Pure CPU, mmap |
 | DeepSeek-R1-0528 | 228 GB | cpu-moe + no-warmup | 1.13 | **1.37** | Vulkan attn, CPU experts |
 
 ### Key findings
 
-1. **Prefetch thread mode** is the production answer for models ≤ RAM. Zero overhead.
+1. **Models ≤ GTT (120 GB):** `buffer_from_host_ptr` zero-copy import works perfectly.
+   20.4 t/s = baseline. No code changes needed beyond the Vulkan backend fix.
 
-2. **Eval callback** serializes GPU execution (7x slower on large models). Not viable.
+2. **Prefetch thread mode** is zero overhead for models ≤ RAM. Background `posix_fadvise`
+   keeps expert pages warm.
 
-3. **Models > RAM** require three patches:
-   - Disable mmap prefetch (avoid paging in entire model)
-   - `--cpu-moe` (keep expert tensors mmap'd, not in Vulkan)
-   - `--no-warmup` (skip initial forward pass that OOMs)
+3. **Eval callback** serializes GPU execution (7x slower on large models). Not viable.
+
+4. **Models > GTT** require: `--cpu-moe` + `--no-warmup` + disabled mmap prefetch.
+   Expert matmul runs on CPU at ~9.5 t/s (vs 20.9 t/s baseline). Works for any model size.
+
+5. **GPU expert matmul with --cpu-moe (the open problem):**
+   - Vulkan_Host buffer type makes experts GPU-accessible (registered in pinned_memory)
+   - With 190 graph splits: 9.0 t/s (sync overhead negates GPU advantage)
+   - With supports_buft to eliminate splits: SIGSEGV in non-MoE ops
+   - Next: targeted scheduler change to route ONLY MUL_MAT_ID to Vulkan
+
+6. **Vulkan_Host buffer context fix:** Changed `ggml_backend_vk_host_buffer_type_alloc_buffer`
+   to create proper `ggml_backend_vk_buffer_context` (with dev_buffer) instead of CPU context.
+   This is correct for MUL_MAT_ID dispatch but causes SIGSEGV when combined with
+   global `supports_buft` (non-MoE ops crash).
 
 4. **buffer_from_host_ptr** fix (alignment + conditional enable) allows zero-copy mmap
    import on UMA for models ≤ GTT (120 GB). **Validated on qwen3-235b (80 GB): 20.4 t/s
