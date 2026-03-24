@@ -1,0 +1,49 @@
+# llama.cpp with MoE flash expert streaming (io_uring + Vulkan)
+# Based on the pre-built Strix Halo Vulkan image
+FROM docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv AS builder
+
+# Install build dependencies
+RUN dnf install -y --setopt=install_weak_deps=False \
+        cmake gcc-c++ git liburing-devel vulkan-headers vulkan-loader-devel \
+    && dnf clean all
+
+# Fix broken ld symlink (Fedora 43 issue)
+RUN ln -sf /usr/bin/ld.bfd /usr/bin/ld
+
+# Clone llama.cpp at the matching version and apply patch
+ARG LLAMA_CPP_TAG=b8298
+RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
+        https://github.com/ggml-org/llama.cpp /build/llama.cpp
+
+COPY patches/0001-moe-flash-complete.patch /build/
+RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch
+
+# Build with Vulkan + io_uring
+RUN cd /build/llama.cpp && cmake -B build \
+        -DGGML_VULKAN=ON \
+        -DGGML_RPC=OFF \
+        -DGGML_CUDA=OFF \
+        -DGGML_IOURING=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_SERVER=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j$(nproc) --target llama-server
+
+# --- Runtime stage ---
+FROM docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv
+
+# Install runtime dependency
+RUN dnf install -y --setopt=install_weak_deps=False liburing && dnf clean all
+
+# Fix ld symlink
+RUN ln -sf /usr/bin/ld.bfd /usr/bin/ld 2>/dev/null || true
+
+# Copy built artifacts over the existing binaries
+COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/bin/llama-server
+COPY --from=builder /build/llama.cpp/build/bin/libllama.so* /lib64/
+COPY --from=builder /build/llama.cpp/build/bin/libggml*.so* /lib64/
+COPY --from=builder /build/llama.cpp/build/bin/libmtmd.so* /lib64/
+
+# Verify
+RUN llama-server --version

@@ -1,0 +1,1772 @@
+warning: refname 'b8298' is ambiguous.
+From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Mon, 23 Mar 2026 23:18:57 +0000
+Subject: [PATCH 1/6] moe-flash: add eval callback for expert routing
+ interception
+
+Add llama-moe-flash module that installs an eval callback to intercept
+ffn_moe_topk tensors after argsort. Supports three modes:
+
+- Routing logging (LLAMA_FLASH_MOE_LOG_ROUTING=1): logs selected expert
+  IDs per layer to stderr
+- posix_fadvise prefetch (LLAMA_FLASH_MOE_FADVISE=1): issues WILLNEED
+  hints for next layer's expert files
+- (future) io_uring reads into staging buffers
+
+On UMA systems (Strix Halo), the tensor readback is a simple memcpy
+since Vulkan buffers are host-visible and host-coherent.
+
+Controlled by LLAMA_FLASH_MOE_ENABLED=1 env var.
+---
+ include/llama-moe-flash.h       |  44 ++++
+ src/CMakeLists.txt              |   1 +
+ src/llama-moe-flash.cpp         | 374 ++++++++++++++++++++++++++++++++
+ tools/server/server-context.cpp |  13 ++
+ 4 files changed, 432 insertions(+)
+ create mode 100644 include/llama-moe-flash.h
+ create mode 100644 src/llama-moe-flash.cpp
+
+diff --git a/include/llama-moe-flash.h b/include/llama-moe-flash.h
+new file mode 100644
+index 000000000..ae1712fdd
+--- /dev/null
++++ b/include/llama-moe-flash.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include "llama.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// ── MoE Flash: expert streaming with io_uring ──────────────────────────
++//
++// When enabled (via environment variable LLAMA_FLASH_MOE_ENABLED=1), this
++// module installs an eval callback that:
++//
++//   Phase 1 (P2.2): Logs routing decisions (which experts are selected)
++//   Phase 2 (P2.3): Issues posix_fadvise(WILLNEED) for next-layer experts
++//   Phase 3 (P2.4): Issues io_uring reads into staging buffers
++//
++// The eval callback intercepts the "ffn_moe_topk" tensor after argsort
++// completes, reads the selected expert IDs (via ggml_backend_tensor_get
++// on UMA), and triggers prefetch for the next layer's experts.
++
++struct llama_moe_flash_context;
++
++// Initialize the flash MoE context. Returns nullptr if disabled or on error.
++// experts_dir: path to the directory containing split expert files + manifest.json
++// If experts_dir is NULL, reads from LLAMA_FLASH_MOE_EXPERTS_DIR env var.
++// If that is also unset, only routing logging is enabled (no prefetch).
++struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir);
++
++// Free the flash MoE context.
++void llama_moe_flash_free(struct llama_moe_flash_context * ctx);
++
++// Get the eval callback function to install on llama_context_params.
++ggml_backend_sched_eval_callback llama_moe_flash_get_callback(void);
++
++// Get the context pointer to pass as cb_eval_user_data.
++void * llama_moe_flash_get_user_data(struct llama_moe_flash_context * ctx);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 283823fa9..2efc27ec3 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -14,6 +14,7 @@ add_library(llama
+             llama-batch.cpp
+             llama-chat.cpp
+             llama-context.cpp
++            llama-moe-flash.cpp
+             llama-cparams.cpp
+             llama-grammar.cpp
+             llama-graph.cpp
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+new file mode 100644
+index 000000000..578dd1a08
+--- /dev/null
++++ b/src/llama-moe-flash.cpp
+@@ -0,0 +1,374 @@
++#include "llama-moe-flash.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <unordered_map>
++
++#if defined(__linux__)
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
++// ── Manifest types ─────────────────────────────────────────────────────
++
++struct expert_part {
++    std::string name;     // "gate", "up", "down", or "gate_up"
++    size_t      offset;   // offset within the expert file
++    size_t      size;     // bytes
++};
++
++struct expert_entry {
++    int         id;
++    std::string file;
++    size_t      raw_size;
++    size_t      padded_size;
++    std::vector<expert_part> parts;
++    int         fd;       // open file descriptor (for prefetch)
++};
++
++struct layer_entry {
++    int layer_idx;
++    int n_experts;
++    std::vector<expert_entry> experts;
++};
++
++// ── Flash MoE context ──────────────────────────────────────────────────
++
++struct llama_moe_flash_context {
++    bool        enabled;
++    bool        log_routing;       // log routing decisions to stderr
++    bool        prefetch_fadvise;  // use posix_fadvise(WILLNEED)
++
++    std::string experts_dir;
++    std::vector<layer_entry> layers;
++    std::unordered_map<int, int> layer_idx_to_pos; // layer_idx → position in layers[]
++
++    // Scratch buffer for reading tensor data from GPU
++    std::vector<int32_t> topk_buf;
++
++    // Stats
++    int64_t n_callbacks;
++    int64_t n_prefetch_calls;
++};
++
++// ── Helpers ────────────────────────────────────────────────────────────
++
++// Parse layer index from tensor name like "ffn_moe_topk-5" → 5
++static int parse_layer_index(const char * name) {
++    // Find the last '-' and parse the number after it
++    const char * dash = strrchr(name, '-');
++    if (dash && dash[1] >= '0' && dash[1] <= '9') {
++        return atoi(dash + 1);
++    }
++    return -1;
++}
++
++// ── Manifest loader ────────────────────────────────────────────────────
++
++// Minimal JSON parser for manifest.json (avoids external dependency).
++// The manifest has a known, simple structure so we parse it with string ops.
++static bool load_manifest(llama_moe_flash_context * ctx) {
++    std::string manifest_path = ctx->experts_dir + "/manifest.json";
++    FILE * f = fopen(manifest_path.c_str(), "r");
++    if (!f) {
++        fprintf(stderr, "moe-flash: cannot open manifest: %s\n", manifest_path.c_str());
++        return false;
++    }
++
++    // Read entire file
++    fseek(f, 0, SEEK_END);
++    long size = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    std::string json(size, '\0');
++    size_t nread = fread(&json[0], 1, size, f);
++    fclose(f);
++    if ((long)nread != size) {
++        fprintf(stderr, "moe-flash: short read on manifest\n");
++        return false;
++    }
++
++    // Parse layer entries using simple string scanning.
++    // We look for "layer": N patterns and "experts": [...] arrays.
++    // This is fragile but sufficient for our known manifest format.
++
++    size_t pos = 0;
++    auto find_key = [&](const std::string & key) -> size_t {
++        size_t p = json.find("\"" + key + "\"", pos);
++        if (p == std::string::npos) return std::string::npos;
++        p = json.find(':', p + key.size() + 2);
++        return p != std::string::npos ? p + 1 : std::string::npos;
++    };
++
++    auto read_int = [&](size_t p) -> int {
++        while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) p++;
++        return atoi(&json[p]);
++    };
++
++    auto read_string = [&](size_t p) -> std::string {
++        size_t q1 = json.find('"', p);
++        if (q1 == std::string::npos) return "";
++        size_t q2 = json.find('"', q1 + 1);
++        if (q2 == std::string::npos) return "";
++        return json.substr(q1 + 1, q2 - q1 - 1);
++    };
++
++    // Find top-level "layers" array
++    size_t layers_pos = json.find("\"layers\"");
++    if (layers_pos == std::string::npos) {
++        fprintf(stderr, "moe-flash: no 'layers' key in manifest\n");
++        return false;
++    }
++
++    // Scan for each layer object
++    size_t scan = layers_pos;
++    while (true) {
++        // Find next "layer": N
++        size_t layer_key = json.find("\"layer\"", scan);
++        if (layer_key == std::string::npos) break;
++
++        size_t colon = json.find(':', layer_key + 7);
++        if (colon == std::string::npos) break;
++        int layer_idx = read_int(colon + 1);
++
++        layer_entry le;
++        le.layer_idx = layer_idx;
++
++        // Find "experts" array for this layer
++        size_t experts_key = json.find("\"experts\"", colon);
++        if (experts_key == std::string::npos) break;
++
++        // Find next layer boundary or end of layers array
++        size_t next_layer = json.find("\"layer\"", experts_key + 10);
++        size_t search_end = (next_layer != std::string::npos) ? next_layer : json.size();
++
++        // Scan expert entries within this range
++        size_t exp_scan = experts_key;
++        while (exp_scan < search_end) {
++            size_t id_key = json.find("\"id\"", exp_scan);
++            if (id_key == std::string::npos || id_key >= search_end) break;
++
++            expert_entry ee;
++            size_t id_colon = json.find(':', id_key + 4);
++            ee.id = read_int(id_colon + 1);
++
++            pos = id_colon;
++            size_t file_pos = find_key("file");
++            if (file_pos != std::string::npos) {
++                ee.file = read_string(file_pos);
++            }
++
++            // Read raw_size and padded_size
++            pos = file_pos;
++            size_t raw_pos = find_key("raw_size");
++            if (raw_pos != std::string::npos) {
++                ee.raw_size = read_int(raw_pos);
++            }
++
++            pos = raw_pos;
++            size_t pad_pos = find_key("padded_size");
++            if (pad_pos != std::string::npos) {
++                ee.padded_size = read_int(pad_pos);
++            }
++
++            // Open file descriptor for prefetch
++            ee.fd = -1;
++            if (!ee.file.empty() && ctx->prefetch_fadvise) {
++                std::string path = ctx->experts_dir + "/" + ee.file;
++                ee.fd = open(path.c_str(), O_RDONLY);
++                if (ee.fd < 0) {
++                    fprintf(stderr, "moe-flash: warning: cannot open %s\n", path.c_str());
++                }
++            }
++
++            le.experts.push_back(std::move(ee));
++            exp_scan = (pad_pos != std::string::npos) ? pad_pos + 10 : exp_scan + 10;
++        }
++
++        le.n_experts = (int)le.experts.size();
++        ctx->layer_idx_to_pos[layer_idx] = (int)ctx->layers.size();
++        ctx->layers.push_back(std::move(le));
++
++        scan = (next_layer != std::string::npos) ? next_layer : json.size();
++    }
++
++    fprintf(stderr, "moe-flash: loaded manifest: %zu layers, %d experts/layer\n",
++            ctx->layers.size(),
++            ctx->layers.empty() ? 0 : ctx->layers[0].n_experts);
++
++    return !ctx->layers.empty();
++}
++
++// ── Eval callback ──────────────────────────────────────────────────────
++
++static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    auto * ctx = (llama_moe_flash_context *)user_data;
++
++    if (ask) {
++        // We only need data from ffn_moe_topk tensors
++        if (strstr(t->name, "ffn_moe_topk") != nullptr) {
++            return true;
++        }
++        return false;
++    }
++
++    // Observe phase: tensor data is ready
++    if (strstr(t->name, "ffn_moe_topk") == nullptr) {
++        return true;
++    }
++
++    ctx->n_callbacks++;
++
++    int layer_idx = parse_layer_index(t->name);
++    if (layer_idx < 0) {
++        return true;
++    }
++
++    // Read the selected expert IDs from the tensor.
++    // Shape: [n_expert_used, n_tokens] — we read all of it.
++    // On UMA (Strix Halo), ggml_backend_tensor_get is just a memcpy.
++    const int64_t n_expert_used = t->ne[0];
++    const int64_t n_tokens      = t->ne[1];
++    const size_t  n_ids         = n_expert_used * n_tokens;
++
++    ctx->topk_buf.resize(n_ids);
++
++    const bool is_host = ggml_backend_buffer_is_host(t->buffer);
++    if (is_host) {
++        memcpy(ctx->topk_buf.data(), t->data, n_ids * sizeof(int32_t));
++    } else {
++        ggml_backend_tensor_get(t, ctx->topk_buf.data(), 0, n_ids * sizeof(int32_t));
++    }
++
++    // Log routing decisions
++    if (ctx->log_routing) {
++        fprintf(stderr, "moe-flash: layer %3d topk=[", layer_idx);
++        // Only log first token's experts (avoid flooding for batch)
++        for (int64_t i = 0; i < n_expert_used && i < 16; i++) {
++            if (i > 0) fprintf(stderr, ",");
++            fprintf(stderr, "%d", ctx->topk_buf[i]);
++        }
++        if (n_tokens > 1) {
++            fprintf(stderr, "] (%lld tokens)", (long long)n_tokens);
++        } else {
++            fprintf(stderr, "]");
++        }
++        fprintf(stderr, "\n");
++    }
++
++    // Prefetch: issue posix_fadvise for the NEXT layer's experts
++    // (Current layer's experts are already needed; prefetch one layer ahead)
++    if (ctx->prefetch_fadvise && !ctx->layers.empty()) {
++        int next_layer = layer_idx + 1;
++        auto it = ctx->layer_idx_to_pos.find(next_layer);
++        if (it != ctx->layer_idx_to_pos.end()) {
++            const layer_entry & le = ctx->layers[it->second];
++
++            // For each token, prefetch its selected experts for next layer
++            // Deduplicate across tokens to avoid redundant fadvise calls
++            std::vector<bool> needed(le.n_experts, false);
++            for (int64_t tok = 0; tok < n_tokens; tok++) {
++                for (int64_t k = 0; k < n_expert_used; k++) {
++                    int eid = ctx->topk_buf[tok * n_expert_used + k];
++                    if (eid >= 0 && eid < le.n_experts) {
++                        needed[eid] = true;
++                    }
++                }
++            }
++
++#if defined(__linux__)
++            for (int e = 0; e < le.n_experts; e++) {
++                if (!needed[e]) continue;
++                const expert_entry & ee = le.experts[e];
++                if (ee.fd >= 0) {
++                    posix_fadvise(ee.fd, 0, ee.raw_size, POSIX_FADV_WILLNEED);
++                    ctx->n_prefetch_calls++;
++                }
++            }
++#endif
++        }
++    }
++
++    return true;
++}
++
++// ── Public API ─────────────────────────────────────────────────────────
++
++struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
++    const char * enabled_env = getenv("LLAMA_FLASH_MOE_ENABLED");
++    if (!enabled_env || strcmp(enabled_env, "1") != 0) {
++        return nullptr;
++    }
++
++    auto * ctx = new llama_moe_flash_context();
++    ctx->enabled = true;
++    ctx->n_callbacks = 0;
++    ctx->n_prefetch_calls = 0;
++
++    // Configuration from env vars
++    const char * log_env = getenv("LLAMA_FLASH_MOE_LOG_ROUTING");
++    ctx->log_routing = (log_env && strcmp(log_env, "1") == 0);
++
++    const char * fadvise_env = getenv("LLAMA_FLASH_MOE_FADVISE");
++    ctx->prefetch_fadvise = (fadvise_env && strcmp(fadvise_env, "1") == 0);
++
++    // Experts directory
++    if (experts_dir) {
++        ctx->experts_dir = experts_dir;
++    } else {
++        const char * dir_env = getenv("LLAMA_FLASH_MOE_EXPERTS_DIR");
++        if (dir_env) {
++            ctx->experts_dir = dir_env;
++        }
++    }
++
++    // Load manifest if experts directory is set
++    if (!ctx->experts_dir.empty()) {
++        if (!load_manifest(ctx)) {
++            fprintf(stderr, "moe-flash: failed to load manifest, prefetch disabled\n");
++            ctx->prefetch_fadvise = false;
++        }
++    }
++
++    // Default: enable routing log if no other mode is set
++    if (!ctx->prefetch_fadvise) {
++        ctx->log_routing = true;
++    }
++
++    fprintf(stderr, "moe-flash: initialized (log=%d, fadvise=%d, experts_dir=%s)\n",
++            ctx->log_routing, ctx->prefetch_fadvise,
++            ctx->experts_dir.empty() ? "(none)" : ctx->experts_dir.c_str());
++
++    return ctx;
++}
++
++void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
++    if (!ctx) return;
++
++    fprintf(stderr, "moe-flash: stats: %lld callbacks, %lld prefetch calls\n",
++            (long long)ctx->n_callbacks, (long long)ctx->n_prefetch_calls);
++
++    // Close file descriptors
++    for (auto & layer : ctx->layers) {
++        for (auto & expert : layer.experts) {
++            if (expert.fd >= 0) {
++                close(expert.fd);
++                expert.fd = -1;
++            }
++        }
++    }
++
++    delete ctx;
++}
++
++ggml_backend_sched_eval_callback llama_moe_flash_get_callback(void) {
++    return moe_flash_eval_cb;
++}
++
++void * llama_moe_flash_get_user_data(struct llama_moe_flash_context * ctx) {
++    return (void *)ctx;
++}
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b4373c101..59af6bdab 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include "common.h"
+ #include "llama.h"
++#include "llama-moe-flash.h"
+ #include "log.h"
+ #include "sampling.h"
+ #include "speculative.h"
+@@ -587,7 +588,12 @@ private:
+ 
+     bool sleeping = false;
+ 
++    llama_moe_flash_context * moe_flash_ctx = nullptr;
++
+     void destroy() {
++        llama_moe_flash_free(moe_flash_ctx);
++        moe_flash_ctx = nullptr;
++
+         llama_init.reset();
+         ctx = nullptr;
+         model = nullptr;
+@@ -627,6 +633,13 @@ private:
+ 
+         params_base = params;
+ 
++        // MoE Flash: install eval callback for expert routing interception
++        moe_flash_ctx = llama_moe_flash_init(nullptr);
++        if (moe_flash_ctx) {
++            params_base.cb_eval           = llama_moe_flash_get_callback();
++            params_base.cb_eval_user_data = llama_moe_flash_get_user_data(moe_flash_ctx);
++        }
++
+         llama_init = common_init_from_params(params_base);
+ 
+         model = llama_init->model();
+-- 
+2.51.1
+
+
+From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Mon, 23 Mar 2026 23:41:14 +0000
+Subject: [PATCH 2/6] moe-flash: fix JSON manifest parser for large expert
+ counts
+
+Use bracket-matching to properly delimit layer and expert objects
+instead of string scanning for "layer" key which was incorrectly
+splitting at expert boundaries when expert count > ~32.
+---
+ src/llama-moe-flash.cpp | 118 +++++++++++++++++++++++++++-------------
+ 1 file changed, 80 insertions(+), 38 deletions(-)
+
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index 578dd1a08..50fe9aa5f 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -124,59 +124,101 @@ static bool load_manifest(llama_moe_flash_context * ctx) {
+         return false;
+     }
+ 
+-    // Scan for each layer object
+-    size_t scan = layers_pos;
+-    while (true) {
+-        // Find next "layer": N
+-        size_t layer_key = json.find("\"layer\"", scan);
+-        if (layer_key == std::string::npos) break;
++    // Helper: find matching closing bracket, respecting nesting
++    auto find_matching_bracket = [&](size_t start, char open, char close) -> size_t {
++        int depth = 0;
++        for (size_t i = start; i < json.size(); i++) {
++            if (json[i] == open) depth++;
++            else if (json[i] == close) {
++                depth--;
++                if (depth == 0) return i;
++            }
++        }
++        return std::string::npos;
++    };
++
++    // Find the opening '[' of the layers array
++    size_t layers_arr_start = json.find('[', layers_pos);
++    if (layers_arr_start == std::string::npos) {
++        fprintf(stderr, "moe-flash: no layers array found\n");
++        return false;
++    }
++
++    // Scan for each layer object (identified by '{' at depth 1 within layers array)
++    size_t scan = layers_arr_start + 1;
++    while (scan < json.size()) {
++        // Find next layer object
++        size_t obj_start = json.find('{', scan);
++        if (obj_start == std::string::npos) break;
++
++        size_t obj_end = find_matching_bracket(obj_start, '{', '}');
++        if (obj_end == std::string::npos) break;
+ 
+-        size_t colon = json.find(':', layer_key + 7);
+-        if (colon == std::string::npos) break;
+-        int layer_idx = read_int(colon + 1);
++        std::string layer_json = json.substr(obj_start, obj_end - obj_start + 1);
++
++        // Parse layer index
++        size_t lk = layer_json.find("\"layer\"");
++        if (lk == std::string::npos) { scan = obj_end + 1; continue; }
++        size_t lc = layer_json.find(':', lk + 7);
++        int layer_idx = atoi(layer_json.c_str() + lc + 1);
+ 
+         layer_entry le;
+         le.layer_idx = layer_idx;
+ 
+-        // Find "experts" array for this layer
+-        size_t experts_key = json.find("\"experts\"", colon);
+-        if (experts_key == std::string::npos) break;
++        // Find experts array within this layer object
++        size_t exp_arr = layer_json.find("\"experts\"");
++        if (exp_arr == std::string::npos) { scan = obj_end + 1; continue; }
++        size_t exp_arr_start = layer_json.find('[', exp_arr);
++        if (exp_arr_start == std::string::npos) { scan = obj_end + 1; continue; }
++
++        // Scan for each expert object within the experts array
++        size_t exp_scan = exp_arr_start + 1;
++        while (exp_scan < layer_json.size()) {
++            size_t eobj_start = layer_json.find('{', exp_scan);
++            if (eobj_start == std::string::npos) break;
+ 
+-        // Find next layer boundary or end of layers array
+-        size_t next_layer = json.find("\"layer\"", experts_key + 10);
+-        size_t search_end = (next_layer != std::string::npos) ? next_layer : json.size();
++            size_t eobj_end = find_matching_bracket(eobj_start, '{', '}');
++            if (eobj_end == std::string::npos) break;
+ 
+-        // Scan expert entries within this range
+-        size_t exp_scan = experts_key;
+-        while (exp_scan < search_end) {
+-            size_t id_key = json.find("\"id\"", exp_scan);
+-            if (id_key == std::string::npos || id_key >= search_end) break;
++            std::string ej = layer_json.substr(eobj_start, eobj_end - eobj_start + 1);
+ 
+             expert_entry ee;
+-            size_t id_colon = json.find(':', id_key + 4);
+-            ee.id = read_int(id_colon + 1);
++            ee.fd = -1;
++
++            // Parse id
++            size_t ik = ej.find("\"id\"");
++            if (ik != std::string::npos) {
++                size_t ic = ej.find(':', ik + 4);
++                ee.id = atoi(ej.c_str() + ic + 1);
++            }
+ 
+-            pos = id_colon;
+-            size_t file_pos = find_key("file");
+-            if (file_pos != std::string::npos) {
+-                ee.file = read_string(file_pos);
++            // Parse file
++            size_t fk = ej.find("\"file\"");
++            if (fk != std::string::npos) {
++                size_t q1 = ej.find('"', fk + 6 + 1);  // skip "file": and find opening quote
++                if (q1 != std::string::npos) {
++                    size_t q2 = ej.find('"', q1 + 1);
++                    if (q2 != std::string::npos) {
++                        ee.file = ej.substr(q1 + 1, q2 - q1 - 1);
++                    }
++                }
+             }
+ 
+-            // Read raw_size and padded_size
+-            pos = file_pos;
+-            size_t raw_pos = find_key("raw_size");
+-            if (raw_pos != std::string::npos) {
+-                ee.raw_size = read_int(raw_pos);
++            // Parse raw_size
++            size_t rk = ej.find("\"raw_size\"");
++            if (rk != std::string::npos) {
++                size_t rc = ej.find(':', rk + 10);
++                ee.raw_size = atol(ej.c_str() + rc + 1);
+             }
+ 
+-            pos = raw_pos;
+-            size_t pad_pos = find_key("padded_size");
+-            if (pad_pos != std::string::npos) {
+-                ee.padded_size = read_int(pad_pos);
++            // Parse padded_size
++            size_t pk = ej.find("\"padded_size\"");
++            if (pk != std::string::npos) {
++                size_t pc = ej.find(':', pk + 13);
++                ee.padded_size = atol(ej.c_str() + pc + 1);
+             }
+ 
+             // Open file descriptor for prefetch
+-            ee.fd = -1;
+             if (!ee.file.empty() && ctx->prefetch_fadvise) {
+                 std::string path = ctx->experts_dir + "/" + ee.file;
+                 ee.fd = open(path.c_str(), O_RDONLY);
+@@ -186,14 +228,14 @@ static bool load_manifest(llama_moe_flash_context * ctx) {
+             }
+ 
+             le.experts.push_back(std::move(ee));
+-            exp_scan = (pad_pos != std::string::npos) ? pad_pos + 10 : exp_scan + 10;
++            exp_scan = eobj_end + 1;
+         }
+ 
+         le.n_experts = (int)le.experts.size();
+         ctx->layer_idx_to_pos[layer_idx] = (int)ctx->layers.size();
+         ctx->layers.push_back(std::move(le));
+ 
+-        scan = (next_layer != std::string::npos) ? next_layer : json.size();
++        scan = obj_end + 1;
+     }
+ 
+     fprintf(stderr, "moe-flash: loaded manifest: %zu layers, %d experts/layer\n",
+-- 
+2.51.1
+
+
+From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Mon, 23 Mar 2026 23:42:41 +0000
+Subject: [PATCH 3/6] moe-flash: fix bracket-matching to use local string
+ reference
+
+The find_matching_bracket lambda was capturing 'json' by reference
+but being called with indices into substring copies (layer_json, ej).
+Pass the string explicitly as a parameter instead.
+---
+ src/llama-moe-flash.cpp | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index 50fe9aa5f..ef89f5496 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -124,12 +124,12 @@ static bool load_manifest(llama_moe_flash_context * ctx) {
+         return false;
+     }
+ 
+-    // Helper: find matching closing bracket, respecting nesting
+-    auto find_matching_bracket = [&](size_t start, char open, char close) -> size_t {
++    // Helper: find matching closing bracket in `s`, respecting nesting
++    auto find_matching_bracket = [](const std::string & s, size_t start, char open, char close) -> size_t {
+         int depth = 0;
+-        for (size_t i = start; i < json.size(); i++) {
+-            if (json[i] == open) depth++;
+-            else if (json[i] == close) {
++        for (size_t i = start; i < s.size(); i++) {
++            if (s[i] == open) depth++;
++            else if (s[i] == close) {
+                 depth--;
+                 if (depth == 0) return i;
+             }
+@@ -151,7 +151,7 @@ static bool load_manifest(llama_moe_flash_context * ctx) {
+         size_t obj_start = json.find('{', scan);
+         if (obj_start == std::string::npos) break;
+ 
+-        size_t obj_end = find_matching_bracket(obj_start, '{', '}');
++        size_t obj_end = find_matching_bracket(json, obj_start, '{', '}');
+         if (obj_end == std::string::npos) break;
+ 
+         std::string layer_json = json.substr(obj_start, obj_end - obj_start + 1);
+@@ -177,7 +177,7 @@ static bool load_manifest(llama_moe_flash_context * ctx) {
+             size_t eobj_start = layer_json.find('{', exp_scan);
+             if (eobj_start == std::string::npos) break;
+ 
+-            size_t eobj_end = find_matching_bracket(eobj_start, '{', '}');
++            size_t eobj_end = find_matching_bracket(layer_json, eobj_start, '{', '}');
+             if (eobj_end == std::string::npos) break;
+ 
+             std::string ej = layer_json.substr(eobj_start, eobj_end - eobj_start + 1);
+-- 
+2.51.1
+
+
+From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 01:15:29 +0000
+Subject: [PATCH 4/6] moe-flash: add io_uring expert reads with staging buffers
+
+Add io_uring-based async read path for MoE expert weights. When enabled
+with LLAMA_FLASH_MOE_IOURING=1 and built with -DGGML_IOURING=ON:
+
+- Allocates 2MB-aligned staging buffers (one per top-k expert slot)
+- Registers buffers with io_uring for zero-copy fixed reads
+- Tries SQPOLL mode for kernel-side submission (falls back to normal)
+- Submits reads when routing decision is intercepted
+- Waits for completion before next layer's routing
+- Reports timing stats (submit/wait latency, bytes read)
+
+The io_uring path supersedes posix_fadvise when both are available.
+Staging buffers are the foundation for Phase 3 (Vulkan integration).
+---
+ src/CMakeLists.txt      |  13 ++
+ src/llama-moe-flash.cpp | 333 +++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 322 insertions(+), 24 deletions(-)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 2efc27ec3..0bfbdf4e4 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -163,6 +163,19 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
+ 
+ target_link_libraries(llama PUBLIC ggml)
+ 
++# Optional io_uring support for MoE expert streaming
++option(GGML_IOURING "Enable io_uring expert streaming for MoE models" OFF)
++if (GGML_IOURING)
++    find_library(URING_LIB uring)
++    if (URING_LIB)
++        target_compile_definitions(llama PRIVATE GGML_USE_IOURING)
++        target_link_libraries(llama PRIVATE ${URING_LIB})
++        message(STATUS "io_uring support enabled for MoE flash streaming")
++    else()
++        message(WARNING "GGML_IOURING=ON but liburing not found")
++    endif()
++endif()
++
+ if (BUILD_SHARED_LIBS)
+     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index ef89f5496..0640a7b22 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -8,10 +8,16 @@
+ #include <string>
+ #include <vector>
+ #include <unordered_map>
++#include <chrono>
+ 
+ #if defined(__linux__)
+ #include <fcntl.h>
+ #include <unistd.h>
++#include <sys/mman.h>
++#endif
++
++#if defined(GGML_USE_IOURING)
++#include <liburing.h>
+ #endif
+ 
+ // ── Manifest types ─────────────────────────────────────────────────────
+@@ -37,12 +43,202 @@ struct layer_entry {
+     std::vector<expert_entry> experts;
+ };
+ 
++// ── io_uring staging pool ──────────────────────────────────────────────
++
++#if defined(GGML_USE_IOURING)
++
++#define MOE_FLASH_MAX_EXPERTS_PER_TOKEN 16  // max K (top-k) per token
++#define MOE_FLASH_STAGING_ALIGN (2 * 1024 * 1024)  // 2 MB alignment for O_DIRECT
++
++struct iouring_staging_slot {
++    void *  data;           // 2MB-aligned host pointer
++    size_t  capacity;       // allocated size
++    int     expert_id;      // which expert is loaded here (-1 = empty)
++    int     layer;          // which layer
++};
++
++struct iouring_prefetcher {
++    struct io_uring ring;
++    bool            ring_initialized;
++
++    // Staging slots — one set for active reads
++    std::vector<iouring_staging_slot> slots;
++    int n_slots;
++
++    // Pending read tracking
++    int     n_pending;
++    int     pending_layer;
++    int32_t pending_ids[MOE_FLASH_MAX_EXPERTS_PER_TOKEN];
++
++    // Timing stats
++    int64_t total_submit_ns;
++    int64_t total_wait_ns;
++    int64_t n_submits;
++    int64_t n_waits;
++    int64_t total_bytes_read;
++};
++
++static bool iouring_prefetcher_init(iouring_prefetcher * pf, int n_slots, size_t max_expert_size) {
++    memset(pf, 0, sizeof(*pf));
++    pf->n_slots = n_slots;
++    pf->ring_initialized = false;
++
++    // Initialize io_uring with SQPOLL for kernel-side submission
++    struct io_uring_params params = {};
++    // Try SQPOLL first (lower latency), fall back to normal mode
++    params.flags = IORING_SETUP_SQPOLL;
++    params.sq_thread_idle = 2000; // 2ms idle before parking
++
++    int ret = io_uring_queue_init_params(64, &pf->ring, &params);
++    if (ret < 0) {
++        // SQPOLL may need CAP_SYS_NICE or root; fall back
++        fprintf(stderr, "moe-flash: SQPOLL init failed (%d), trying normal mode\n", -ret);
++        memset(&params, 0, sizeof(params));
++        ret = io_uring_queue_init(64, &pf->ring, 0);
++        if (ret < 0) {
++            fprintf(stderr, "moe-flash: io_uring init failed: %d\n", -ret);
++            return false;
++        }
++    }
++    pf->ring_initialized = true;
++
++    // Allocate staging slots with aligned memory
++    size_t alloc_size = (max_expert_size + MOE_FLASH_STAGING_ALIGN - 1) & ~(size_t)(MOE_FLASH_STAGING_ALIGN - 1);
++    pf->slots.resize(n_slots);
++
++    for (int i = 0; i < n_slots; i++) {
++        void * ptr = nullptr;
++        if (posix_memalign(&ptr, MOE_FLASH_STAGING_ALIGN, alloc_size) != 0) {
++            fprintf(stderr, "moe-flash: posix_memalign failed for slot %d\n", i);
++            return false;
++        }
++        pf->slots[i].data = ptr;
++        pf->slots[i].capacity = alloc_size;
++        pf->slots[i].expert_id = -1;
++        pf->slots[i].layer = -1;
++    }
++
++    // Register buffers for zero-copy fixed reads
++    std::vector<struct iovec> iovs(n_slots);
++    for (int i = 0; i < n_slots; i++) {
++        iovs[i].iov_base = pf->slots[i].data;
++        iovs[i].iov_len = alloc_size;
++    }
++    ret = io_uring_register_buffers(&pf->ring, iovs.data(), n_slots);
++    if (ret < 0) {
++        fprintf(stderr, "moe-flash: buffer registration failed (%d), using non-fixed reads\n", -ret);
++        // Non-fatal: we'll use regular reads instead of fixed
++    }
++
++    fprintf(stderr, "moe-flash: io_uring initialized: %d slots × %zu bytes (%zu MB total)\n",
++            n_slots, alloc_size, (size_t)n_slots * alloc_size / (1024 * 1024));
++
++    return true;
++}
++
++static void iouring_prefetcher_destroy(iouring_prefetcher * pf) {
++    if (pf->ring_initialized) {
++        io_uring_queue_exit(&pf->ring);
++        pf->ring_initialized = false;
++    }
++    for (auto & slot : pf->slots) {
++        if (slot.data) {
++            free(slot.data);
++            slot.data = nullptr;
++        }
++    }
++}
++
++// Submit async reads for selected experts in the given layer
++static void iouring_prefetcher_submit(
++        iouring_prefetcher * pf,
++        const std::vector<layer_entry> & layers,
++        const std::unordered_map<int, int> & layer_idx_to_pos,
++        int layer_idx,
++        const int32_t * expert_ids,
++        int k) {
++    auto it = layer_idx_to_pos.find(layer_idx);
++    if (it == layer_idx_to_pos.end()) return;
++
++    const layer_entry & le = layers[it->second];
++
++    auto t_start = std::chrono::steady_clock::now();
++
++    int submitted = 0;
++    for (int i = 0; i < k && i < pf->n_slots; i++) {
++        int eid = expert_ids[i];
++        if (eid < 0 || eid >= le.n_experts) continue;
++
++        const expert_entry & ee = le.experts[eid];
++        if (ee.fd < 0) continue;
++
++        iouring_staging_slot & slot = pf->slots[i];
++
++        struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
++        if (!sqe) {
++            fprintf(stderr, "moe-flash: no SQE available\n");
++            break;
++        }
++
++        io_uring_prep_read(sqe, ee.fd, slot.data, ee.raw_size, 0);
++        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)i);
++
++        slot.expert_id = eid;
++        slot.layer = layer_idx;
++        pf->pending_ids[submitted] = eid;
++        submitted++;
++    }
++
++    if (submitted > 0) {
++        io_uring_submit(&pf->ring);
++    }
++
++    pf->n_pending = submitted;
++    pf->pending_layer = layer_idx;
++    pf->n_submits++;
++
++    auto t_end = std::chrono::steady_clock::now();
++    pf->total_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
++}
++
++// Wait for all pending reads to complete
++static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
++    if (pf->n_pending == 0) return;
++
++    auto t_start = std::chrono::steady_clock::now();
++
++    struct io_uring_cqe * cqe;
++    for (int i = 0; i < pf->n_pending; i++) {
++        int ret = io_uring_wait_cqe(&pf->ring, &cqe);
++        if (ret < 0) {
++            fprintf(stderr, "moe-flash: io_uring wait failed: %d\n", -ret);
++            break;
++        }
++        if (cqe->res < 0) {
++            fprintf(stderr, "moe-flash: read failed for slot %llu: %d\n",
++                    (unsigned long long)(unsigned long long)(uintptr_t)io_uring_cqe_get_data(cqe), cqe->res);
++        } else {
++            pf->total_bytes_read += cqe->res;
++        }
++        io_uring_cqe_seen(&pf->ring, cqe);
++    }
++
++    pf->n_waits++;
++    pf->n_pending = 0;
++
++    auto t_end = std::chrono::steady_clock::now();
++    pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
++}
++
++#endif // GGML_USE_IOURING
++
+ // ── Flash MoE context ──────────────────────────────────────────────────
+ 
+ struct llama_moe_flash_context {
+     bool        enabled;
+     bool        log_routing;       // log routing decisions to stderr
+     bool        prefetch_fadvise;  // use posix_fadvise(WILLNEED)
++    bool        prefetch_iouring;  // use io_uring reads
+ 
+     std::string experts_dir;
+     std::vector<layer_entry> layers;
+@@ -51,6 +247,10 @@ struct llama_moe_flash_context {
+     // Scratch buffer for reading tensor data from GPU
+     std::vector<int32_t> topk_buf;
+ 
++#if defined(GGML_USE_IOURING)
++    iouring_prefetcher iouring_pf;
++#endif
++
+     // Stats
+     int64_t n_callbacks;
+     int64_t n_prefetch_calls;
+@@ -302,33 +502,57 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+         fprintf(stderr, "\n");
+     }
+ 
+-    // Prefetch: issue posix_fadvise for the NEXT layer's experts
+-    // (Current layer's experts are already needed; prefetch one layer ahead)
++    // Collect unique expert IDs needed across all tokens for prefetch
++    std::vector<int32_t> unique_experts;
++    {
++        // Use the current layer's routing to predict next layer's needs.
++        // (We prefetch for current layer since we just got the routing decision.)
++        // Deduplicate across tokens
++        std::vector<bool> seen(256, false); // max experts
++        for (int64_t tok = 0; tok < n_tokens; tok++) {
++            for (int64_t k = 0; k < n_expert_used; k++) {
++                int eid = ctx->topk_buf[tok * n_expert_used + k];
++                if (eid >= 0 && eid < (int)seen.size() && !seen[eid]) {
++                    seen[eid] = true;
++                    unique_experts.push_back(eid);
++                }
++            }
++        }
++    }
++
++#if defined(GGML_USE_IOURING)
++    // io_uring path: wait for previous layer's reads, then submit for current layer
++    if (ctx->prefetch_iouring) {
++        // Wait for any pending reads from previous submission
++        iouring_prefetcher_wait(&ctx->iouring_pf);
++
++        // Submit reads for the CURRENT layer's experts (we now know which ones)
++        // The data will be ready by the time the MUL_MAT_ID op needs it
++        // (there's attention compute between routing and expert matmul)
++        iouring_prefetcher_submit(
++            &ctx->iouring_pf,
++            ctx->layers, ctx->layer_idx_to_pos,
++            layer_idx,
++            unique_experts.data(),
++            (int)unique_experts.size());
++        ctx->n_prefetch_calls += unique_experts.size();
++    }
++#endif
++
++    // posix_fadvise path: hint for NEXT layer's experts
+     if (ctx->prefetch_fadvise && !ctx->layers.empty()) {
+         int next_layer = layer_idx + 1;
+         auto it = ctx->layer_idx_to_pos.find(next_layer);
+         if (it != ctx->layer_idx_to_pos.end()) {
+             const layer_entry & le = ctx->layers[it->second];
+-
+-            // For each token, prefetch its selected experts for next layer
+-            // Deduplicate across tokens to avoid redundant fadvise calls
+-            std::vector<bool> needed(le.n_experts, false);
+-            for (int64_t tok = 0; tok < n_tokens; tok++) {
+-                for (int64_t k = 0; k < n_expert_used; k++) {
+-                    int eid = ctx->topk_buf[tok * n_expert_used + k];
+-                    if (eid >= 0 && eid < le.n_experts) {
+-                        needed[eid] = true;
+-                    }
+-                }
+-            }
+-
+ #if defined(__linux__)
+-            for (int e = 0; e < le.n_experts; e++) {
+-                if (!needed[e]) continue;
+-                const expert_entry & ee = le.experts[e];
+-                if (ee.fd >= 0) {
+-                    posix_fadvise(ee.fd, 0, ee.raw_size, POSIX_FADV_WILLNEED);
+-                    ctx->n_prefetch_calls++;
++            for (int32_t eid : unique_experts) {
++                if (eid >= 0 && eid < le.n_experts) {
++                    const expert_entry & ee = le.experts[eid];
++                    if (ee.fd >= 0) {
++                        posix_fadvise(ee.fd, 0, ee.raw_size, POSIX_FADV_WILLNEED);
++                        ctx->n_prefetch_calls++;
++                    }
+                 }
+             }
+ #endif
+@@ -350,6 +574,7 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     ctx->enabled = true;
+     ctx->n_callbacks = 0;
+     ctx->n_prefetch_calls = 0;
++    ctx->prefetch_iouring = false;
+ 
+     // Configuration from env vars
+     const char * log_env = getenv("LLAMA_FLASH_MOE_LOG_ROUTING");
+@@ -358,6 +583,10 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     const char * fadvise_env = getenv("LLAMA_FLASH_MOE_FADVISE");
+     ctx->prefetch_fadvise = (fadvise_env && strcmp(fadvise_env, "1") == 0);
+ 
++    const char * iouring_env = getenv("LLAMA_FLASH_MOE_IOURING");
++    bool want_iouring = (iouring_env && strcmp(iouring_env, "1") == 0);
++    (void)want_iouring; // may be unused if not compiled with GGML_USE_IOURING
++
+     // Experts directory
+     if (experts_dir) {
+         ctx->experts_dir = experts_dir;
+@@ -376,13 +605,44 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+         }
+     }
+ 
++#if defined(GGML_USE_IOURING)
++    // Initialize io_uring if requested and manifest loaded
++    if (want_iouring && !ctx->layers.empty()) {
++        // Determine max expert size across all layers
++        size_t max_expert_size = 0;
++        for (const auto & layer : ctx->layers) {
++            for (const auto & expert : layer.experts) {
++                if (expert.raw_size > max_expert_size) {
++                    max_expert_size = expert.raw_size;
++                }
++            }
++        }
++
++        // Number of slots = max top-k across any model (typically 4-8, use 16 for safety)
++        int n_slots = MOE_FLASH_MAX_EXPERTS_PER_TOKEN;
++        if (iouring_prefetcher_init(&ctx->iouring_pf, n_slots, max_expert_size)) {
++            ctx->prefetch_iouring = true;
++            // io_uring supersedes fadvise
++            ctx->prefetch_fadvise = false;
++            fprintf(stderr, "moe-flash: io_uring mode active, max expert size=%zu\n", max_expert_size);
++        } else {
++            fprintf(stderr, "moe-flash: io_uring init failed, falling back to fadvise\n");
++            ctx->prefetch_fadvise = true;
++        }
++    }
++#else
++    if (want_iouring) {
++        fprintf(stderr, "moe-flash: io_uring requested but not compiled in (need -DGGML_IOURING=ON)\n");
++    }
++#endif
++
+     // Default: enable routing log if no other mode is set
+-    if (!ctx->prefetch_fadvise) {
++    if (!ctx->prefetch_fadvise && !ctx->prefetch_iouring) {
+         ctx->log_routing = true;
+     }
+ 
+-    fprintf(stderr, "moe-flash: initialized (log=%d, fadvise=%d, experts_dir=%s)\n",
+-            ctx->log_routing, ctx->prefetch_fadvise,
++    fprintf(stderr, "moe-flash: initialized (log=%d, fadvise=%d, iouring=%d, experts_dir=%s)\n",
++            ctx->log_routing, ctx->prefetch_fadvise, ctx->prefetch_iouring,
+             ctx->experts_dir.empty() ? "(none)" : ctx->experts_dir.c_str());
+ 
+     return ctx;
+@@ -394,6 +654,31 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+     fprintf(stderr, "moe-flash: stats: %lld callbacks, %lld prefetch calls\n",
+             (long long)ctx->n_callbacks, (long long)ctx->n_prefetch_calls);
+ 
++#if defined(GGML_USE_IOURING)
++    if (ctx->prefetch_iouring) {
++        // Wait for any remaining pending reads
++        iouring_prefetcher_wait(&ctx->iouring_pf);
++
++        auto & pf = ctx->iouring_pf;
++        fprintf(stderr, "moe-flash: io_uring stats:\n");
++        fprintf(stderr, "  submits: %lld, waits: %lld\n",
++                (long long)pf.n_submits, (long long)pf.n_waits);
++        fprintf(stderr, "  total bytes read: %lld (%.1f MB)\n",
++                (long long)pf.total_bytes_read,
++                (double)pf.total_bytes_read / (1024.0 * 1024.0));
++        if (pf.n_submits > 0) {
++            fprintf(stderr, "  avg submit time: %.1f µs\n",
++                    (double)pf.total_submit_ns / pf.n_submits / 1000.0);
++        }
++        if (pf.n_waits > 0) {
++            fprintf(stderr, "  avg wait time: %.1f µs\n",
++                    (double)pf.total_wait_ns / pf.n_waits / 1000.0);
++        }
++
++        iouring_prefetcher_destroy(&ctx->iouring_pf);
++    }
++#endif
++
+     // Close file descriptors
+     for (auto & layer : ctx->layers) {
+         for (auto & expert : layer.experts) {
+-- 
+2.51.1
+
+
+From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 01:31:23 +0000
+Subject: [PATCH 5/6] moe-flash: fix FD opening for io_uring mode
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Always open expert file descriptors during manifest loading, not just
+when fadvise mode is requested. io_uring mode also needs open FDs to
+submit reads.
+
+Tested on cluster with IPC_LOCK capability: 322 batches, 15.9 GB read,
+avg submit 0.8µs, avg wait 1.6ms (from page cache).
+---
+ src/llama-moe-flash.cpp | 39 ++++++++++++++++++++++++++-------------
+ 1 file changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index 0640a7b22..d0d02bead 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -83,24 +83,37 @@ static bool iouring_prefetcher_init(iouring_prefetcher * pf, int n_slots, size_t
+     pf->n_slots = n_slots;
+     pf->ring_initialized = false;
+ 
+-    // Initialize io_uring with SQPOLL for kernel-side submission
++    // Initialize io_uring
++    // Try SQPOLL first (lower latency), then normal mode, then smaller queue
++    int ret = -1;
+     struct io_uring_params params = {};
+-    // Try SQPOLL first (lower latency), fall back to normal mode
++
++    // Attempt 1: SQPOLL (needs CAP_SYS_NICE or root)
+     params.flags = IORING_SETUP_SQPOLL;
+-    params.sq_thread_idle = 2000; // 2ms idle before parking
++    params.sq_thread_idle = 2000;
++    ret = io_uring_queue_init_params(32, &pf->ring, &params);
+ 
+-    int ret = io_uring_queue_init_params(64, &pf->ring, &params);
+     if (ret < 0) {
+-        // SQPOLL may need CAP_SYS_NICE or root; fall back
++        // Attempt 2: normal mode, moderate queue
+         fprintf(stderr, "moe-flash: SQPOLL init failed (%d), trying normal mode\n", -ret);
+-        memset(&params, 0, sizeof(params));
+-        ret = io_uring_queue_init(64, &pf->ring, 0);
+-        if (ret < 0) {
+-            fprintf(stderr, "moe-flash: io_uring init failed: %d\n", -ret);
+-            return false;
+-        }
++        ret = io_uring_queue_init(32, &pf->ring, 0);
++    }
++
++    if (ret < 0) {
++        // Attempt 3: minimal queue (may work with low memlock limits)
++        fprintf(stderr, "moe-flash: normal init failed (%d), trying minimal queue\n", -ret);
++        ret = io_uring_queue_init(8, &pf->ring, 0);
++    }
++
++    if (ret < 0) {
++        fprintf(stderr, "moe-flash: io_uring init failed: %d (check ulimit -l, currently %d KB)\n",
++                -ret, (int)(sysconf(_SC_MEMLOCK) / 1024));
++        fprintf(stderr, "moe-flash: hint: increase memlock with 'ulimit -l unlimited' or set "
++                "LimitMEMLOCK=infinity in container security context\n");
++        return false;
+     }
+     pf->ring_initialized = true;
++    fprintf(stderr, "moe-flash: io_uring ring created (sq_entries=%u)\n", params.sq_entries);
+ 
+     // Allocate staging slots with aligned memory
+     size_t alloc_size = (max_expert_size + MOE_FLASH_STAGING_ALIGN - 1) & ~(size_t)(MOE_FLASH_STAGING_ALIGN - 1);
+@@ -418,8 +431,8 @@ static bool load_manifest(llama_moe_flash_context * ctx) {
+                 ee.padded_size = atol(ej.c_str() + pc + 1);
+             }
+ 
+-            // Open file descriptor for prefetch
+-            if (!ee.file.empty() && ctx->prefetch_fadvise) {
++            // Open file descriptor for prefetch (fadvise or io_uring)
++            if (!ee.file.empty()) {
+                 std::string path = ctx->experts_dir + "/" + ee.file;
+                 ee.fd = open(path.c_str(), O_RDONLY);
+                 if (ee.fd < 0) {
+-- 
+2.51.1
+
+
+From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 01:43:01 +0000
+Subject: [PATCH 6/6] moe-flash: add GGUF page cache warming mode (Phase 3)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+New mode that reads expert data directly from the GGUF file at the
+known tensor offsets, using io_uring. The reads go into staging buffers
+(discarded), but the side effect is that the kernel populates the page
+cache for those GGUF regions. When the mmap'd tensor is subsequently
+accessed by the Vulkan compute graph, the data is already resident.
+
+This approach requires zero Vulkan changes — the existing mmap-based
+tensor access works unchanged, just without page faults.
+
+Enabled with:
+  LLAMA_FLASH_MOE_GGUF_PATH=/path/to/model.gguf
+
+Includes a minimal GGUF header parser that extracts expert tensor
+offsets and strides (gate, up, down per layer per expert).
+
+Tested on glm-4-7-flash: 64 MB staging, 12 GB read, 368µs avg wait.
+---
+ src/llama-moe-flash.cpp | 353 +++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 333 insertions(+), 20 deletions(-)
+
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index d0d02bead..9efff7012 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -7,6 +7,7 @@
+ #include <cstring>
+ #include <string>
+ #include <vector>
++#include <map>
+ #include <unordered_map>
+ #include <chrono>
+ 
+@@ -20,6 +21,34 @@
+ #include <liburing.h>
+ #endif
+ 
++// ── GGUF source mapping (for page cache warming) ──────────────────────
++
++// Maps (layer, expert) to regions in the original GGUF file.
++// Reading these regions via io_uring warms the page cache so that
++// the mmap'd tensor access doesn't cause major page faults.
++struct gguf_expert_part {
++    size_t offset;   // absolute file offset in the GGUF
++    size_t size;     // bytes to read
++};
++
++struct gguf_expert_region {
++    std::vector<gguf_expert_part> parts; // gate, up, down tensor slices
++    size_t total_size;                    // sum of all parts
++};
++
++struct gguf_layer_source {
++    int layer_idx;
++    int n_experts;
++    std::vector<gguf_expert_region> experts; // indexed by expert_id
++};
++
++struct gguf_source {
++    int         fd;        // open file descriptor for the GGUF
++    std::string path;
++    std::vector<gguf_layer_source> layers;
++    std::unordered_map<int, int> layer_idx_to_pos;
++};
++
+ // ── Manifest types ─────────────────────────────────────────────────────
+ 
+ struct expert_part {
+@@ -163,6 +192,7 @@ static void iouring_prefetcher_destroy(iouring_prefetcher * pf) {
+ }
+ 
+ // Submit async reads for selected experts in the given layer
++// Submit reads from split expert files into staging buffers
+ static void iouring_prefetcher_submit(
+         iouring_prefetcher * pf,
+         const std::vector<layer_entry> & layers,
+@@ -214,6 +244,67 @@ static void iouring_prefetcher_submit(
+     pf->total_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
+ }
+ 
++// Submit reads from original GGUF file to warm page cache.
++// The data goes into staging buffers (which we discard), but the side effect
++// is that the kernel populates the page cache for these GGUF regions.
++// When the mmap'd tensor is subsequently accessed by the Vulkan shader,
++// the data is already in page cache → no major faults.
++static void iouring_prefetcher_submit_gguf(
++        iouring_prefetcher * pf,
++        const gguf_source & src,
++        int layer_idx,
++        const int32_t * expert_ids,
++        int k) {
++    auto it = src.layer_idx_to_pos.find(layer_idx);
++    if (it == src.layer_idx_to_pos.end()) return;
++
++    const gguf_layer_source & ls = src.layers[it->second];
++
++    auto t_start = std::chrono::steady_clock::now();
++
++    // Submit one io_uring read per tensor part per expert.
++    // Each part (gate, up, down) is a separate contiguous region in the GGUF.
++    // The reads go into staging buffers (which are discarded), but the side
++    // effect is that the kernel populates the page cache for these regions.
++    int submitted = 0;
++    int slot_idx = 0;
++    for (int i = 0; i < k; i++) {
++        int eid = expert_ids[i];
++        if (eid < 0 || eid >= ls.n_experts) continue;
++
++        const gguf_expert_region & region = ls.experts[eid];
++
++        for (const auto & part : region.parts) {
++            if (slot_idx >= pf->n_slots) break;
++
++            iouring_staging_slot & slot = pf->slots[slot_idx % pf->n_slots];
++            size_t read_size = std::min(part.size, slot.capacity);
++
++            struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
++            if (!sqe) goto done_submit;
++
++            io_uring_prep_read(sqe, src.fd, slot.data, read_size, part.offset);
++            io_uring_sqe_set_data(sqe, (void *)(uintptr_t)submitted);
++            submitted++;
++        }
++
++        pf->pending_ids[slot_idx] = eid;
++        slot_idx++;
++    }
++
++done_submit:
++    if (submitted > 0) {
++        io_uring_submit(&pf->ring);
++    }
++
++    pf->n_pending = submitted;
++    pf->pending_layer = layer_idx;
++    pf->n_submits++;
++
++    auto t_end = std::chrono::steady_clock::now();
++    pf->total_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
++}
++
+ // Wait for all pending reads to complete
+ static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
+     if (pf->n_pending == 0) return;
+@@ -252,11 +343,15 @@ struct llama_moe_flash_context {
+     bool        log_routing;       // log routing decisions to stderr
+     bool        prefetch_fadvise;  // use posix_fadvise(WILLNEED)
+     bool        prefetch_iouring;  // use io_uring reads
++    bool        gguf_warmcache;   // use io_uring to warm page cache from GGUF
+ 
+     std::string experts_dir;
+     std::vector<layer_entry> layers;
+     std::unordered_map<int, int> layer_idx_to_pos; // layer_idx → position in layers[]
+ 
++    // GGUF source for page cache warming mode
++    gguf_source gguf_src;
++
+     // Scratch buffer for reading tensor data from GPU
+     std::vector<int32_t> topk_buf;
+ 
+@@ -458,6 +553,183 @@ static bool load_manifest(llama_moe_flash_context * ctx) {
+     return !ctx->layers.empty();
+ }
+ 
++// ── GGUF header scanner (for page cache warming) ─────────────────────
++
++// Minimal GGUF header parsing to find expert tensor offsets.
++// This allows io_uring to read from the original GGUF at the exact offsets
++// where expert data lives, warming the page cache for the mmap'd tensor.
++
++static void gguf_skip_value(FILE * f, int vtype) {
++    static const int sizes[] = {1,1,2,2,4,4,4,1,8,0,8,8,8,4};
++    if (vtype == 8) { // string
++        uint64_t len; if (fread(&len, 8, 1, f) != 1) return; fseek(f, (long)len, SEEK_CUR);
++    } else if (vtype == 9) { // array
++        int32_t atype; if (fread(&atype, 4, 1, f) != 1) return;
++        uint64_t alen; if (fread(&alen, 8, 1, f) != 1) return;
++        for (uint64_t i = 0; i < alen; i++) gguf_skip_value(f, atype);
++    } else if (vtype >= 0 && vtype <= 13) {
++        fseek(f, sizes[vtype], SEEK_CUR);
++    }
++}
++
++static std::string gguf_read_string(FILE * f) {
++    uint64_t len = 0;
++    if (fread(&len, 8, 1, f) != 1) return "";
++    std::string s(len, '\0');
++    if (fread(&s[0], 1, len, f) != len) return "";
++    return s;
++}
++
++// GGML type info: (block_size_elements, block_size_bytes)
++static size_t gguf_type_bytes(int ttype, size_t n_elements) {
++    static const int block_elems[] = {1,1,32,32,0,0,32,32,32,32,256,256,256,256,256,256,256,256,256,256,32,256,256,256,256,1,32,32,32,0,256,256,32};
++    static const int block_bytes[] = {4,2,18,20,0,0,20,24,34,36,84,110,144,176,210,292,66,74,98,54,18,110,66,70,56,2,18,18,18,0,54,66,18};
++    if (ttype < 0 || ttype > 32 || block_elems[ttype] == 0) return 0;
++    return (n_elements / block_elems[ttype]) * block_bytes[ttype];
++}
++
++static bool load_gguf_source(gguf_source * src, const char * gguf_path) {
++    FILE * f = fopen(gguf_path, "rb");
++    if (!f) {
++        fprintf(stderr, "moe-flash: cannot open GGUF: %s\n", gguf_path);
++        return false;
++    }
++
++    // Read header
++    char magic[4];
++    if (fread(magic, 4, 1, f) != 1 || memcmp(magic, "GGUF", 4) != 0) {
++        fprintf(stderr, "moe-flash: not a GGUF file: %s\n", gguf_path);
++        fclose(f); return false;
++    }
++    uint32_t version = 0; (void)fread(&version, 4, 1, f);
++    uint64_t n_tensors = 0; (void)fread(&n_tensors, 8, 1, f);
++    uint64_t n_kv = 0; (void)fread(&n_kv, 8, 1, f);
++
++    // Skip KV pairs
++    uint32_t alignment = 32;
++    for (uint64_t i = 0; i < n_kv; i++) {
++        std::string key = gguf_read_string(f);
++        uint32_t vtype = 0; (void)fread(&vtype, 4, 1, f);
++        if (key == "general.alignment" && vtype == 4) {
++            (void)fread(&alignment, 4, 1, f);
++        } else {
++            gguf_skip_value(f, vtype);
++        }
++    }
++
++    // Read tensor metadata
++    struct tensor_meta {
++        std::string name;
++        std::vector<uint64_t> dims;
++        int ttype;
++        uint64_t offset;
++        size_t n_bytes;
++    };
++    std::vector<tensor_meta> tensors;
++
++    for (uint64_t i = 0; i < n_tensors; i++) {
++        tensor_meta tm;
++        tm.name = gguf_read_string(f);
++        uint32_t n_dims = 0; (void)fread(&n_dims, 4, 1, f);
++        tm.dims.resize(n_dims);
++        for (uint32_t d = 0; d < n_dims; d++) {
++            (void)fread(&tm.dims[d], 8, 1, f);
++        }
++        uint32_t ttype = 0; (void)fread(&ttype, 4, 1, f);
++        tm.ttype = ttype;
++        (void)fread(&tm.offset, 8, 1, f);
++
++        size_t n_elements = 1;
++        for (auto d : tm.dims) n_elements *= d;
++        tm.n_bytes = gguf_type_bytes(ttype, n_elements);
++
++        tensors.push_back(std::move(tm));
++    }
++
++    // Data section starts at next alignment boundary
++    size_t data_start = ((size_t)ftell(f) + alignment - 1) & ~(size_t)(alignment - 1);
++    fclose(f);
++
++    // Open the GGUF for io_uring reads
++    src->fd = open(gguf_path, O_RDONLY);
++    if (src->fd < 0) {
++        fprintf(stderr, "moe-flash: cannot open GGUF for reading: %s\n", gguf_path);
++        return false;
++    }
++    src->path = gguf_path;
++
++    // Build expert offset map from tensor metadata
++    // Expert tensors follow the pattern: blk.N.ffn_{gate,up,down}_exps.weight
++    // Shape: [inner_dims..., n_experts] — expert is last dimension
++    std::map<int, std::map<std::string, tensor_meta *>> by_layer;
++
++    for (auto & tm : tensors) {
++        if (tm.name.find("_exps") == std::string::npos) continue;
++        // Parse layer: "blk.N.ffn_*_exps.weight"
++        size_t dot1 = tm.name.find('.');
++        size_t dot2 = tm.name.find('.', dot1 + 1);
++        if (dot1 == std::string::npos || dot2 == std::string::npos) continue;
++        int layer = atoi(tm.name.c_str() + dot1 + 1);
++
++        // Determine type: gate, up, down, or gate_up
++        std::string type;
++        if (tm.name.find("gate_up_exps") != std::string::npos) type = "gate_up";
++        else if (tm.name.find("gate_exps") != std::string::npos) type = "gate";
++        else if (tm.name.find("up_exps") != std::string::npos) type = "up";
++        else if (tm.name.find("down_exps") != std::string::npos) type = "down";
++        else continue;
++
++        by_layer[layer][type] = &tm;
++    }
++
++    // Build layer entries
++    for (auto & [layer_idx, types] : by_layer) {
++        gguf_layer_source ls;
++        ls.layer_idx = layer_idx;
++
++        // Determine n_experts from the last dimension of any expert tensor
++        int n_experts = 0;
++        for (auto & [type, tm] : types) {
++            if (!tm->dims.empty()) {
++                n_experts = (int)tm->dims.back();
++                break;
++            }
++        }
++        ls.n_experts = n_experts;
++        ls.experts.resize(n_experts);
++
++        // For each expert, collect individual tensor parts (gate, up, down)
++        for (int e = 0; e < n_experts; e++) {
++            gguf_expert_region region;
++            region.total_size = 0;
++
++            for (auto & [type, tm] : types) {
++                size_t inner_elements = 1;
++                for (size_t d = 0; d + 1 < tm->dims.size(); d++) {
++                    inner_elements *= tm->dims[d];
++                }
++                size_t expert_stride = gguf_type_bytes(tm->ttype, inner_elements);
++                size_t abs_offset = data_start + tm->offset + (size_t)e * expert_stride;
++
++                region.parts.push_back({abs_offset, expert_stride});
++                region.total_size += expert_stride;
++            }
++
++            ls.experts[e] = std::move(region);
++        }
++
++        src->layer_idx_to_pos[layer_idx] = (int)src->layers.size();
++        src->layers.push_back(std::move(ls));
++    }
++
++    fprintf(stderr, "moe-flash: loaded GGUF source: %zu MoE layers, %d experts/layer, data_start=%zu\n",
++            src->layers.size(),
++            src->layers.empty() ? 0 : src->layers[0].n_experts,
++            data_start);
++
++    return !src->layers.empty();
++}
++
+ // ── Eval callback ──────────────────────────────────────────────────────
+ 
+ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+@@ -534,20 +806,28 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+     }
+ 
+ #if defined(GGML_USE_IOURING)
+-    // io_uring path: wait for previous layer's reads, then submit for current layer
+     if (ctx->prefetch_iouring) {
+         // Wait for any pending reads from previous submission
+         iouring_prefetcher_wait(&ctx->iouring_pf);
+ 
+-        // Submit reads for the CURRENT layer's experts (we now know which ones)
+-        // The data will be ready by the time the MUL_MAT_ID op needs it
+-        // (there's attention compute between routing and expert matmul)
+-        iouring_prefetcher_submit(
+-            &ctx->iouring_pf,
+-            ctx->layers, ctx->layer_idx_to_pos,
+-            layer_idx,
+-            unique_experts.data(),
+-            (int)unique_experts.size());
++        if (ctx->gguf_warmcache && ctx->gguf_src.fd >= 0) {
++            // Page cache warming mode: read from GGUF at expert offsets
++            // This warms the page cache so the mmap'd tensor doesn't page-fault
++            iouring_prefetcher_submit_gguf(
++                &ctx->iouring_pf,
++                ctx->gguf_src,
++                layer_idx,
++                unique_experts.data(),
++                (int)unique_experts.size());
++        } else {
++            // Staging buffer mode: read from split expert files
++            iouring_prefetcher_submit(
++                &ctx->iouring_pf,
++                ctx->layers, ctx->layer_idx_to_pos,
++                layer_idx,
++                unique_experts.data(),
++                (int)unique_experts.size());
++        }
+         ctx->n_prefetch_calls += unique_experts.size();
+     }
+ #endif
+@@ -600,6 +880,11 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     bool want_iouring = (iouring_env && strcmp(iouring_env, "1") == 0);
+     (void)want_iouring; // may be unused if not compiled with GGML_USE_IOURING
+ 
++    // GGUF path for page cache warming mode (Phase 3)
++    const char * gguf_path_env = getenv("LLAMA_FLASH_MOE_GGUF_PATH");
++    ctx->gguf_warmcache = false;
++    ctx->gguf_src.fd = -1;
++
+     // Experts directory
+     if (experts_dir) {
+         ctx->experts_dir = experts_dir;
+@@ -619,25 +904,47 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     }
+ 
+ #if defined(GGML_USE_IOURING)
+-    // Initialize io_uring if requested and manifest loaded
+-    if (want_iouring && !ctx->layers.empty()) {
+-        // Determine max expert size across all layers
++    // Load GGUF source for page cache warming (if GGUF path provided)
++    if (want_iouring && gguf_path_env) {
++        if (load_gguf_source(&ctx->gguf_src, gguf_path_env)) {
++            ctx->gguf_warmcache = true;
++            fprintf(stderr, "moe-flash: GGUF page cache warming mode enabled\n");
++        }
++    }
++
++    // Initialize io_uring if requested
++    if (want_iouring && (ctx->gguf_warmcache || !ctx->layers.empty())) {
++        // Determine max expert size
+         size_t max_expert_size = 0;
+-        for (const auto & layer : ctx->layers) {
+-            for (const auto & expert : layer.experts) {
+-                if (expert.raw_size > max_expert_size) {
+-                    max_expert_size = expert.raw_size;
++
++        if (ctx->gguf_warmcache) {
++            // Use max individual tensor part size (not total per expert)
++            for (const auto & layer : ctx->gguf_src.layers) {
++                for (const auto & expert : layer.experts) {
++                    for (const auto & part : expert.parts) {
++                        if (part.size > max_expert_size) {
++                            max_expert_size = part.size;
++                        }
++                    }
++                }
++            }
++        } else {
++            // Use manifest sizes
++            for (const auto & layer : ctx->layers) {
++                for (const auto & expert : layer.experts) {
++                    if (expert.raw_size > max_expert_size) {
++                        max_expert_size = expert.raw_size;
++                    }
+                 }
+             }
+         }
+ 
+-        // Number of slots = max top-k across any model (typically 4-8, use 16 for safety)
+         int n_slots = MOE_FLASH_MAX_EXPERTS_PER_TOKEN;
+         if (iouring_prefetcher_init(&ctx->iouring_pf, n_slots, max_expert_size)) {
+             ctx->prefetch_iouring = true;
+-            // io_uring supersedes fadvise
+             ctx->prefetch_fadvise = false;
+-            fprintf(stderr, "moe-flash: io_uring mode active, max expert size=%zu\n", max_expert_size);
++            fprintf(stderr, "moe-flash: io_uring mode active (warmcache=%d), max expert size=%zu\n",
++                    ctx->gguf_warmcache, max_expert_size);
+         } else {
+             fprintf(stderr, "moe-flash: io_uring init failed, falling back to fadvise\n");
+             ctx->prefetch_fadvise = true;
+@@ -692,6 +999,12 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+     }
+ #endif
+ 
++    // Close GGUF source fd
++    if (ctx->gguf_src.fd >= 0) {
++        close(ctx->gguf_src.fd);
++        ctx->gguf_src.fd = -1;
++    }
++
+     // Close file descriptors
+     for (auto & layer : ctx->layers) {
+         for (auto & expert : layer.experts) {
+-- 
+2.51.1
+

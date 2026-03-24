@@ -1,0 +1,13 @@
+# llama.cpp checkout (cloned during development, not part of this repo)
+llama.cpp/
+
+# Build artifacts
+build/
+build-*/
+*.o
+*.so
+*.a
+
+# Python
+__pycache__/
+*.pyc
