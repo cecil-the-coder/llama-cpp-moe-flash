@@ -2,7 +2,7 @@ warning: refname 'b8298' is ambiguous.
 From b72b9cf71932a2306e2cebcad3ccd59437cf02a5 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:18:57 +0000
-Subject: [PATCH 1/8] moe-flash: add eval callback for expert routing
+Subject: [PATCH 1/9] moe-flash: add eval callback for expert routing
  interception
 
 Add llama-moe-flash module that installs an eval callback to intercept
@@ -515,7 +515,7 @@ index b4373c101..59af6bdab 100644
 From 42867e94b531501373a1720251b7ad867e791681 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:41:14 +0000
-Subject: [PATCH 2/8] moe-flash: fix JSON manifest parser for large expert
+Subject: [PATCH 2/9] moe-flash: fix JSON manifest parser for large expert
  counts
 
 Use bracket-matching to properly delimit layer and expert objects
@@ -691,7 +691,7 @@ index 578dd1a08..50fe9aa5f 100644
 From e611745c7e171fd90baa077da482103ac7552ac1 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 23 Mar 2026 23:42:41 +0000
-Subject: [PATCH 3/8] moe-flash: fix bracket-matching to use local string
+Subject: [PATCH 3/9] moe-flash: fix bracket-matching to use local string
  reference
 
 The find_matching_bracket lambda was capturing 'json' by reference
@@ -748,7 +748,7 @@ index 50fe9aa5f..ef89f5496 100644
 From ff9a7b4ff5382d7709e43052c76bd27151108631 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:15:29 +0000
-Subject: [PATCH 4/8] moe-flash: add io_uring expert reads with staging buffers
+Subject: [PATCH 4/9] moe-flash: add io_uring expert reads with staging buffers
 
 Add io_uring-based async read path for MoE expert weights. When enabled
 with LLAMA_FLASH_MOE_IOURING=1 and built with -DGGML_IOURING=ON:
@@ -1211,7 +1211,7 @@ index ef89f5496..0640a7b22 100644
 From 4688c1605688ff543e79d64d9826fdf7d66eec80 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:31:23 +0000
-Subject: [PATCH 5/8] moe-flash: fix FD opening for io_uring mode
+Subject: [PATCH 5/9] moe-flash: fix FD opening for io_uring mode
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1297,7 +1297,7 @@ index 0640a7b22..d0d02bead 100644
 From 6cdcb2cd0b3d9d04188684082d4ab989e2f1577e Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 01:43:01 +0000
-Subject: [PATCH 6/8] moe-flash: add GGUF page cache warming mode (Phase 3)
+Subject: [PATCH 6/9] moe-flash: add GGUF page cache warming mode (Phase 3)
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -1774,7 +1774,7 @@ index d0d02bead..9efff7012 100644
 From 6ef77a18e4aefc92cb10b3850cebe10c12d71e00 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:25:26 +0000
-Subject: [PATCH 7/8] moe-flash: fall back to HF_SOURCE env for GGUF path
+Subject: [PATCH 7/9] moe-flash: fall back to HF_SOURCE env for GGUF path
 
 ---
  src/llama-moe-flash.cpp | 8 ++++++++
@@ -1807,7 +1807,7 @@ index 9efff7012..f79ae43bd 100644
 From 6816f953cb232dc78a9a9238a8de90dccac120ef Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Tue, 24 Mar 2026 02:51:45 +0000
-Subject: [PATCH 8/8] moe-flash: add zero-overhead prefetch and fadvise modes
+Subject: [PATCH 8/9] moe-flash: add zero-overhead prefetch and fadvise modes
 
 The eval callback serializes graph execution (~7x slowdown on large
 models). Add two new modes that have zero inference overhead:
@@ -2203,6 +2203,260 @@ index 59af6bdab..f1504c256 100644
          }
  
          llama_init = common_init_from_params(params_base);
+-- 
+2.51.1
+
+
+From 9fd000239625c0178ded6cb89f06401162bcd90f Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Tue, 24 Mar 2026 03:19:38 +0000
+Subject: [PATCH 9/9] moe-flash: add multi-shard GGUF support
+
+Detect split GGUF patterns (*-NNNNN-of-NNNNN.gguf) and load all shards,
+merging their MoE layer maps. Each layer tracks which shard fd to use
+for fadvise calls.
+
+Fixes: qwen3-235b-a22b only loaded 55/92 MoE layers (shard 1).
+Required for: DeepSeek-R1-0528 671B Q2_K (5 shards, 61 MoE layers).
+---
+ src/llama-moe-flash.cpp | 139 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 126 insertions(+), 13 deletions(-)
+
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index c47fafa2c..f531fc6d7 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -7,6 +7,7 @@
+ #include <cstring>
+ #include <string>
+ #include <vector>
++#include <algorithm>
+ #include <map>
+ #include <unordered_map>
+ #include <atomic>
+@@ -40,15 +41,17 @@ struct gguf_expert_region {
+ 
+ struct gguf_layer_source {
+     int layer_idx;
++    int fd;        // file descriptor for the GGUF shard containing this layer
+     int n_experts;
+     std::vector<gguf_expert_region> experts; // indexed by expert_id
+ };
+ 
+ struct gguf_source {
+-    int         fd;        // open file descriptor for the GGUF
++    int         fd;        // open file descriptor for first shard
+     std::string path;
+     std::vector<gguf_layer_source> layers;
+     std::unordered_map<int, int> layer_idx_to_pos;
++    std::vector<int> extra_fds; // fds for additional shards
+ };
+ 
+ // ── Manifest types ─────────────────────────────────────────────────────
+@@ -704,6 +707,7 @@ static bool load_gguf_source(gguf_source * src, const char * gguf_path) {
+     for (auto & [layer_idx, types] : by_layer) {
+         gguf_layer_source ls;
+         ls.layer_idx = layer_idx;
++        ls.fd = src->fd;
+ 
+         // Determine n_experts from the last dimension of any expert tensor
+         int n_experts = 0;
+@@ -740,7 +744,7 @@ static bool load_gguf_source(gguf_source * src, const char * gguf_path) {
+         src->layers.push_back(std::move(ls));
+     }
+ 
+-    fprintf(stderr, "moe-flash: loaded GGUF source: %zu MoE layers, %d experts/layer, data_start=%zu\n",
++    fprintf(stderr, "moe-flash: loaded GGUF shard: %zu MoE layers, %d experts/layer, data_start=%zu\n",
+             src->layers.size(),
+             src->layers.empty() ? 0 : src->layers[0].n_experts,
+             data_start);
+@@ -748,6 +752,115 @@ static bool load_gguf_source(gguf_source * src, const char * gguf_path) {
+     return !src->layers.empty();
+ }
+ 
++// Load all shards of a multi-shard GGUF.
++// Detects patterns like "model-00001-of-00005.gguf" and loads all shards,
++// merging their layer maps into a single gguf_source.
++static bool load_gguf_source_multi(gguf_source * src, const char * gguf_path) {
++    std::string path(gguf_path);
++
++    // Detect multi-shard pattern: *-NNNNN-of-NNNNN.gguf
++    size_t of_pos = path.rfind("-of-");
++    if (of_pos == std::string::npos) {
++        // Single shard
++        return load_gguf_source(src, gguf_path);
++    }
++
++    // Find the shard number start
++    size_t dash_pos = path.rfind('-', of_pos - 1);
++    if (dash_pos == std::string::npos) {
++        return load_gguf_source(src, gguf_path);
++    }
++
++    // Extract total shards
++    size_t dot_pos = path.rfind(".gguf");
++    if (dot_pos == std::string::npos) {
++        return load_gguf_source(src, gguf_path);
++    }
++
++    std::string total_str = path.substr(of_pos + 4, dot_pos - (of_pos + 4));
++    int n_shards = atoi(total_str.c_str());
++    if (n_shards <= 0 || n_shards > 100) {
++        return load_gguf_source(src, gguf_path);
++    }
++
++    std::string prefix = path.substr(0, dash_pos + 1);
++    std::string suffix = path.substr(of_pos); // "-of-NNNNN.gguf"
++    int shard_digits = (int)(of_pos - dash_pos - 1); // number of digits in shard number
++
++    fprintf(stderr, "moe-flash: detected %d GGUF shards\n", n_shards);
++
++    // Track extra fds for shards beyond the first
++    std::vector<int> extra_fds;
++
++    for (int s = 1; s <= n_shards; s++) {
++        char shard_num[16];
++        snprintf(shard_num, sizeof(shard_num), "%0*d", shard_digits, s);
++        std::string shard_path = prefix + shard_num + suffix;
++
++        if (s == 1) {
++            // First shard: load into src directly
++            if (!load_gguf_source(src, shard_path.c_str())) {
++                fprintf(stderr, "moe-flash: failed to load shard 1: %s\n", shard_path.c_str());
++                return false;
++            }
++        } else {
++            // Subsequent shards: load into a temp source and merge layers
++            gguf_source tmp;
++            tmp.fd = -1;
++            if (!load_gguf_source(&tmp, shard_path.c_str())) {
++                fprintf(stderr, "moe-flash: failed to load shard %d: %s\n", s, shard_path.c_str());
++                continue;
++            }
++
++            // Merge layers from this shard into the main source
++            for (auto & layer : tmp.layers) {
++                // Check if this layer already exists (split across shards)
++                auto it = src->layer_idx_to_pos.find(layer.layer_idx);
++                if (it != src->layer_idx_to_pos.end()) {
++                    // Layer exists in a previous shard — merge expert parts
++                    auto & existing = src->layers[it->second];
++                    for (int e = 0; e < layer.n_experts && e < existing.n_experts; e++) {
++                        for (auto & part : layer.experts[e].parts) {
++                            existing.experts[e].parts.push_back(part);
++                            existing.experts[e].total_size += part.size;
++                        }
++                    }
++                    // Update fd to the shard that has the additional parts
++                    // (keep existing fd for existing parts, new parts have tmp.fd)
++                } else {
++                    // New layer — add to source
++                    src->layer_idx_to_pos[layer.layer_idx] = (int)src->layers.size();
++                    src->layers.push_back(std::move(layer));
++                }
++            }
++
++            // Keep the shard fd alive (don't close it — layers reference it)
++            extra_fds.push_back(tmp.fd);
++            tmp.fd = -1; // prevent close in destructor
++        }
++    }
++
++    // Store extra fds so they get closed on cleanup
++    // (We'll store them in a vector on the source)
++    src->extra_fds = std::move(extra_fds);
++
++    // Sort layers by index
++    std::sort(src->layers.begin(), src->layers.end(),
++              [](const gguf_layer_source & a, const gguf_layer_source & b) {
++                  return a.layer_idx < b.layer_idx;
++              });
++    // Rebuild index
++    src->layer_idx_to_pos.clear();
++    for (size_t i = 0; i < src->layers.size(); i++) {
++        src->layer_idx_to_pos[src->layers[i].layer_idx] = (int)i;
++    }
++
++    fprintf(stderr, "moe-flash: total after merging %d shards: %zu MoE layers\n",
++            n_shards, src->layers.size());
++
++    return !src->layers.empty();
++}
++
+ // ── Background prefetch thread (Option C) ─────────────────────────────
+ //
+ // Continuously cycles through MoE layers calling madvise(MADV_WILLNEED)
+@@ -780,10 +893,7 @@ static void prefetch_thread_fn(llama_moe_flash_context * ctx) {
+             for (int e = 0; e < ls.n_experts; e++) {
+                 const gguf_expert_region & region = ls.experts[e];
+                 for (const auto & part : region.parts) {
+-                    // Convert GGUF file offset to mmap address
+-                    // We use posix_fadvise on the fd since we may not have
+-                    // access to the mmap base address
+-                    posix_fadvise(ctx->gguf_src.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++                    posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
+                     ctx->prefetch_madvise_calls++;
+                 }
+             }
+@@ -806,12 +916,11 @@ static void pre_graph_fadvise_all(llama_moe_flash_context * ctx) {
+     // This is speculative — we don't know which experts will be selected,
+     // so we advise all of them. The kernel will start readahead.
+ #if defined(__linux__)
+-    if (ctx->gguf_src.fd < 0) return;
+-
+     for (const auto & ls : ctx->gguf_src.layers) {
++        if (ls.fd < 0) continue;
+         for (int e = 0; e < ls.n_experts; e++) {
+             for (const auto & part : ls.experts[e].parts) {
+-                posix_fadvise(ctx->gguf_src.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
+                 ctx->n_prefetch_calls++;
+             }
+         }
+@@ -1016,7 +1125,7 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+ #if defined(GGML_USE_IOURING)
+     // Load GGUF source for page cache warming (if GGUF path provided)
+     if (want_iouring && gguf_path_env) {
+-        if (load_gguf_source(&ctx->gguf_src, gguf_path_env)) {
++        if (load_gguf_source_multi(&ctx->gguf_src, gguf_path_env)) {
+             ctx->gguf_warmcache = true;
+             fprintf(stderr, "moe-flash: GGUF page cache warming mode enabled\n");
+         }
+@@ -1068,7 +1177,7 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+ 
+     // Start background prefetch thread if in prefetch mode
+ #if defined(__linux__)
+-    if (ctx->mode == MOE_FLASH_MODE_PREFETCH && ctx->gguf_src.fd >= 0) {
++    if (ctx->mode == MOE_FLASH_MODE_PREFETCH && !ctx->gguf_src.layers.empty()) {
+         ctx->prefetch_running.store(true);
+         ctx->prefetch_thread = std::thread(prefetch_thread_fn, ctx);
+     }
+@@ -1082,7 +1191,7 @@ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir)
+     const char * mode_names[] = {"callback", "prefetch", "fadvise"};
+     fprintf(stderr, "moe-flash: initialized (mode=%s, gguf=%s)\n",
+             mode_names[ctx->mode],
+-            ctx->gguf_src.fd >= 0 ? ctx->gguf_src.path.c_str() : "(none)");
++            !ctx->gguf_src.layers.empty() ? ctx->gguf_src.path.c_str() : "(none)");
+ 
+     return ctx;
+ }
+@@ -1127,11 +1236,15 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+     }
+ #endif
+ 
+-    // Close GGUF source fd
++    // Close GGUF source fds (all shards)
+     if (ctx->gguf_src.fd >= 0) {
+         close(ctx->gguf_src.fd);
+         ctx->gguf_src.fd = -1;
+     }
++    for (int fd : ctx->gguf_src.extra_fds) {
++        if (fd >= 0) close(fd);
++    }
++    ctx->gguf_src.extra_fds.clear();
+ 
+     // Close file descriptors
+     for (auto & layer : ctx->layers) {
 -- 
 2.51.1
 

@@ -253,13 +253,21 @@ GPU sync points per token instead of running the entire graph as one submission.
 **Conclusion**: The `cb_eval` approach is too expensive for production use on large
 models. Need a mechanism that doesn't serialize the graph.
 
-### Alternative Approaches to Evaluate
+### Mode Comparison (qwen3-235b-a22b, 200 tokens, image 1790a42)
 
-| Option | Mechanism | Overhead | Accuracy |
-|---|---|---|---|
-| A: Speculative fadvise | `posix_fadvise(WILLNEED)` on all expert regions before graph | Zero | Low (reads all experts, not just top-k) |
-| B: Lightweight callback | Return `ask=false` always, use separate mechanism | Near-zero | Needs different data path |
-| C: madvise prefetch thread | `madvise(MADV_WILLNEED)` on mmap regions from bg thread | Zero | Can be targeted if we get routing info cheaply |
+| Mode | Prompt t/s | Gen t/s | ms/tok | vs Baseline | Notes |
+|---|---|---|---|---|---|
+| Baseline (no flash) | 18.2 | **20.9** | 47.9 | 1.00x | No eval callback |
+| **Prefetch** (bg thread) | 18.3 | **21.0** | 47.5 | **1.00x** | Zero overhead, default mode |
+| Fadvise (pre-graph all) | 17.8 | 14.0 | 71.6 | 0.67x | 21K fadvise syscalls/graph |
+| Callback (eval cb) | 13.4 | 3.0 | 330.1 | 0.14x | Serializes graph execution |
+
+**Winner: Prefetch mode** — background thread running `posix_fadvise(WILLNEED)` on
+expert GGUF regions independently of inference. Zero measured overhead.
+
+The fadvise-all mode is too chatty (55 layers × 128 experts × 3 parts = 21K syscalls
+per graph compute). The callback mode serializes GPU execution via
+`ggml_backend_synchronize` between every node batch.
 
 ---
 
