@@ -196,23 +196,32 @@ expert tensors to CPU.
   **Working at 1.37 t/s** with --cpu-moe + --no-warmup + disabled prefetch.
   Vulkan uses 10.7 GB (8.5% of GTT). Expert matmul on CPU.
 
-- [ ] **P3.7** — Get expert matmul on Vulkan GPU
-  Current: `--cpu-moe` routes MUL_MAT_ID to CPU (1.37 t/s). Expert matmul on GPU
-  would be significantly faster.
+- [ ] **P3.7** — Validate buffer_from_host_ptr on qwen3-235b (80 GB < 120 GB GTT)
+  Test the buffer_from_host_ptr + alignment fix on a model that fits in GTT.
+  If 80 GB imports successfully, we have zero-copy Vulkan with full GPU matmul.
+  This validates the fix before tackling models > GTT.
+
+- [ ] **P3.8** — Get expert matmul on Vulkan GPU for models > GTT
+  Current: `--cpu-moe` routes MUL_MAT_ID to CPU (1.37 t/s on DeepSeek 671B).
 
   **Tested and failed:**
-  - Full `buffer_from_host_ptr` import (228 GB): OOMs the node. Kernel can't handle
-    228 GB of VK_EXT_external_memory_host imports on 125 GB RAM, even with the
-    alignment fix and prefetch disabled.
+  - Full `buffer_from_host_ptr` import (228 GB): kernel OOM. Even with alignment
+    fix and prefetch disabled, importing 228 GB exceeds what the kernel allows.
 
-  **Remaining approach: Staging buffer per MUL_MAT_ID dispatch**
-  - Allocate a Vulkan staging buffer (~120 MB for top-8 experts)
-  - In `ggml_vk_mul_mat_id_q_f16`, detect CPU-resident src0 on UMA
-  - Read the routing IDs, memcpy only used experts from mmap into staging
-  - Bind staging as d_Qx for the shader dispatch
-  - On UMA, memcpy is ~200 GB/s → 120 MB in ~0.6ms
-  - This adds ~0.6ms per layer (61 layers × 0.6ms = ~37ms/token overhead)
-  - With GPU matmul speedup (10-50x vs CPU), net result should be much faster
+  **Root cause analysis:**
+  - Scheduler already offloads MUL_MAT_ID to Vulkan when src0 is on CPU host buffer
+  - Scheduler allocates `input_cpy` at FULL expert tensor size (~46 GB per shard)
+  - Selective copy (ggml-backend.cpp:1480-1564) only copies used experts (8/256)
+    but the destination buffer must be full-size for shader indexing
+  - vkAllocateMemory for the full-size copy buffer exceeds GTT/kernel limits
+
+  **Approaches (in order of complexity):**
+  1. Per-layer `buffer_from_host_ptr` import/release: import ~1.5 GB for one layer's
+     expert tensor, dispatch MUL_MAT_ID, release. Never >1.5 GB of extra GTT.
+  2. Compact staging buffer + shader indirection: 8-slot staging buffer, remap expert
+     IDs to dense indices 0-7. Requires GLSL shader changes.
+  3. Modify gallocr to allocate expert copy buffer at K×expert_size instead of
+     N×expert_size. Requires scheduler + shader changes for dense indexing.
 
 ---
 

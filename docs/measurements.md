@@ -352,24 +352,41 @@ or implement the staging buffer approach from the original design.
 
 ## Summary
 
-| Metric | Value | Notes |
-|---|---|---|
-| llama.cpp version | b8298 (`f90bd1dd`) | Tag `b8298` |
-| Routing tensor backend | **Vulkan** | Readback needed for eval callback |
-| TTFT (scale-from-zero, warm cache) | **6.50s** | ~3s model load, ~2.5s k8s overhead |
-| Generation TPS (warm) | **59 t/s** | 17ms/token window for prefetch |
-| Major faults (warm) | **0** | Model fully in page cache (small model) |
-| NVMe reads (warm) | **0** | All served from cache |
+### All benchmark results
 
-### Key Design Implications
+| Model | Size | Config | Prompt t/s | Gen t/s | Notes |
+|---|---|---|---|---|---|
+| glm-4-7-flash | 17 GB | Baseline (no flash) | 88.5 | **59.0** | Fits in RAM, no benefit |
+| glm-4-7-flash | 17 GB | Prefetch thread | 88.5 | **59.0** | Zero overhead confirmed |
+| glm-4-7-flash | 17 GB | Eval callback | — | **25.3** | 2.3x slower (serialized) |
+| qwen3-235b-a22b | 80 GB | Baseline (no flash) | 18.2 | **20.9** | Fits in RAM |
+| qwen3-235b-a22b | 80 GB | Prefetch thread | 18.3 | **21.0** | Zero overhead |
+| qwen3-235b-a22b | 80 GB | Eval callback | 13.4 | **3.0** | 7x slower |
+| qwen3-235b-a22b | 80 GB | Fadvise (pre-graph) | 17.8 | **14.0** | 21K syscalls overhead |
+| qwen3-235b-a22b | 80 GB | cpu-moe + prefetch | 16.5 | **9.4** | Expert matmul on CPU |
+| DeepSeek-R1-0528 | 228 GB | CPU-only | 0.88 | **1.31** | Pure CPU, mmap |
+| DeepSeek-R1-0528 | 228 GB | cpu-moe + no-warmup | 1.13 | **1.37** | Vulkan attn, CPU experts |
 
-1. **P0.4 is the critical blocker**: Routing tensor on Vulkan means Phase 2 must include
-   a readback mechanism. On UMA (Strix Halo), this is a cache-coherent read, not a PCIe
-   transfer, so overhead should be low (~μs).
+### Key findings
 
-2. **17ms generation window**: The prefetch system has 17ms per token to issue and
-   complete io_uring reads for the next layer's experts. At NVMe speeds (~5 GB/s),
-   this allows reading ~85 MB per token — more than enough for any MoE expert size.
+1. **Prefetch thread mode** is the production answer for models ≤ RAM. Zero overhead.
 
-3. **Small models don't benefit**: glm-4-7-flash fits in RAM. The real target is
-   qwen3-235b-a22b where memory pressure will cause page faults.
+2. **Eval callback** serializes GPU execution (7x slower on large models). Not viable.
+
+3. **Models > RAM** require three patches:
+   - Disable mmap prefetch (avoid paging in entire model)
+   - `--cpu-moe` (keep expert tensors mmap'd, not in Vulkan)
+   - `--no-warmup` (skip initial forward pass that OOMs)
+
+4. **buffer_from_host_ptr** fix (alignment + conditional enable) allows zero-copy mmap
+   import on UMA for models ≤ GTT (120 GB). Needs validation on qwen3-235b.
+
+5. **Models > GTT** (228 GB on 120 GB GTT) can't import via buffer_from_host_ptr.
+   Need staging buffer approach or per-layer import for GPU expert matmul.
+
+6. **GPU memory on UMA** (Strix Halo):
+   - Single memory heap: 125 GB (= physical RAM)
+   - Single type: DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT + HOST_CACHED
+   - GTT limit: 120 GB (kernel param `amdgpu.gttsize=122880`)
+   - VRAM carve-out: 512 MB
+   - Vulkan budget: 125 GB, but kernel limits to 120 GB GTT
