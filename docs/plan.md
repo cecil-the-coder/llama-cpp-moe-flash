@@ -262,12 +262,12 @@ expert tensors to CPU.
 
   **Three viable approaches to reduce split cost:**
 
-  - [x] **P3.8a** — Pipeline parallelism (`n_copies=2`) — **OOM for q4km, untested for deepseek**
+  - [x] **P3.8a** — Pipeline parallelism (`n_copies=2`) — **FAILED: OOM on both models**
     Enabled by relaxing `model.n_devices() > 1` gate (image `55060be`).
-    q4km (133 GB): 2× compute buffer (~1.5 GB) + alloc+copy for 47 GB Vulkan
-    shard → total GTT ~141 GB > 120 GB → OOM, took down the shadow node.
-    deepseek (228 GB): should be safe (only ~10 GB Vulkan + ~6 GB compute).
-    **TODO**: test with deepseek once shadow node is back up.
+    OOM'd both q4km (133 GB) and deepseek (228 GB), taking down shadow node.
+    `n_copies=2` doubles ALL intermediate tensor allocations in the graph,
+    not just the compute buffer. Fundamentally incompatible with models
+    that already push memory limits.
 
   - [ ] **P3.8b** — Dynamic import inside split copy phase
     In `ggml_backend_sched_compute_splits` (line 1480), when copying expert
