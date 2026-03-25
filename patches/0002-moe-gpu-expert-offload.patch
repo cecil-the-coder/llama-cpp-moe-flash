@@ -98,17 +98,16 @@ index bc57df20b..40b2b05ed 100644
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..f0d337114 100644
+index e510a92ce..efd8d0412 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -2,6 +2,7 @@
+@@ -1,5 +1,6 @@
+ #include "ggml-vulkan.h"
  #include <vulkan/vulkan_core.h>
++#include <csignal>
  #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
  #include <chrono>
-+#include <csignal>
  #include "ggml-cpu.h"
- #endif
- 
 @@ -6322,6 +6323,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
      }
  }
