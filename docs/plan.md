@@ -275,22 +275,29 @@ expert tensors to CPU.
     to import the mmap'd memory region. Zero-copy on UMA. Keep the split
     structure for synchronization but eliminate the copy cost (~420 MB/token).
 
-  - [~] **P3.8c** — Per-op split bypass with dynamic host import (image `14384ee`)
-    Instead of `supports_buft`, modify split creation + input copy logic:
-    skip `need_new_split` and skip copy creation for host-buffer weights when
-    the backend has `buffer_from_host_ptr` capability. No gallocr impact.
+  - [~] **P3.8c** — Per-op split bypass with dynamic host import (image `9309283`)
+    Modified scheduler to skip `need_new_split` and skip copy creation for
+    MUL_MAT_ID ops with host-buffer weights when backend has `buffer_from_host_ptr`.
     Dynamic VK_EXT_external_memory_host import in Vulkan tensor_subbuffer.
-    Model loader wraps CPU buft mmap via `ggml_backend_cpu_buffer_from_ptr`.
+    4096-byte ggml_aligned_malloc for page-aligned CPU buffers.
 
-    **Status**: Code compiles and deploys. Needs testing on a fresh node.
-    Previous tests were confounded by repeated OOM crashes degrading node
-    memory state — even the stable image couldn't load deepseek after
-    multiple OOMs. Node needs clean reboot before testing.
+    **Split reduction verified**: glm 140→2, Q2_K 284→2. Scheduler works.
 
-    **Known fixes applied**:
-    - Null check on `src->buffer` in copy bypass
-    - Restrict mmap-wrap to `buft == ggml_backend_cpu_buffer_type()` only
-      (not Vulkan_Host, which broke its alloc+import path)
+    **SIGSEGV during inference** with Vulkan_Host expert tensors used directly
+    (no copy). The Vulkan dispatch's `buf_ctx->dev_buffer` fallback path
+    returns the correct vk_buffer+offset, but something still crashes.
+    Crash happens on first token, not during loading or warmup.
+
+    Possible causes:
+    1. The dev_buffer from Vulkan_Host alloc might not be suitable for
+       the MUL_MAT_ID compute shader (e.g., wrong memory type flags)
+    2. The vk_tensor_offset calculation for Vulkan_Host tensors might be
+       wrong (multiple expert tensors sharing one dev_buffer)
+    3. Buffer size/alignment issues in the pinned memory vk_buffer
+
+    **Needs**: Debug build with GDB on the cluster to get exact crash location.
+    Or: add fprintf debugging to tensor_subbuffer to log which buffer/offset
+    is used for MUL_MAT_ID expert tensors.
 
 ---
 
