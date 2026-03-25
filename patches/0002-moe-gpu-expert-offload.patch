@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..afc46a261 100644
+index bc57df20b..d5230e1d9 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -834,6 +834,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -35,7 +35,7 @@ index bc57df20b..afc46a261 100644
 +                                ggml_backend_dev_get_props(dev, &dev_props);
 +                                can_import = dev_props.caps.buffer_from_host_ptr;
 +                            }
-+                            fprintf(stderr, "SPLIT_DBG: node=%s op=%s src=%s is_host=%d is_mmid=%d can_import=%d n_inputs=%d\n",
++                            GGML_LOG_WARN("SPLIT_DBG: node=%s op=%s src=%s is_host=%d is_mmid=%d can_import=%d n_inputs=%d\n",
 +                                node->name, ggml_op_name(node->op), src->name,
 +                                ggml_backend_buffer_is_host(src->buffer),
 +                                node->op == GGML_OP_MUL_MAT_ID, can_import, split->n_inputs);
@@ -50,7 +50,7 @@ index bc57df20b..afc46a261 100644
              }
  
              if (node_backend_id != cur_backend_id || need_new_split) {
-+                fprintf(stderr, "SPLIT: node=%s op=%s backend_change=%d need_new=%d n_inputs=%d\n",
++                GGML_LOG_WARN("SPLIT: node=%s op=%s backend_change=%d need_new=%d n_inputs=%d\n",
 +                    node->name, ggml_op_name(node->op),
 +                    node_backend_id != cur_backend_id, need_new_split, split->n_inputs);
                  split->i_end = i;
