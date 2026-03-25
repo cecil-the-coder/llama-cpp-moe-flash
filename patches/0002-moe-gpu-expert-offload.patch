@@ -172,14 +172,14 @@ index 5c449414c..434965bba 100644
          if (pipeline_parallel) {
              for (auto & backend : backends) {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..a9f3b2f94 100644
+index 11c5cd23e..f07e610b9 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -7584,6 +7584,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                  bufs.emplace_back(buf);
                  buf_map.emplace(idx, buf);
              }
-+        } else if (ml.use_mmap && use_mmap_buffer && ggml_backend_buft_is_host(buft) && (is_default_buft || is_host_buft)) {
++        } else if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_cpu_buffer_type() && is_default_buft) {
 +            // CPU host buffer with mmap: wrap mmap directly instead of alloc+copy.
 +            // This keeps tensor data on page-aligned mmap addresses, enabling
 +            // dynamic VK_EXT_external_memory_host import on UMA for zero-copy GPU access.
