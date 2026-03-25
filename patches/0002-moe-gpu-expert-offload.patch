@@ -64,7 +64,7 @@ index bc57df20b..f5a684914 100644
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..fdbb5e17b 100644
+index e510a92ce..a6875ca69 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
@@ -164,7 +164,30 @@ index e510a92ce..fdbb5e17b 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -13440,7 +13511,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13417,16 +13488,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+     ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
+ 
+     if (vk_buf) {
+-        // Create a proper Vulkan buffer context so that the dispatch code
+-        // can cast buffer->context to ggml_backend_vk_buffer_context.
+-        // This is critical for supports_buft to work without SIGSEGV.
+-        // Copy (not move) the shared_ptr — pinned_memory also holds a reference
+-        vk_buffer vk_buf_copy = vk_buf;
+-        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(
+-            vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
+-
+-        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+-        return buffer;
++        // Use CPU buffer interface with real host pointers.
++        // The Vulkan dispatch finds the vk_buffer via ggml_vk_host_get (pinned_memory)
++        // using the real host pointer. This allows the scheduler's selective expert copy
++        // to access tensor->data as a valid host pointer.
++        // Note: ggml_backend_vk_buffer_interface uses virtual pointers (vk_ptr_base + offset)
++        // which are NOT dereferenceable and break host-side data access.
+     }
+ 
+     // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
+@@ -13440,7 +13507,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -176,7 +199,7 @@ index e510a92ce..fdbb5e17b 100644
  
      UNUSED(buft);
  }
-@@ -15513,12 +15587,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15583,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
