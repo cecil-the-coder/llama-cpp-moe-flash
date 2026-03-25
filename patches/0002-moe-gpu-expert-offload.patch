@@ -105,7 +105,7 @@ index bc57df20b..4b5bfc0de 100644
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..8dc6c933d 100644
+index e510a92ce..740ee0a90 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -1,5 +1,6 @@
@@ -262,7 +262,18 @@ index e510a92ce..8dc6c933d 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -13417,16 +13525,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13411,22 +13519,23 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+     }
+ 
++    if (ptr == nullptr) {
++        // host_malloc returned nullptr (e.g., GTT exhausted on UMA)
++        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
++    }
++
+     // Look up the pinned vk_buffer that ggml_vk_host_malloc registered
+     vk_buffer vk_buf = nullptr;
+     size_t buf_offset = 0;
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
      if (vk_buf) {
@@ -285,7 +296,7 @@ index e510a92ce..8dc6c933d 100644
      }
  
      // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
-@@ -13440,7 +13544,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13440,7 +13549,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -297,7 +308,7 @@ index e510a92ce..8dc6c933d 100644
  
      UNUSED(buft);
  }
-@@ -14219,6 +14326,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14219,6 +14331,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
  
          ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
          ctx->fused_topk_moe_scale = false;
@@ -312,7 +323,7 @@ index e510a92ce..8dc6c933d 100644
          const char *fusion_string {};
          if (!ctx->device->disable_fusion) {
              uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-@@ -14798,6 +14913,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
+@@ -14798,6 +14918,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
  ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
      VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
  
@@ -331,7 +342,7 @@ index e510a92ce..8dc6c933d 100644
      ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
      ggml_vk_init(ctx, dev_num);
  
-@@ -15513,12 +15640,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15645,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
