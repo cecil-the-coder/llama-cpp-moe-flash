@@ -98,7 +98,7 @@ index bc57df20b..40b2b05ed 100644
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..efd8d0412 100644
+index e510a92ce..6893bf0f1 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -1,5 +1,6 @@
@@ -108,7 +108,7 @@ index e510a92ce..efd8d0412 100644
  #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
  #include <chrono>
  #include "ggml-cpu.h"
-@@ -6322,6 +6323,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
+@@ -6322,6 +6323,61 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
      }
  }
  
@@ -131,12 +131,26 @@ index e510a92ce..efd8d0412 100644
 +    void * base = ggml_backend_buffer_get_base(buf);
 +    size_t size = ggml_backend_buffer_get_size(buf);
 +
-+    // Check if already imported
++    // Check if already imported via buffer_from_host_ptr (not just pinned_memory)
 +    vk_buffer existing;
 +    size_t existing_off;
 +    ggml_vk_host_get(device, base, existing, existing_off);
 +    if (existing) {
-+        return;
++        // If the existing buffer is from ggml_vk_host_malloc (pinned memory),
++        // it may use a memory type that can't be read by compute shaders on some drivers.
++        // Re-import via buffer_from_host_ptr to get a shader-compatible buffer.
++        // Check: if the existing buffer was created with eHostCached, replace it.
++        if (!(existing->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached)) {
++            return;  // Already imported via buffer_from_host_ptr
++        }
++        // Remove the old pinned_memory entry — we'll replace it with an imported one
++        std::lock_guard<std::recursive_mutex> guard(device->mutex);
++        for (auto it = device->pinned_memory.begin(); it != device->pinned_memory.end(); ++it) {
++            if (std::get<0>(*it) == base) {
++                device->pinned_memory.erase(it);
++                break;
++            }
++        }
 +    }
 +
 +    // Align base down and size up to import alignment
@@ -156,7 +170,7 @@ index e510a92ce..efd8d0412 100644
  static vk_subbuffer ggml_vk_tensor_subbuffer(
      const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
  
-@@ -6329,6 +6371,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6329,6 +6385,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
      size_t offset = 0;
      if (ctx->device->uma) {
          ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
@@ -173,7 +187,7 @@ index e510a92ce..efd8d0412 100644
      }
      if (!buffer) {
          auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-@@ -6339,6 +6391,37 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6339,6 +6405,37 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
  
      size_t size = ggml_nbytes(tensor);
  
@@ -211,7 +225,7 @@ index e510a92ce..efd8d0412 100644
      size_t misalign_bytes = offset & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
      // The shader must support misaligned offsets when indexing into the buffer
      GGML_ASSERT(allow_misalign || misalign_bytes == 0);
-@@ -8144,6 +8227,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+@@ -8144,6 +8241,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
          ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
          ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
          ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
@@ -233,7 +247,7 @@ index e510a92ce..efd8d0412 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -13417,16 +13515,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13417,16 +13529,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
      if (vk_buf) {
@@ -256,7 +270,7 @@ index e510a92ce..efd8d0412 100644
      }
  
      // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
-@@ -13440,7 +13534,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13440,7 +13548,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -268,7 +282,7 @@ index e510a92ce..efd8d0412 100644
  
      UNUSED(buft);
  }
-@@ -14219,6 +14316,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14219,6 +14330,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
  
          ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
          ctx->fused_topk_moe_scale = false;
@@ -283,7 +297,7 @@ index e510a92ce..efd8d0412 100644
          const char *fusion_string {};
          if (!ctx->device->disable_fusion) {
              uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-@@ -14798,6 +14903,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
+@@ -14798,6 +14917,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
  ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
      VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
  
@@ -302,7 +316,7 @@ index e510a92ce..efd8d0412 100644
      ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
      ggml_vk_init(ctx, dev_num);
  
-@@ -15513,12 +15630,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15644,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
