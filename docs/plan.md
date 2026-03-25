@@ -265,21 +265,27 @@ expert tensors to CPU.
         With `kv_unified=true` (2 splits), bypass is fully active — expert
         weights stay on Vulkan_Host, no copies. But SIGSEGV on first request.
 
-        Alignment was investigated and ruled out: `vkMapMemory` returns
-        page-aligned pointers, gallocr uses `minStorageBufferOffsetAlignment`,
-        offsets are correctly aligned. Disabling coopmat doesn't help.
+        Alignment ruled out (vkMapMemory page-aligned, gallocr correct).
+        Coopmat disabled doesn't help. Bounds check added (image `2ab7da0`).
 
-        The SIGSEGV is a GPU fault during command execution — the vk_buffer
-        from `host_get` is valid, `tensor_subbuffer` returns correct
-        buffer+offset+size, but the GPU crashes when executing the shader.
+        The SIGSEGV is a GPU fault during command buffer execution. The
+        vk_buffer from `host_get` is valid, offset+size within bounds,
+        alignment correct — but the GPU crashes reading the pinned buffer.
+        The SAME data works when memcpy'd to a Vulkan compute buffer
+        (94-split selective copy path).
 
-        With 94 splits (selective copy path), expert data is memcpy'd to
-        Vulkan compute buffer → works. With 2 splits (direct access to
-        Vulkan_Host pinned memory) → SIGSEGV.
+        **Possible causes**:
+        1. RADV driver bug: pinned host memory not usable as storage buffer
+           input (despite UMA — same physical RAM)
+        2. Buffer not properly flushed/invalidated between CPU write and
+           GPU read (though eHostCoherent should handle this)
+        3. The vk_buffer from ggml_vk_host_malloc may have different
+           VkBuffer flags or memory binding than what the shader expects
 
-        **Needs**: Vulkan validation layers (`VK_LAYER_KHRONOS_validation`)
-        to get the actual GPU error. Or test if the issue is specific to
-        MUL_MAT_ID or affects any op accessing Vulkan_Host pinned memory.
+        **Next steps**:
+        - Check `2ab7da0` bounds check result (pending deployment)
+        - Build with `VK_LAYER_KHRONOS_validation` for actual error
+        - Compare VkBuffer properties between pinned buffer and compute buffer
 
 ---
 

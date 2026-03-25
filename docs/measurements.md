@@ -440,17 +440,43 @@ or implement the staging buffer approach from the original design.
 
    | Model | Size | Splits (bs=1) | TPS | Notes |
    |---|---|---|---|---|
-   | glm-4-7-flash | 17 GB | 94 | 29.8 | Working, under GTT |
-   | qwen3-235b Q2_K | 80 GB | 190 | 9.55 | Regression from --cpu-moe ENV |
+   | glm-4-7-flash | 17 GB | 2 | SIGSEGV | Split bypass works, GPU fault |
+   | qwen3-235b Q2_K | 80 GB | 2 | SIGSEGV | Split bypass works, GPU fault |
 
-   **Q2_K regression** (20.4 → 9.55 t/s): `LLAMA_ARG_CPU_MOE=1` baked in
-   Dockerfile forces expert weights to CPU even though Q2_K fits in GTT via
-   buffer_from_host_ptr. MUL_MAT_ID offload creates 190 splits (up from 94)
-   to copy experts back to GPU. Without --cpu-moe, Q2_K would have no splits.
+   NOTE: earlier results of 94/190 splits at 29.8/9.55 t/s were from stale pods
+   running the `5486e15` or `998a216` image. When `d101d54` actually deploys fresh,
+   the P3.8c split bypass IS active → 2 splits → but SIGSEGV on first inference.
 
-   **P3.8c split bypass**: scheduler code is present (skip `need_new_split` +
-   skip copy for MUL_MAT_ID + host buffer + `buffer_from_host_ptr`) but
-   94/190 splits still observed. Bypass not activating — needs debug.
+   **P3.8c split bypass**: CONFIRMED WORKING at scheduler level.
+   - `need_new_split` bypass fires for MUL_MAT_ID + host buffer + buffer_from_host_ptr
+   - `needs_copy` bypass fires → no copy tensors created
+   - MUL_MAT_ID offload fires for src_backend_id == -1 (Vulkan_Host weights)
+   - Result: 2 graph splits (from non-MoE output buffer, not expert weights)
+
+   **SIGSEGV during inference** (GPU fault, exit code 139):
+   - Occurs on first request after model loads (with --no-warmup) or during warmup
+   - `tensor_subbuffer` resolves Vulkan_Host tensors correctly via `host_get`:
+     the vk_buffer and offset are valid (from `pinned_memory` lookup)
+   - The GPU faults when executing the shader that reads from the pinned buffer
+   - Alignment verified: `vkMapMemory` returns page-aligned, gallocr uses
+     `minStorageBufferOffsetAlignment`, offset = tensor_ptr - pinned_base is aligned
+   - Disabling coopmat (`GGML_VK_DISABLE_COOPMAT=1`) doesn't help
+   - Buffer bounds check added (image `2ab7da0`) to rule out OOB access
+   - The SAME pinned memory works fine when data is memcpy'd to a Vulkan compute
+     buffer (94-split path) — the issue is specific to direct shader access
+
+   **Key question**: Is this an amdgpu/RADV driver limitation where pinned host
+   memory (`eHostVisible|eHostCoherent|eHostCached`) cannot be used as a storage
+   buffer input for compute shaders? On discrete GPUs this wouldn't work (different
+   memory heaps), but on UMA it should (same physical memory). May need Vulkan
+   validation layers (`VK_LAYER_KHRONOS_validation`) to get the actual error.
+
+   **Baseline comparison** (image `998a216`, no offload, no bypass):
+
+   | Model | Size | Splits (bs=1) | TPS | Notes |
+   |---|---|---|---|---|
+   | glm-4-7-flash | 17 GB | 94 | ~30 | Expert matmul on CPU |
+   | qwen3-235b Q2_K | 80 GB | 94 | 20.4 | Expert matmul on CPU |
 
 7. **GPU memory on UMA** (Strix Halo):
    - Single memory heap: 125 GB (= physical RAM)
