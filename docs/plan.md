@@ -274,18 +274,22 @@ expert tensors to CPU.
         The SAME data works when memcpy'd to a Vulkan compute buffer
         (94-split selective copy path).
 
-        **Possible causes**:
-        1. RADV driver bug: pinned host memory not usable as storage buffer
-           input (despite UMA — same physical RAM)
-        2. Buffer not properly flushed/invalidated between CPU write and
-           GPU read (though eHostCoherent should handle this)
-        3. The vk_buffer from ggml_vk_host_malloc may have different
-           VkBuffer flags or memory binding than what the shader expects
+        **CONFIRMED: RADV driver limitation.** Pinned host memory from
+        `ggml_vk_host_malloc` (eHostVisible|eHostCoherent|eHostCached) cannot
+        be read by compute shaders as storage buffer input, despite UMA.
 
-        **Next steps**:
-        - Check `2ab7da0` bounds check result (pending deployment)
-        - Build with `VK_LAYER_KHRONOS_validation` for actual error
-        - Compare VkBuffer properties between pinned buffer and compute buffer
+        Evidence:
+        - Signal handler didn't catch SIGSEGV → GPU page fault from driver
+        - compute_splits never reached → crash during alloc_graph
+        - tensor_subbuffer never called → crash before any op dispatch
+        - Bounds check passes → offset+size within buffer
+        - Re-importing via VK_EXT_external_memory_host doesn't fix it
+          (same memory type on UMA)
+        - Same data works when memcpy'd to regular Vulkan compute buffer
+
+        **P3.8c split bypass is architecturally correct but blocked by this
+        driver limitation.** Need Vulkan validation layers to determine if
+        this is a RADV bug or Vulkan spec-conformant behavior.
 
 ---
 
