@@ -170,20 +170,3 @@ index e5b83e144..e9e378b56 100644
  #endif
  
  #if defined(_MSC_VER) || defined(__MINGW32__)
-diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 5c449414c..434965bba 100644
---- a/src/llama-context.cpp
-+++ b/src/llama-context.cpp
-@@ -317,6 +317,12 @@ llama_context::llama_context(
-             cparams.offload_kqv &&
-             !model.has_tensor_overrides();
- 
-+        // On UMA with --cpu-moe, pipeline parallelism hides per-split sync overhead
-+        // when MoE expert matmul is offloaded to GPU (many graph splits from expert copies).
-+        if (!pipeline_parallel && cparams.op_offload && model.hparams.n_expert > 0) {
-+            pipeline_parallel = true;
-+        }
-+
-         // pipeline parallelism requires support for async compute and events in all devices
-         if (pipeline_parallel) {
-             for (auto & backend : backends) {
