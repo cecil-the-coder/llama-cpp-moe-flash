@@ -425,6 +425,43 @@ or implement the staging buffer approach from the original design.
    expert data this exceeds available memory. supports_buft is per-buffer-type,
    not per-op — fundamentally unsuitable for incremental expert loading.
 
+8. **P3.8c — Per-op split bypass with dynamic host import (image `f02c853`)**:
+   Modified scheduler split_graph to skip `need_new_split` and skip copy creation
+   for host-buffer weights when backend has `buffer_from_host_ptr` capability.
+   Dynamic VK_EXT_external_memory_host import in Vulkan tensor_subbuffer.
+   4096-byte ggml_aligned_malloc for page-aligned CPU buffers.
+
+   Results (so far):
+   - glm-4-7-flash (17 GB): **2 splits** (down from ~90+ with stable image)
+     Model loads, scheduler reserve succeeds. SIGSEGV during warmup was from
+     dynamic import trying to import Vulkan_Host virtual pointer (0x1000).
+     Fixed in f02c853 by checking buffer interface before import.
+   - qwen3-235b Q2_K (80 GB): **2 splits** (down from 284 with stable image!)
+     Model loads, but warmup OOM. SAME OOM on stable image — pre-existing issue.
+
+   **Key findings on the warmup OOM (Q2_K 80 GB + Q4_K_M 133 GB)**:
+   - Q2_K with --cpu-moe: expert data (~70 GB) is malloc'd and copied from mmap.
+     Plus 80 GB mmap imported via buffer_from_host_ptr. Total: ~150 GB > 125 GB RAM.
+     This worked in earlier sessions ONLY when page cache was warm from prior runs.
+   - Q4_K_M: one 47 GB shard fails buffer_from_host_ptr. The `goto fallback_alloc`
+     at line 7580 clears ALL successful imports for that buft context, then
+     `ggml_backend_alloc_ctx_tensors_from_buft` mallocs ALL non-expert tensors.
+     Combined with expert malloc (CPU buft), total exceeds RAM.
+   - Deepseek (228 GB): TWO shards fail (Vulkan0 + Vulkan_Host). Double alloc+copy
+     totaling ~93 GB of new Vulkan allocations → guaranteed OOM.
+   - Root issue: `--cpu-moe` forces expert data through malloc+copy even when the
+     data could stay on mmap. For models > RAM, this is always OOM.
+
+   **Vulkan_Host buffer virtual pointer design** (key for future work):
+   - `ggml_backend_vk_host_buffer_type_alloc_buffer` (line 13465) creates buffers
+     with `ggml_backend_vk_buffer_interface`, which uses virtual pointers
+     (vk_ptr_base=0x1000 + offset) for tensor->data.
+   - `ggml_backend_buffer_is_host` returns true (is_host from CPU buft iface).
+   - `ggml_backend_buffer_get_base` returns 0x1000 (sentinel, NOT a real address).
+   - `ggml_vk_host_get` FAILS for these tensors (searches by real host pointer).
+   - Access path: buf_ctx->dev_buffer + vk_tensor_offset (Vulkan buffer context).
+   - Dynamic import must SKIP these buffers (they're already Vulkan-managed).
+
 7. **GPU memory on UMA** (Strix Halo):
    - Single memory heap: 125 GB (= physical RAM)
    - Single type: DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT + HOST_CACHED
