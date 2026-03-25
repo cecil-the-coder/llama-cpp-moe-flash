@@ -361,14 +361,14 @@ index e5b83e144..e9e378b56 100644
  
  #if defined(_MSC_VER) || defined(__MINGW32__)
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..e2e1b045b 100644
+index 11c5cd23e..4ede8ec96 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -7584,6 +7584,26 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                  bufs.emplace_back(buf);
                  buf_map.emplace(idx, buf);
              }
-+        } else if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_cpu_buffer_type() && is_default_buft) {
++        } else if (ml.use_mmap && use_mmap_buffer && (is_default_buft || is_host_buft) && ggml_backend_buft_is_host(buft) && !buffer_from_host_ptr_supported) {
 +            // CPU buffer with mmap: wrap mmap directly instead of malloc+copy.
 +            // Critical for models > RAM with --cpu-moe: expert data stays on mmap
 +            // (demand-paged) instead of being malloc'd (which OOMs on 228 GB models).
