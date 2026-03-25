@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..f330fd840 100644
+index bc57df20b..40b2b05ed 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -827,13 +827,27 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -75,6 +75,28 @@ index bc57df20b..f330fd840 100644
                      // create a copy of the input in the split's backend
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
+@@ -1455,6 +1492,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        GGML_LOG_WARN("COMPUTE_SPLIT: split=%d/%d backend=%s n_inputs=%d n_nodes=%d\n",
++            split_id, sched->n_splits, ggml_backend_name(split_backend),
++            split->n_inputs, split->graph.n_nodes);
++
+         if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
+             ggml_backend_synchronize(split_backend);
+         }
+@@ -1465,6 +1506,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+ 
++            GGML_LOG_WARN("  INPUT: %s buf=%s is_input=%d\n",
++                input->name, input->buffer ? ggml_backend_buffer_name(input->buffer) : "null",
++                (input->flags & GGML_TENSOR_FLAG_INPUT) ? 1 : 0);
++
+             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 index e510a92ce..1c8a8cc48 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
