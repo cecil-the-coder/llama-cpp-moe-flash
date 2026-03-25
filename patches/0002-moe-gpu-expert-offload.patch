@@ -76,7 +76,7 @@ index bc57df20b..f330fd840 100644
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..4290c75f9 100644
+index e510a92ce..1c8a8cc48 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
@@ -239,7 +239,22 @@ index e510a92ce..4290c75f9 100644
  
      UNUSED(buft);
  }
-@@ -15513,12 +15609,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -14219,6 +14315,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
++        {
++            static int node_count = 0;
++            node_count++;
++            if (node_count <= 5 || node_count % 500 == 0) {
++                GGML_LOG_WARN("vk_graph: node #%d %s op=%s\n", node_count,
++                    cgraph->nodes[i]->name, ggml_op_name(cgraph->nodes[i]->op));
++            }
++        }
+         const char *fusion_string {};
+         if (!ctx->device->disable_fusion) {
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+@@ -15513,12 +15617,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
