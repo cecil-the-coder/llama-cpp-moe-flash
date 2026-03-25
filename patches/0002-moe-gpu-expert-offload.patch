@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..d9a3dedd8 100644
+index bc57df20b..f5a684914 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -834,6 +834,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -20,33 +20,38 @@ index bc57df20b..d9a3dedd8 100644
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1191,8 +1202,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1191,8 +1202,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
 -                            need_new_split = true;
 -                            break;
-+                            // On UMA with buffer_from_host_ptr, the split backend can import
++                            // On UMA with buffer_from_host_ptr, MUL_MAT_ID can import
 +                            // host buffer memory directly — no copy or split needed.
-+                            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
-+                            ggml_backend_dev_props dev_props;
-+                            ggml_backend_dev_get_props(dev, &dev_props);
-+                            if (!(dev_props.caps.buffer_from_host_ptr && ggml_backend_buffer_is_host(src->buffer))) {
++                            bool can_import = false;
++                            if (node->op == GGML_OP_MUL_MAT_ID && ggml_backend_buffer_is_host(src->buffer)) {
++                                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
++                                ggml_backend_dev_props dev_props;
++                                ggml_backend_dev_get_props(dev, &dev_props);
++                                can_import = dev_props.caps.buffer_from_host_ptr;
++                            }
++                            if (!can_import) {
 +                                need_new_split = true;
 +                                break;
 +                            }
                          }
                      }
                      // check if the split has too many inputs
-@@ -1258,7 +1276,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1258,7 +1280,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      }
                  }
  
 -                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
 +                bool needs_copy = src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
-+                // On UMA with buffer_from_host_ptr, skip copy for host buffers —
++                // On UMA with buffer_from_host_ptr, skip copy for MUL_MAT_ID host buffer weights —
 +                // the backend can import the memory directly at dispatch time.
-+                if (needs_copy && src->buffer && ggml_backend_buffer_is_host(src->buffer)) {
++                if (needs_copy && node->op == GGML_OP_MUL_MAT_ID &&
++                    src->buffer && ggml_backend_buffer_is_host(src->buffer)) {
 +                    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
 +                    ggml_backend_dev_props dev_props;
 +                    ggml_backend_dev_get_props(dev, &dev_props);
