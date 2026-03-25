@@ -203,101 +203,63 @@ expert tensors to CPU.
 
 - [~] **P3.8** — Get expert matmul on Vulkan GPU for models > GTT
 
-  **Current state (stable, deployed as image `5486e15`):**
-  `--cpu-moe` + MUL_MAT_ID GPU offload. Expert matmul on Vulkan GPU via
-  selective expert copy. Performance limited by graph split overhead.
+  **Current state (deployed as image `d101d54`):**
+  P3.8c scheduler bypass + Vulkan_Host SIGSEGV root cause fix. Models working.
+  Split bypass code is present but not activating — needs debug.
 
-  | Model | Size | Splits (bs=1) | TPS | Notes |
-  |---|---|---|---|---|
-  | qwen3-235b Q2_K | 80 GB | 2 | 20.4 | ≤ GTT, buffer_from_host_ptr |
-  | qwen3-235b Q4_K_M | 133 GB | 190 | 4.71 | > GTT, --cpu-moe + offload |
-  | deepseek-r1-0528 Q2_K | 228 GB | 118 | 1.48 | > GTT, I/O bound |
+  | Model | Size | Image | Splits (bs=1) | TPS | Notes |
+  |---|---|---|---|---|---|
+  | qwen3-235b Q2_K | 80 GB | 998a216 | 94 | 20.4 | Original baseline |
+  | qwen3-235b Q2_K | 80 GB | d101d54 | 190 | 9.55 | Regression from offload |
+  | glm-4-7-flash | 17 GB | d101d54 | 94 | 29.8 | Working |
+  | qwen3-235b Q4_K_M | 133 GB | 5486e15 | 190 | 4.71 | > GTT |
+  | deepseek-r1-0528 | 228 GB | 5486e15 | 118 | 1.48 | > GTT, I/O bound |
 
-  **What was attempted and why it failed:**
+  **Root cause of ALL previous SIGSEGVs (fixed in `d101d54`):**
 
-  1. **Full buffer_from_host_ptr import (228 GB):** Kernel OOM — importing 228 GB
-     via VK_EXT_external_memory_host exceeds 120 GB GTT limit.
+  Patch 0001's c265012 change created `ggml_backend_vk_buffer_context` for
+  Vulkan_Host with virtual pointers (vk_ptr_base=0x1000 + offset). The
+  scheduler's selective expert copy (ggml-backend.cpp:1547) dereferences
+  `input->data` as a host pointer → SIGSEGV at 0x1000+offset.
 
-  2. **Vulkan_Host buffer type for experts (image `a888d75`):**
-     Expert data via `ggml_vk_host_malloc` + alloc+copy from mmap. 190 graph splits
-     → 9.0 t/s (sync overhead). OOM for models > RAM (doubles memory).
+  Fix: revert Vulkan_Host `alloc_buffer` to `ggml_backend_cpu_buffer_from_ptr`
+  — real host pointers, `is_host=true`, `host_get` finds vk_buffer in
+  `pinned_memory` (registered by `ggml_vk_host_malloc`).
 
-  3. **supports_buft for Vulkan_Host (image `c265012`):**
-     SIGSEGV during warmup. Non-MoE ops crash with Vulkan_Host buffers.
+  This also explains why `998a216` (no MUL_MAT_ID offload) worked but `5486e15`
+  (with offload) crashed: without offload, MUL_MAT_ID stays on CPU → no
+  selective expert copy → virtual pointers never dereferenced.
 
-  4. **supports_buft for all host buffers via buft_is_host (image `b806384`):**
-     With dynamic VK_EXT_external_memory_host import in tensor_subbuffer.
-     OOM/crash on node. Root cause: supports_buft merges ALL ops into one Vulkan
-     split. The gallocr allocates compute buffer for ALL weight copies across
-     ALL layers simultaneously → 130+ GB compute buffer → OOM.
+  Also fixed: Vulkan_Host alignment changed from `minMemoryMapAlignment` to
+  `minStorageBufferOffsetAlignment` — required when expert tensors are used
+  directly in Vulkan compute shaders (P3.8c bypass path).
 
-     **Key learning**: `supports_buft` is ALL-OR-NOTHING per buffer type. It can't
-     express "I can handle this buffer type, but only one layer at a time."
-     This makes it fundamentally unsuitable for MoE expert offloading where
-     expert data vastly exceeds compute buffer capacity.
+  **Q2_K regression (20.4 → 9.55 t/s):**
 
-  **Currently deployed: MUL_MAT_ID offload (patch 0002, image `5486e15`)**
+  `LLAMA_ARG_CPU_MOE=1` is baked in the Dockerfile. For models ≤ GTT (like
+  Q2_K 80 GB), this forces expert weights to CPU even though buffer_from_host_ptr
+  could import them directly into Vulkan. The MUL_MAT_ID offload then creates
+  190 splits to copy experts back to GPU. Without `--cpu-moe`, Q2_K had 94
+  splits and 20.4 t/s.
 
-  The existing `op_offload` mechanism requires `batch_size >= 32`.
-  For MUL_MAT_ID during single-token generation, `ne[2] = 1`, so it never
-  triggers. The fix: unconditional GPU offload for MUL_MAT_ID after the
-  batch-gated loop. The scheduler's selective expert copy (lines 1480-1564)
-  copies only used experts from CPU → Vulkan compute buffer.
+  **What was attempted and ruled out:**
 
-  Changes:
-  - `ggml/src/ggml-backend.cpp:837-847`: MUL_MAT_ID offload (8 lines)
-  - Patch: `patches/0002-moe-gpu-expert-offload.patch`
+  1. **Full buffer_from_host_ptr import (228 GB):** exceeds 120 GB GTT.
+  2. **Vulkan_Host for experts (a888d75):** 190 splits → 9.0 t/s. OOM > RAM.
+  3. **supports_buft (c265012, b806384):** gallocr allocates ALL copies → OOM.
+  4. **Pipeline parallelism (55060be):** n_copies=2 doubles all tensors → OOM.
 
-  **Remaining problem: 118-190 graph splits create ~50-100ms overhead/token.**
+  **P3.8c implementation (in `d101d54`, needs split bypass debug):**
 
-  Each split requires: Vulkan submit → fence wait → expert copy → next submit.
-  Split count = 2 × n_MoE_layers (one split per MUL_MAT_ID weight tensor).
-  The `need_new_split` at ggml-backend.cpp:1202 forces a new split whenever a
-  different weight tensor is on an incompatible backend, to allow compute buffer
-  memory reuse between copies.
-
-  Merging splits (skipping `need_new_split` for MUL_MAT_ID) is UNSAFE because
-  the copy phase writes ALL inputs before compute starts. If gallocr reuses
-  memory between non-overlapping compute lifetimes, the copy phase overwrites.
-
-  **Three viable approaches to reduce split cost:**
-
-  - [x] **P3.8a** — Pipeline parallelism (`n_copies=2`) — **FAILED: OOM on both models**
-    Enabled by relaxing `model.n_devices() > 1` gate (image `55060be`).
-    OOM'd both q4km (133 GB) and deepseek (228 GB), taking down shadow node.
-    `n_copies=2` doubles ALL intermediate tensor allocations in the graph,
-    not just the compute buffer. Fundamentally incompatible with models
-    that already push memory limits.
-
-  - [ ] **P3.8b** — Dynamic import inside split copy phase
-    In `ggml_backend_sched_compute_splits` (line 1480), when copying expert
-    weights from CPU to Vulkan, instead of memcpy, use VK_EXT_external_memory_host
-    to import the mmap'd memory region. Zero-copy on UMA. Keep the split
-    structure for synchronization but eliminate the copy cost (~420 MB/token).
-
-  - [~] **P3.8c** — Per-op split bypass with dynamic host import (image `9309283`)
-    Modified scheduler to skip `need_new_split` and skip copy creation for
-    MUL_MAT_ID ops with host-buffer weights when backend has `buffer_from_host_ptr`.
-    Dynamic VK_EXT_external_memory_host import in Vulkan tensor_subbuffer.
-    4096-byte ggml_aligned_malloc for page-aligned CPU buffers.
-
-    **Split reduction verified**: glm 140→2, Q2_K 284→2. Scheduler works.
-
-    **SIGSEGV during inference** with Vulkan_Host expert tensors used directly
-    (no copy). The Vulkan dispatch's `buf_ctx->dev_buffer` fallback path
-    returns the correct vk_buffer+offset, but something still crashes.
-    Crash happens on first token, not during loading or warmup.
-
-    Possible causes:
-    1. The dev_buffer from Vulkan_Host alloc might not be suitable for
-       the MUL_MAT_ID compute shader (e.g., wrong memory type flags)
-    2. The vk_tensor_offset calculation for Vulkan_Host tensors might be
-       wrong (multiple expert tensors sharing one dev_buffer)
-    3. Buffer size/alignment issues in the pinned memory vk_buffer
-
-    **Needs**: Debug build with GDB on the cluster to get exact crash location.
-    Or: add fprintf debugging to tensor_subbuffer to log which buffer/offset
-    is used for MUL_MAT_ID expert tensors.
+  - [x] Scheduler: skip `need_new_split` for MUL_MAT_ID + host buffer +
+        `buffer_from_host_ptr` capability (ggml-backend.cpp:1205-1217)
+  - [x] Scheduler: skip copy creation under same conditions (line 1284-1293)
+  - [x] Vulkan: dynamic import in tensor_subbuffer + mul_mat_id (ggml-vulkan.cpp)
+  - [x] ggml.c: 4096-byte alignment for CPU buffers (page-aligned for import)
+  - [x] Vulkan_Host: alignment fix (minStorageBufferOffsetAlignment)
+  - [x] Vulkan_Host: revert to CPU buffer interface (SIGSEGV root cause fix)
+  - [ ] **Debug**: bypass code present but splits not reduced (94/190 still seen).
+        Need fprintf to trace why `need_new_split` bypass doesn't activate.
 
 ---
 
