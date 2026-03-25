@@ -355,22 +355,6 @@ index e510a92ce..740ee0a90 100644
      return false;
  }
  
-diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index e5b83e144..e9e378b56 100644
---- a/ggml/src/ggml.c
-+++ b/ggml/src/ggml.c
-@@ -317,7 +317,10 @@ void * ggml_aligned_malloc(size_t size) {
- #if defined(__s390x__)
-     const int alignment = 256;
- #else
--    const int alignment = 64;
-+    // 4096 alignment enables VK_EXT_external_memory_host import on UMA
-+    // (page alignment required). 4096 is a multiple of 64 so all existing
-+    // alignment requirements are still satisfied.
-+    const int alignment = 4096;
- #endif
- 
- #if defined(_MSC_VER) || defined(__MINGW32__)
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 11c5cd23e..4ede8ec96 100644
 --- a/src/llama-model.cpp
