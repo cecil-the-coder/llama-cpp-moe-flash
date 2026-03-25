@@ -260,15 +260,22 @@ expert tensors to CPU.
   - [x] Vulkan_Host: revert to CPU buffer interface (SIGSEGV root cause fix)
   - [x] Offload fix: handle `src_backend_id == -1` for Vulkan_Host weights
         (backend_from_buffer returns -1 because no backend claims Vulkan_Host buft)
-  - [~] **Split bypass not reducing splits** (94/190 still seen):
-        The bypass correctly prevents copy creation (needs_copy = false).
-        But splits come from `node_backend_id != cur_backend_id` (backend
-        CHANGES), not from the weight incompatibility check. The
-        `need_new_split` bypass at line 1205 is never reached because
-        `split->n_inputs > 0` is rarely true.
-        **Root cause**: with `--cpu-moe` ENV, some non-MoE ops end up on
-        CPU, creating backend change splits. Need `GGML_SCHED_DEBUG=1`
-        to see which ops are on which backends.
+  - [x] Offload fix: handle `src_backend_id == -1` for Vulkan_Host weights
+  - [~] **Split bypass reduces splits to 2 but SIGSEGV on inference**:
+        With `kv_unified=true` (2 splits), bypass is fully active — expert
+        weights stay on Vulkan_Host, no copies. But SIGSEGV on first request.
+
+        Root cause: `host_get` returns offset = `tensor_ptr - pinned_base`.
+        The gallocr aligns tensor_ptr to `minStorageBufferOffsetAlignment`,
+        but `pinned_base` (from `ggml_vk_host_malloc` → `vkMapMemory`) may
+        NOT be aligned to the same boundary. The difference (offset) is
+        misaligned for Vulkan storage buffer binding → driver crash.
+
+        With 94 splits (selective copy path), expert data is memcpy'd to
+        Vulkan compute buffer which IS properly aligned → no crash.
+
+        **Fix needed**: align `ggml_vk_host_malloc` base to
+        `minStorageBufferOffsetAlignment`, or adjust the returned offset.
 
 ---
 
