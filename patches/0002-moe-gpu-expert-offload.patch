@@ -154,6 +154,22 @@ index e510a92ce..b905ce861 100644
      return false;
  }
  
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index e5b83e144..e9e378b56 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -317,7 +317,10 @@ void * ggml_aligned_malloc(size_t size) {
+ #if defined(__s390x__)
+     const int alignment = 256;
+ #else
+-    const int alignment = 64;
++    // 4096 alignment enables VK_EXT_external_memory_host import on UMA
++    // (page alignment required). 4096 is a multiple of 64 so all existing
++    // alignment requirements are still satisfied.
++    const int alignment = 4096;
+ #endif
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 index 5c449414c..434965bba 100644
 --- a/src/llama-context.cpp
@@ -171,33 +187,3 @@ index 5c449414c..434965bba 100644
          // pipeline parallelism requires support for async compute and events in all devices
          if (pipeline_parallel) {
              for (auto & backend : backends) {
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..f07e610b9 100644
---- a/src/llama-model.cpp
-+++ b/src/llama-model.cpp
-@@ -7584,6 +7584,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
-                 bufs.emplace_back(buf);
-                 buf_map.emplace(idx, buf);
-             }
-+        } else if (ml.use_mmap && use_mmap_buffer && buft == ggml_backend_cpu_buffer_type() && is_default_buft) {
-+            // CPU host buffer with mmap: wrap mmap directly instead of alloc+copy.
-+            // This keeps tensor data on page-aligned mmap addresses, enabling
-+            // dynamic VK_EXT_external_memory_host import on UMA for zero-copy GPU access.
-+            GGML_ASSERT(!ml.no_alloc);
-+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-+                void * addr = nullptr;
-+                size_t first, last; // NOLINT
-+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-+                if (first >= last) {
-+                    continue;
-+                }
-+                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + first, last - first);
-+                if (buf == nullptr) {
-+                    goto fallback_alloc;
-+                }
-+                bufs.emplace_back(buf);
-+                buf_map.emplace(idx, buf);
-+            }
-         } else { fallback_alloc:
-             ggml_backend_buffer_t buf;
-             if (ml.no_alloc) {
