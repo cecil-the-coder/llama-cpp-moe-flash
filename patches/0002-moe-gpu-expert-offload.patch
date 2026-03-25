@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..40b2b05ed 100644
+index bc57df20b..533a3ee8f 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -827,13 +827,27 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -32,7 +32,7 @@ index bc57df20b..40b2b05ed 100644
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1191,8 +1205,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1191,8 +1205,22 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
@@ -41,7 +41,10 @@ index bc57df20b..40b2b05ed 100644
 +                            // On UMA with buffer_from_host_ptr, MUL_MAT_ID can import
 +                            // host buffer memory directly — no copy or split needed.
 +                            bool can_import = false;
-+                            if (node->op == GGML_OP_MUL_MAT_ID && ggml_backend_buffer_is_host(src->buffer)) {
++                            // Only bypass for plain CPU buffers (from --cpu-moe on > GTT models).
++                            // Vulkan_Host pinned buffers cause GPU page faults when used directly.
++                            if (node->op == GGML_OP_MUL_MAT_ID &&
++                                src->buffer->buft == ggml_backend_cpu_buffer_type()) {
 +                                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
 +                                ggml_backend_dev_props dev_props;
 +                                ggml_backend_dev_get_props(dev, &dev_props);
@@ -54,7 +57,7 @@ index bc57df20b..40b2b05ed 100644
                          }
                      }
                      // check if the split has too many inputs
-@@ -1258,7 +1283,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1258,7 +1286,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      }
                  }
  
@@ -62,8 +65,9 @@ index bc57df20b..40b2b05ed 100644
 +                bool needs_copy = src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
 +                // On UMA with buffer_from_host_ptr, skip copy for MUL_MAT_ID host buffer weights —
 +                // the backend can import the memory directly at dispatch time.
++                // Only bypass for plain CPU buffers (not Vulkan_Host pinned memory)
 +                if (needs_copy && node->op == GGML_OP_MUL_MAT_ID &&
-+                    src->buffer && ggml_backend_buffer_is_host(src->buffer)) {
++                    src->buffer && src->buffer->buft == ggml_backend_cpu_buffer_type()) {
 +                    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
 +                    ggml_backend_dev_props dev_props;
 +                    ggml_backend_dev_get_props(dev, &dev_props);
@@ -75,7 +79,7 @@ index bc57df20b..40b2b05ed 100644
                      // create a copy of the input in the split's backend
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
-@@ -1455,6 +1492,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1455,6 +1496,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
  
@@ -86,7 +90,7 @@ index bc57df20b..40b2b05ed 100644
          if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
              ggml_backend_synchronize(split_backend);
          }
-@@ -1465,6 +1506,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1465,6 +1510,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              struct ggml_tensor * input = split->inputs[input_id];
              struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
  
@@ -98,7 +102,7 @@ index bc57df20b..40b2b05ed 100644
                  // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                  if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..58e113086 100644
+index e510a92ce..8dc6c933d 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -1,5 +1,6 @@
@@ -130,7 +134,7 @@ index e510a92ce..58e113086 100644
  
      if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
          fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
-@@ -6322,6 +6333,61 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
+@@ -6322,6 +6333,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
      }
  }
  
@@ -153,26 +157,12 @@ index e510a92ce..58e113086 100644
 +    void * base = ggml_backend_buffer_get_base(buf);
 +    size_t size = ggml_backend_buffer_get_size(buf);
 +
-+    // Check if already imported via buffer_from_host_ptr (not just pinned_memory)
++    // Check if already imported
 +    vk_buffer existing;
 +    size_t existing_off;
 +    ggml_vk_host_get(device, base, existing, existing_off);
 +    if (existing) {
-+        // If the existing buffer is from ggml_vk_host_malloc (pinned memory),
-+        // it may use a memory type that can't be read by compute shaders on some drivers.
-+        // Re-import via buffer_from_host_ptr to get a shader-compatible buffer.
-+        // Check: if the existing buffer was created with eHostCached, replace it.
-+        if (!(existing->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCached)) {
-+            return;  // Already imported via buffer_from_host_ptr
-+        }
-+        // Remove the old pinned_memory entry — we'll replace it with an imported one
-+        std::lock_guard<std::recursive_mutex> guard(device->mutex);
-+        for (auto it = device->pinned_memory.begin(); it != device->pinned_memory.end(); ++it) {
-+            if (std::get<0>(*it) == base) {
-+                device->pinned_memory.erase(it);
-+                break;
-+            }
-+        }
++        return;
 +    }
 +
 +    // Align base down and size up to import alignment
@@ -192,7 +182,7 @@ index e510a92ce..58e113086 100644
  static vk_subbuffer ggml_vk_tensor_subbuffer(
      const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
  
-@@ -6329,6 +6395,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6329,6 +6381,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
      size_t offset = 0;
      if (ctx->device->uma) {
          ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
@@ -209,7 +199,7 @@ index e510a92ce..58e113086 100644
      }
      if (!buffer) {
          auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-@@ -6339,6 +6415,37 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6339,6 +6401,37 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
  
      size_t size = ggml_nbytes(tensor);
  
@@ -247,7 +237,7 @@ index e510a92ce..58e113086 100644
      size_t misalign_bytes = offset & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
      // The shader must support misaligned offsets when indexing into the buffer
      GGML_ASSERT(allow_misalign || misalign_bytes == 0);
-@@ -8144,6 +8251,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+@@ -8144,6 +8237,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
          ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
          ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
          ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
@@ -269,7 +259,7 @@ index e510a92ce..58e113086 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -13417,16 +13539,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13417,16 +13525,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
      if (vk_buf) {
@@ -292,7 +282,7 @@ index e510a92ce..58e113086 100644
      }
  
      // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
-@@ -13440,7 +13558,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13440,7 +13544,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -304,7 +294,7 @@ index e510a92ce..58e113086 100644
  
      UNUSED(buft);
  }
-@@ -14219,6 +14340,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+@@ -14219,6 +14326,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
  
          ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
          ctx->fused_topk_moe_scale = false;
@@ -319,7 +309,7 @@ index e510a92ce..58e113086 100644
          const char *fusion_string {};
          if (!ctx->device->disable_fusion) {
              uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-@@ -14798,6 +14927,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
+@@ -14798,6 +14913,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
  ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
      VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
  
@@ -338,7 +328,7 @@ index e510a92ce..58e113086 100644
      ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
      ggml_vk_init(ctx, dev_num);
  
-@@ -15513,12 +15654,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15640,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
