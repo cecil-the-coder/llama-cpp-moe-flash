@@ -76,7 +76,7 @@ index bc57df20b..f330fd840 100644
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..b58177cd2 100644
+index e510a92ce..9da5713df 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
@@ -127,7 +127,7 @@ index e510a92ce..b58177cd2 100644
  static vk_subbuffer ggml_vk_tensor_subbuffer(
      const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
  
-@@ -6329,11 +6370,29 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6329,6 +6370,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
      size_t offset = 0;
      if (ctx->device->uma) {
          ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
@@ -143,24 +143,8 @@ index e510a92ce..b58177cd2 100644
 +        }
      }
      if (!buffer) {
--        auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
--        buffer = buf_ctx->dev_buffer;
--        offset = vk_tensor_offset(tensor) + tensor->view_offs;
-+        // Only safe for Vulkan buffer interface (vk_buffer_context)
-+        // NOT safe for CPU buffer interface (Vulkan_Host with our fix)
-+        if (tensor->buffer->iface.get_base == ggml_backend_vk_buffer_get_base) {
-+            auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-+            buffer = buf_ctx->dev_buffer;
-+            offset = vk_tensor_offset(tensor) + tensor->view_offs;
-+        } else {
-+            GGML_LOG_ERROR("ggml_vk_tensor_subbuffer: cannot resolve tensor %s (buffer %s) — not in pinned_memory and not a Vulkan buffer\n",
-+                tensor->name, ggml_backend_buffer_name(tensor->buffer));
-+            GGML_ABORT("unresolvable tensor buffer");
-+        }
-     }
-     GGML_ASSERT(buffer != nullptr);
- 
-@@ -8144,6 +8203,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+@@ -8144,6 +8195,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
          ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
          ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
          ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
@@ -182,7 +166,7 @@ index e510a92ce..b58177cd2 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -13417,16 +13491,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13417,16 +13483,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
      if (vk_buf) {
@@ -205,7 +189,7 @@ index e510a92ce..b58177cd2 100644
      }
  
      // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
-@@ -13440,7 +13510,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13440,7 +13502,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -217,7 +201,7 @@ index e510a92ce..b58177cd2 100644
  
      UNUSED(buft);
  }
-@@ -15513,12 +15586,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15578,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
