@@ -1,8 +1,20 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..d5230e1d9 100644
+index bc57df20b..dea18d2e6 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -834,6 +834,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -827,13 +827,27 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+             // check if a backend with higher prio wants to offload the op
+-            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
+-                for (int b = 0; b < src_backend_id; b++) {
++            // Also handle src_backend_id == -1: Vulkan_Host buffers (CPU interface)
++            // aren't claimed by any backend via supports_buft, but are host-accessible.
++            int offload_limit = src_backend_id > 0 ? src_backend_id : sched->n_backends - 1;
++            if (sched->op_offload && (src_backend_id == sched->n_backends - 1 || src_backend_id == -1) && ggml_backend_buffer_is_host(src->buffer)) {
++                for (int b = 0; b < offload_limit; b++) {
+                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                         SET_CAUSE(tensor, "1.off");
                          return b;
                      }
                  }
@@ -10,7 +22,7 @@ index bc57df20b..d5230e1d9 100644
 +                // The scheduler's selective expert copy handles the host->device data transfer,
 +                // copying only the experts selected by the routing tensor.
 +                if (tensor->op == GGML_OP_MUL_MAT_ID) {
-+                    for (int b = 0; b < src_backend_id; b++) {
++                    for (int b = 0; b < offload_limit; b++) {
 +                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
 +                            SET_CAUSE(tensor, "1.moe");
 +                            return b;
@@ -20,7 +32,7 @@ index bc57df20b..d5230e1d9 100644
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1191,8 +1202,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1191,8 +1205,23 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
@@ -46,7 +58,7 @@ index bc57df20b..d5230e1d9 100644
                          }
                      }
                      // check if the split has too many inputs
-@@ -1210,6 +1236,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1210,6 +1239,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
              }
  
              if (node_backend_id != cur_backend_id || need_new_split) {
@@ -56,7 +68,7 @@ index bc57df20b..d5230e1d9 100644
                  split->i_end = i;
                  i_split++;
                  if (i_split >= sched->splits_capacity) {
-@@ -1258,7 +1287,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1258,7 +1290,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      }
                  }
  
