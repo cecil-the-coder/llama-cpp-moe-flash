@@ -76,7 +76,7 @@ index bc57df20b..f330fd840 100644
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..4d168c1ef 100644
+index e510a92ce..9730c6481 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
@@ -155,14 +155,14 @@ index e510a92ce..4d168c1ef 100644
 +        GGML_ABORT("buffer out of bounds");
 +    }
 +
-+    // Debug: log host-buffer tensor resolution for MoE expert weights
-+    if (ggml_backend_buffer_is_host(tensor->buffer) && tensor->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
++    // Debug: log ALL tensor resolution failures for host buffers
++    if (tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
 +        static int log_count = 0;
-+        if (log_count < 5) {
-+            GGML_LOG_WARN("vk_subbuf: %s buf_name=%s buf_ptr=%p tensor_data=%p offset=%zu size=%zu vkbuf_size=%zu\n",
++        if (log_count < 10) {
++            GGML_LOG_WARN("vk_subbuf: %s buf=%s data=%p offset=%zu size=%zu vkbuf=%zu via=%s\n",
 +                tensor->name, ggml_backend_buffer_name(tensor->buffer),
-+                ggml_backend_buffer_get_base(tensor->buffer), tensor->data,
-+                offset, size, buffer->size);
++                tensor->data, offset, size, buffer->size,
++                (offset == (size_t)((uint8_t*)tensor->data - (uint8_t*)ggml_backend_buffer_get_base(tensor->buffer))) ? "host_get" : "dev_buf");
 +            log_count++;
 +        }
 +    }
