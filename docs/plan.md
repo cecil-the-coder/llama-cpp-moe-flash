@@ -258,8 +258,17 @@ expert tensors to CPU.
   - [x] ggml.c: 4096-byte alignment for CPU buffers (page-aligned for import)
   - [x] Vulkan_Host: alignment fix (minStorageBufferOffsetAlignment)
   - [x] Vulkan_Host: revert to CPU buffer interface (SIGSEGV root cause fix)
-  - [ ] **Debug**: bypass code present but splits not reduced (94/190 still seen).
-        Need fprintf to trace why `need_new_split` bypass doesn't activate.
+  - [x] Offload fix: handle `src_backend_id == -1` for Vulkan_Host weights
+        (backend_from_buffer returns -1 because no backend claims Vulkan_Host buft)
+  - [~] **Split bypass not reducing splits** (94/190 still seen):
+        The bypass correctly prevents copy creation (needs_copy = false).
+        But splits come from `node_backend_id != cur_backend_id` (backend
+        CHANGES), not from the weight incompatibility check. The
+        `need_new_split` bypass at line 1205 is never reached because
+        `split->n_inputs > 0` is rarely true.
+        **Root cause**: with `--cpu-moe` ENV, some non-MoE ops end up on
+        CPU, creating backend change splits. Need `GGML_SCHED_DEBUG=1`
+        to see which ops are on which backends.
 
 ---
 
