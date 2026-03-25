@@ -275,12 +275,22 @@ expert tensors to CPU.
     to import the mmap'd memory region. Zero-copy on UMA. Keep the split
     structure for synchronization but eliminate the copy cost (~420 MB/token).
 
-  - [ ] **P3.8c** — Per-tensor supports_buft (scheduler modification)
-    Add `ggml_backend_supports_buft_for_op(backend, buft, op)` that returns
-    true for MUL_MAT_ID + host buffer on UMA. The scheduler would skip splits
-    for this specific combination. Different from global `supports_buft` because
-    it doesn't affect compute buffer allocation for other ops.
-    This is the most complex but would eliminate splits entirely.
+  - [~] **P3.8c** — Per-op split bypass with dynamic host import (image `14384ee`)
+    Instead of `supports_buft`, modify split creation + input copy logic:
+    skip `need_new_split` and skip copy creation for host-buffer weights when
+    the backend has `buffer_from_host_ptr` capability. No gallocr impact.
+    Dynamic VK_EXT_external_memory_host import in Vulkan tensor_subbuffer.
+    Model loader wraps CPU buft mmap via `ggml_backend_cpu_buffer_from_ptr`.
+
+    **Status**: Code compiles and deploys. Needs testing on a fresh node.
+    Previous tests were confounded by repeated OOM crashes degrading node
+    memory state — even the stable image couldn't load deepseek after
+    multiple OOMs. Node needs clean reboot before testing.
+
+    **Known fixes applied**:
+    - Null check on `src->buffer` in copy bypass
+    - Restrict mmap-wrap to `buft == ggml_backend_cpu_buffer_type()` only
+      (not Vulkan_Host, which broke its alloc+import path)
 
 ---
 
