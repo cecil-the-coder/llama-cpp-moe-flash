@@ -402,11 +402,28 @@ or implement the staging buffer approach from the original design.
    `--cpu-moe` keeps experts on CPU mmap (no GTT consumption). Expert matmul runs on CPU.
    GPU expert matmul requires either scheduler modification or staging buffer approach.
 
-6. **GPU expert matmul attempted and reverted**: Changed `supports_buft` to accept CPU
-   host buffers on UMA and added lazy `buffer_from_host_ptr` import in
-   `ggml_vk_tensor_subbuffer`. Caused SIGSEGV because many Vulkan functions cast
-   `buffer->context` to `ggml_backend_vk_buffer_context *` without checking buffer type.
-   The approach needs to modify the scheduler's copy path instead of the Vulkan dispatch.
+6. **GPU expert matmul — MUL_MAT_ID offload (image `5486e15`, deployed)**:
+   Added unconditional GPU offload for MUL_MAT_ID in `backend_id_from_cur`.
+   Expert weights stay on CPU mmap. Scheduler creates graph splits with selective
+   expert copy (only used experts copied per split). Results:
+
+   | Model | Size vs GTT | Splits (bs=1) | TPS | Bottleneck |
+   |---|---|---|---|---|
+   | qwen3-235b Q2_K | 80 GB (under) | 2 | 20.4 | None (buffer_from_host_ptr) |
+   | qwen3-235b Q4_K_M | 133 GB (over) | 190 | 4.71 | Split sync overhead |
+   | deepseek-r1-0528 Q2_K | 228 GB (over) | 118 | 1.48 | I/O + split overhead |
+
+   Split count = 2 × n_MoE_layers (one per MUL_MAT_ID weight tensor change).
+   qwen3-235b: 92 layers × 2 = 184 + bookends = 190.
+   deepseek-r1: 58 layers × 2 = 116 + bookends = 118.
+
+7. **supports_buft approaches — all failed (OOM/SIGSEGV)**:
+   - `supports_buft` for Vulkan_Host (f62620a, c265012): SIGSEGV
+   - `supports_buft` for all host buffers via `buft_is_host` (b806384): OOM on node
+   Root cause: supports_buft merges ALL ops into one Vulkan split. The gallocr
+   allocates compute buffer for ALL weight copies simultaneously. For 130+ GB of
+   expert data this exceeds available memory. supports_buft is per-buffer-type,
+   not per-op — fundamentally unsuitable for incremental expert loading.
 
 7. **GPU memory on UMA** (Strix Halo):
    - Single memory heap: 125 GB (= physical RAM)

@@ -203,63 +203,83 @@ expert tensors to CPU.
 
 - [~] **P3.8** — Get expert matmul on Vulkan GPU for models > GTT
 
-  **Current state (stable, deployed as image `998a216`):**
-  `--cpu-moe` with plain CPU buffers. Expert matmul on CPU. 9.5 t/s (qwen3-235b Q2_K).
-  Models > GTT work with `--no-warmup` + disabled mmap prefetch.
+  **Current state (stable, deployed as image `5486e15`):**
+  `--cpu-moe` + MUL_MAT_ID GPU offload. Expert matmul on Vulkan GPU via
+  selective expert copy. Performance limited by graph split overhead.
+
+  | Model | Size | Splits (bs=1) | TPS | Notes |
+  |---|---|---|---|---|
+  | qwen3-235b Q2_K | 80 GB | 2 | 20.4 | ≤ GTT, buffer_from_host_ptr |
+  | qwen3-235b Q4_K_M | 133 GB | 190 | 4.71 | > GTT, --cpu-moe + offload |
+  | deepseek-r1-0528 Q2_K | 228 GB | 118 | 1.48 | > GTT, I/O bound |
 
   **What was attempted and why it failed:**
 
   1. **Full buffer_from_host_ptr import (228 GB):** Kernel OOM — importing 228 GB
-     via VK_EXT_external_memory_host exceeds what the kernel allows on 125 GB RAM.
+     via VK_EXT_external_memory_host exceeds 120 GB GTT limit.
 
   2. **Vulkan_Host buffer type for experts (image `a888d75`):**
-     Changed model loader to keep experts on Vulkan_Host instead of CPU. Expert
-     data allocated via `ggml_vk_host_malloc` + alloc+copy from mmap. Expert
-     MUL_MAT_ID routes to Vulkan BUT with 190 graph splits → 9.0 t/s (slower
-     than baseline due to sync overhead).
+     Expert data via `ggml_vk_host_malloc` + alloc+copy from mmap. 190 graph splits
+     → 9.0 t/s (sync overhead). OOM for models > RAM (doubles memory).
 
   3. **supports_buft for Vulkan_Host (image `c265012`):**
-     Made `ggml_backend_vk_device_supports_buft` return true for Vulkan_Host.
-     Eliminated graph splits (190→1). BUT caused SIGSEGV during warmup.
+     SIGSEGV during warmup. Non-MoE ops crash with Vulkan_Host buffers.
 
-     Root cause of SIGSEGV: Vulkan_Host `alloc_buffer` originally created a
-     **CPU buffer context** (`ggml_backend_cpu_buffer_from_ptr` at line 13414).
-     We fixed this to create a proper `ggml_backend_vk_buffer_context` with
-     `dev_buffer` from the pinned memory. However, with supports_buft=true,
-     ALL ops (not just MUL_MAT_ID) run in one Vulkan split. The crash happens
-     BEFORE MUL_MAT_ID — in attention or early ops that process the Vulkan_Host
-     output buffer or intermediate tensors.
+  4. **supports_buft for all host buffers via buft_is_host (image `b806384`):**
+     With dynamic VK_EXT_external_memory_host import in tensor_subbuffer.
+     OOM/crash on node. Root cause: supports_buft merges ALL ops into one Vulkan
+     split. The gallocr allocates compute buffer for ALL weight copies across
+     ALL layers simultaneously → 130+ GB compute buffer → OOM.
 
-     Key finding: `vk_tensor_offset` uses `tensor->data - vk_ptr_base` (where
-     vk_ptr_base = 0x1000). ALL Vulkan buffer tensors get virtual pointers at
-     0x1000+offset. `ggml_vk_host_get` searches pinned_memory by ACTUAL host
-     pointer — so it never finds these virtual pointers. The fallback to
-     `buf_ctx->dev_buffer` + `vk_tensor_offset` should work, but something
-     in non-MoE ops fails.
+     **Key learning**: `supports_buft` is ALL-OR-NOTHING per buffer type. It can't
+     express "I can handle this buffer type, but only one layer at a time."
+     This makes it fundamentally unsuitable for MoE expert offloading where
+     expert data vastly exceeds compute buffer capacity.
 
-  **Implemented approach: MUL_MAT_ID offload in scheduler (patch 0002)**
+  **Currently deployed: MUL_MAT_ID offload (patch 0002, image `5486e15`)**
 
-  Key insight: the existing `op_offload` mechanism in `backend_id_from_cur`
-  already routes CPU weights to GPU, but gated by `offload_op()` which
-  requires `batch_size >= 32`. For MUL_MAT_ID during single-token generation,
-  `ne[2] = 1` (batch dimension), so it never triggers.
-
-  The fix: after the batch-size-gated offload loop, add unconditional GPU
-  offload specifically for `GGML_OP_MUL_MAT_ID`. Expert weights stay on plain
-  CPU buffer (from `--cpu-moe`), no Vulkan_Host needed. The scheduler's
-  selective expert copy (lines 1480-1564) copies only used experts from
-  CPU → Vulkan compute buffer.
-
-  Also reverted `supports_buft` for Vulkan_Host (SIGSEGV source).
+  The existing `op_offload` mechanism requires `batch_size >= 32`.
+  For MUL_MAT_ID during single-token generation, `ne[2] = 1`, so it never
+  triggers. The fix: unconditional GPU offload for MUL_MAT_ID after the
+  batch-gated loop. The scheduler's selective expert copy (lines 1480-1564)
+  copies only used experts from CPU → Vulkan compute buffer.
 
   Changes:
   - `ggml/src/ggml-backend.cpp:837-847`: MUL_MAT_ID offload (8 lines)
-  - `ggml/src/ggml-vulkan/ggml-vulkan.cpp:15517-15520`: removed supports_buft for Vulkan_Host
   - Patch: `patches/0002-moe-gpu-expert-offload.patch`
 
-  **Status: needs deployment testing on cluster**
-  Expected: scheduler creates graph splits at MoE boundaries (~2-4 per layer),
-  selective expert copy handles data transfer, MUL_MAT_ID runs on Vulkan GPU.
+  **Remaining problem: 118-190 graph splits create ~50-100ms overhead/token.**
+
+  Each split requires: Vulkan submit → fence wait → expert copy → next submit.
+  Split count = 2 × n_MoE_layers (one split per MUL_MAT_ID weight tensor).
+  The `need_new_split` at ggml-backend.cpp:1202 forces a new split whenever a
+  different weight tensor is on an incompatible backend, to allow compute buffer
+  memory reuse between copies.
+
+  Merging splits (skipping `need_new_split` for MUL_MAT_ID) is UNSAFE because
+  the copy phase writes ALL inputs before compute starts. If gallocr reuses
+  memory between non-overlapping compute lifetimes, the copy phase overwrites.
+
+  **Three viable approaches to reduce split cost:**
+
+  - [ ] **P3.8a** — Pipeline parallelism (`n_copies=2`)
+    Overlap split N's compute with split N+1's copy. Currently gated on
+    `model.n_devices() > 1` (llama-context.cpp:313). Relaxing for UMA would
+    enable pipelining with 2× compute buffer (~1.5 GB extra). The per-split
+    sync overhead is hidden by overlapping with useful GPU work.
+
+  - [ ] **P3.8b** — Dynamic import inside split copy phase
+    In `ggml_backend_sched_compute_splits` (line 1480), when copying expert
+    weights from CPU to Vulkan, instead of memcpy, use VK_EXT_external_memory_host
+    to import the mmap'd memory region. Zero-copy on UMA. Keep the split
+    structure for synchronization but eliminate the copy cost (~420 MB/token).
+
+  - [ ] **P3.8c** — Per-tensor supports_buft (scheduler modification)
+    Add `ggml_backend_supports_buft_for_op(backend, buft, op)` that returns
+    true for MUL_MAT_ID + host buffer on UMA. The scheduler would skip splits
+    for this specific combination. Different from global `supports_buft` because
+    it doesn't affect compute buffer allocation for other ops.
+    This is the most complex but would eliminate splits entirely.
 
 ---
 

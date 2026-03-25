@@ -21,95 +21,10 @@ index bc57df20b..a8260165e 100644
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..66a7f1cab 100644
+index e510a92ce..f3cd5deef 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
-     }
- }
- 
-+// Forward declaration for dynamic import
-+static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
-+
-+// On UMA, dynamically import a host buffer's memory via VK_EXT_external_memory_host.
-+// The buffer base must be page-aligned (true for mmap'd regions).
-+// Once imported, the buffer is registered in pinned_memory for future host_get lookups.
-+static void ggml_vk_dynamic_import_host_buffer(vk_device& device, const ggml_tensor * tensor) {
-+    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-+    if (!buf || !ggml_backend_buffer_is_host(buf)) {
-+        return;
-+    }
-+
-+    void * base = ggml_backend_buffer_get_base(buf);
-+    size_t size = ggml_backend_buffer_get_size(buf);
-+
-+    // Check if already imported
-+    vk_buffer existing;
-+    size_t existing_off;
-+    ggml_vk_host_get(device, base, existing, existing_off);
-+    if (existing) {
-+        return;
-+    }
-+
-+    // Align base down and size up to import alignment
-+    const size_t align = device->min_imported_host_pointer_alignment;
-+    uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
-+    uintptr_t aligned_addr = base_addr & ~(align - 1);
-+    size_t pre_pad = base_addr - aligned_addr;
-+    size_t aligned_size = (pre_pad + size + align - 1) & ~(align - 1);
-+
-+    vk_buffer vk_buf = ggml_vk_buffer_from_host_ptr(device, reinterpret_cast<void *>(aligned_addr), aligned_size);
-+    if (vk_buf) {
-+        std::lock_guard<std::recursive_mutex> guard(device->mutex);
-+        device->pinned_memory.push_back(std::make_tuple(reinterpret_cast<void *>(aligned_addr), aligned_size, vk_buf));
-+        VK_LOG_DEBUG("ggml_vk_dynamic_import: imported " << aligned_size / (1024*1024) << " MiB host buffer at " << reinterpret_cast<void *>(aligned_addr));
-+    } else {
-+        GGML_LOG_WARN("ggml_vulkan: dynamic import failed for host buffer at %p (size %zu MiB)\n",
-+            reinterpret_cast<void *>(aligned_addr), aligned_size / (1024*1024));
-+    }
-+}
-+
- static vk_subbuffer ggml_vk_tensor_subbuffer(
-     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
- 
-@@ -6329,6 +6370,14 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
-     size_t offset = 0;
-     if (ctx->device->uma) {
-         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
-+
-+        // Dynamic import: if host_get failed but tensor is on a host buffer,
-+        // import via VK_EXT_external_memory_host for zero-copy GPU access on UMA
-+        if (!buffer && ctx->device->external_memory_host &&
-+            tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
-+            { vk_device dev = ctx->device; ggml_vk_dynamic_import_host_buffer(dev, tensor); }
-+            ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
-+        }
-     }
-     if (!buffer) {
-         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-@@ -8144,6 +8193,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
-         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-         ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
-         ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
-+
-+        // Dynamic import for host buffers not yet in pinned_memory (e.g. mmap'd CPU weights)
-+        if (!d_Qx && ctx->device->external_memory_host && src0->buffer && ggml_backend_buffer_is_host(src0->buffer)) {
-+            { vk_device dev = ctx->device; ggml_vk_dynamic_import_host_buffer(dev, src0); }
-+            ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
-+        }
-+        if (!d_Qy && ctx->device->external_memory_host && src1->buffer && ggml_backend_buffer_is_host(src1->buffer)) {
-+            { vk_device dev = ctx->device; ggml_vk_dynamic_import_host_buffer(dev, src1); }
-+            ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
-+        }
-+        if (!d_ids && ctx->device->external_memory_host && ids->buffer && ggml_backend_buffer_is_host(ids->buffer)) {
-+            { vk_device dev = ctx->device; ggml_vk_dynamic_import_host_buffer(dev, ids); }
-+            ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
-+        }
-+
-         src0_uma = d_Qx != nullptr;
-         src1_uma = d_Qy != nullptr;
-         ids_uma = d_ids != nullptr;
-@@ -15513,10 +15577,14 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15513,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
@@ -117,44 +32,25 @@ index e510a92ce..66a7f1cab 100644
 -    // so they can be safely used in Vulkan dispatch without graph splits.
 -    if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
 -        return true;
-+    // On UMA with VK_EXT_external_memory_host, Vulkan can dynamically import
-+    // host buffer memory (e.g. mmap'd CPU weights) for zero-copy GPU access.
-+    // This eliminates graph splits for MoE expert weights on CPU.
-+    // Matches both ggml_backend_cpu_buffer_type and cpu_buffer_from_ptr_type (CPU_Mapped).
-+    if (ggml_backend_buft_is_host(buft)) {
-+        ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
-+        auto device = ggml_vk_get_device(ctx->device);
-+        return device->uma && device->external_memory_host;
-     }
- 
+-    }
+-
      return false;
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..a9f3b2f94 100644
---- a/src/llama-model.cpp
-+++ b/src/llama-model.cpp
-@@ -7584,6 +7584,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
-                 bufs.emplace_back(buf);
-                 buf_map.emplace(idx, buf);
-             }
-+        } else if (ml.use_mmap && use_mmap_buffer && ggml_backend_buft_is_host(buft) && (is_default_buft || is_host_buft)) {
-+            // CPU host buffer with mmap: wrap mmap directly instead of alloc+copy.
-+            // This keeps tensor data on page-aligned mmap addresses, enabling
-+            // dynamic VK_EXT_external_memory_host import on UMA for zero-copy GPU access.
-+            GGML_ASSERT(!ml.no_alloc);
-+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-+                void * addr = nullptr;
-+                size_t first, last; // NOLINT
-+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-+                if (first >= last) {
-+                    continue;
-+                }
-+                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + first, last - first);
-+                if (buf == nullptr) {
-+                    goto fallback_alloc;
-+                }
-+                bufs.emplace_back(buf);
-+                buf_map.emplace(idx, buf);
-+            }
-         } else { fallback_alloc:
-             ggml_backend_buffer_t buf;
-             if (ml.no_alloc) {
+ }
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5c449414c..434965bba 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -317,6 +317,12 @@ llama_context::llama_context(
+             cparams.offload_kqv &&
+             !model.has_tensor_overrides();
+ 
++        // On UMA with --cpu-moe, pipeline parallelism hides per-split sync overhead
++        // when MoE expert matmul is offloaded to GPU (many graph splits from expert copies).
++        if (!pipeline_parallel && cparams.op_offload && model.hparams.n_expert > 0) {
++            pipeline_parallel = true;
++        }
++
+         // pipeline parallelism requires support for async compute and events in all devices
+         if (pipeline_parallel) {
+             for (auto & backend : backends) {
