@@ -64,7 +64,7 @@ index bc57df20b..f5a684914 100644
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..122c5cfb8 100644
+index e510a92ce..c63b56ff8 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
@@ -115,7 +115,7 @@ index e510a92ce..122c5cfb8 100644
  static vk_subbuffer ggml_vk_tensor_subbuffer(
      const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
  
-@@ -6329,6 +6370,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6329,11 +6370,26 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
      size_t offset = 0;
      if (ctx->device->uma) {
          ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
@@ -132,7 +132,17 @@ index e510a92ce..122c5cfb8 100644
      }
      if (!buffer) {
          auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-@@ -8144,6 +8195,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         buffer = buf_ctx->dev_buffer;
+         offset = vk_tensor_offset(tensor) + tensor->view_offs;
++        if (ggml_backend_buffer_is_host(tensor->buffer)) {
++            fprintf(stderr, "VKSUB: %s buf=%p dev_buf=%p offset=%zu buf_size=%zu tensor_bytes=%zu view_offs=%zu\n",
++                tensor->name, (void*)tensor->buffer, (void*)buffer.get(), offset,
++                buffer ? buffer->size : 0, ggml_nbytes(tensor), (size_t)tensor->view_offs);
++        }
+     }
+     GGML_ASSERT(buffer != nullptr);
+ 
+@@ -8144,6 +8200,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
          ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
          ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
          ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
@@ -154,7 +164,7 @@ index e510a92ce..122c5cfb8 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -15513,12 +15579,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15584,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
