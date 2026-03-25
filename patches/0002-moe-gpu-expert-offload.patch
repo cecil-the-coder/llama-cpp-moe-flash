@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..aa8bcf48c 100644
+index bc57df20b..afc46a261 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -834,6 +834,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -46,7 +46,17 @@ index bc57df20b..aa8bcf48c 100644
                          }
                      }
                      // check if the split has too many inputs
-@@ -1258,7 +1284,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1210,6 +1236,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+             }
+ 
+             if (node_backend_id != cur_backend_id || need_new_split) {
++                fprintf(stderr, "SPLIT: node=%s op=%s backend_change=%d need_new=%d n_inputs=%d\n",
++                    node->name, ggml_op_name(node->op),
++                    node_backend_id != cur_backend_id, need_new_split, split->n_inputs);
+                 split->i_end = i;
+                 i_split++;
+                 if (i_split >= sched->splits_capacity) {
+@@ -1258,7 +1287,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      }
                  }
  
