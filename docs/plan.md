@@ -262,11 +262,12 @@ expert tensors to CPU.
 
   **Three viable approaches to reduce split cost:**
 
-  - [ ] **P3.8a** — Pipeline parallelism (`n_copies=2`)
-    Overlap split N's compute with split N+1's copy. Currently gated on
-    `model.n_devices() > 1` (llama-context.cpp:313). Relaxing for UMA would
-    enable pipelining with 2× compute buffer (~1.5 GB extra). The per-split
-    sync overhead is hidden by overlapping with useful GPU work.
+  - [x] **P3.8a** — Pipeline parallelism (`n_copies=2`) — **OOM for q4km, untested for deepseek**
+    Enabled by relaxing `model.n_devices() > 1` gate (image `55060be`).
+    q4km (133 GB): 2× compute buffer (~1.5 GB) + alloc+copy for 47 GB Vulkan
+    shard → total GTT ~141 GB > 120 GB → OOM, took down the shadow node.
+    deepseek (228 GB): should be safe (only ~10 GB Vulkan + ~6 GB compute).
+    **TODO**: test with deepseek once shadow node is back up.
 
   - [ ] **P3.8b** — Dynamic import inside split copy phase
     In `ggml_backend_sched_compute_splits` (line 1480), when copying expert
