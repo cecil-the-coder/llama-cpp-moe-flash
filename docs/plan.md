@@ -265,17 +265,21 @@ expert tensors to CPU.
         With `kv_unified=true` (2 splits), bypass is fully active — expert
         weights stay on Vulkan_Host, no copies. But SIGSEGV on first request.
 
-        Root cause: `host_get` returns offset = `tensor_ptr - pinned_base`.
-        The gallocr aligns tensor_ptr to `minStorageBufferOffsetAlignment`,
-        but `pinned_base` (from `ggml_vk_host_malloc` → `vkMapMemory`) may
-        NOT be aligned to the same boundary. The difference (offset) is
-        misaligned for Vulkan storage buffer binding → driver crash.
+        Alignment was investigated and ruled out: `vkMapMemory` returns
+        page-aligned pointers, gallocr uses `minStorageBufferOffsetAlignment`,
+        offsets are correctly aligned. Disabling coopmat doesn't help.
+
+        The SIGSEGV is a GPU fault during command execution — the vk_buffer
+        from `host_get` is valid, `tensor_subbuffer` returns correct
+        buffer+offset+size, but the GPU crashes when executing the shader.
 
         With 94 splits (selective copy path), expert data is memcpy'd to
-        Vulkan compute buffer which IS properly aligned → no crash.
+        Vulkan compute buffer → works. With 2 splits (direct access to
+        Vulkan_Host pinned memory) → SIGSEGV.
 
-        **Fix needed**: align `ggml_vk_host_malloc` base to
-        `minStorageBufferOffsetAlignment`, or adjust the returned offset.
+        **Needs**: Vulkan validation layers (`VK_LAYER_KHRONOS_validation`)
+        to get the actual GPU error. Or test if the issue is specific to
+        MUL_MAT_ID or affects any op accessing Vulkan_Host pinned memory.
 
 ---
 
