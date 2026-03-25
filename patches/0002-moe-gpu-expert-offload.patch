@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..a8260165e 100644
+index bc57df20b..9d3c75c06 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -834,6 +834,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
@@ -20,11 +20,128 @@ index bc57df20b..a8260165e 100644
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
+@@ -1191,8 +1202,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                         int src_backend_id = tensor_backend_id(src);
+                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+-                            need_new_split = true;
+-                            break;
++                            // On UMA with buffer_from_host_ptr, the split backend can import
++                            // host buffer memory directly — no copy or split needed.
++                            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
++                            ggml_backend_dev_props dev_props;
++                            ggml_backend_dev_get_props(dev, &dev_props);
++                            if (!(dev_props.caps.buffer_from_host_ptr && ggml_backend_buffer_is_host(src->buffer))) {
++                                need_new_split = true;
++                                break;
++                            }
+                         }
+                     }
+                     // check if the split has too many inputs
+@@ -1258,7 +1276,18 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     }
+                 }
+ 
+-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
++                bool needs_copy = src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
++                // On UMA with buffer_from_host_ptr, skip copy for host buffers —
++                // the backend can import the memory directly at dispatch time.
++                if (needs_copy && ggml_backend_buffer_is_host(src->buffer)) {
++                    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
++                    ggml_backend_dev_props dev_props;
++                    ggml_backend_dev_get_props(dev, &dev_props);
++                    if (dev_props.caps.buffer_from_host_ptr) {
++                        needs_copy = false;
++                    }
++                }
++                if (needs_copy) {
+                     // create a copy of the input in the split's backend
+                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                         ggml_backend_t backend = sched->backends[cur_backend_id];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..f3cd5deef 100644
+index e510a92ce..b905ce861 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -15513,12 +15513,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -6322,6 +6322,41 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
+     }
+ }
+ 
++// Forward declaration for dynamic import
++static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size);
++
++// On UMA, dynamically import a host buffer's memory via VK_EXT_external_memory_host.
++// Once imported, registered in pinned_memory for future host_get lookups.
++static void ggml_vk_dynamic_import_host_buffer(vk_device& device, const ggml_tensor * tensor) {
++    ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++    if (!buf || !ggml_backend_buffer_is_host(buf)) {
++        return;
++    }
++    void * base = ggml_backend_buffer_get_base(buf);
++    size_t size = ggml_backend_buffer_get_size(buf);
++
++    // Check if already imported
++    vk_buffer existing;
++    size_t existing_off;
++    ggml_vk_host_get(device, base, existing, existing_off);
++    if (existing) {
++        return;
++    }
++
++    // Align base down and size up to import alignment
++    const size_t align = device->min_imported_host_pointer_alignment;
++    uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
++    uintptr_t aligned_addr = base_addr & ~(align - 1);
++    size_t pre_pad = base_addr - aligned_addr;
++    size_t aligned_size = (pre_pad + size + align - 1) & ~(align - 1);
++
++    vk_buffer vk_buf = ggml_vk_buffer_from_host_ptr(device, reinterpret_cast<void *>(aligned_addr), aligned_size);
++    if (vk_buf) {
++        std::lock_guard<std::recursive_mutex> guard(device->mutex);
++        device->pinned_memory.push_back(std::make_tuple(reinterpret_cast<void *>(aligned_addr), aligned_size, vk_buf));
++    }
++}
++
+ static vk_subbuffer ggml_vk_tensor_subbuffer(
+     const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
+ 
+@@ -6329,6 +6364,14 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+     size_t offset = 0;
+     if (ctx->device->uma) {
+         ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
++
++        // Dynamic import: host buffer not yet in pinned_memory (e.g. mmap'd CPU weights)
++        if (!buffer && ctx->device->external_memory_host &&
++            tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
++            vk_device dev = ctx->device;
++            ggml_vk_dynamic_import_host_buffer(dev, tensor);
++            ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
++        }
+     }
+     if (!buffer) {
+         auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
+@@ -8144,6 +8187,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
+         ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
+         ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
++
++        // Dynamic import for host buffers not yet in pinned_memory
++        if (!d_Qx && ctx->device->external_memory_host && src0->buffer && ggml_backend_buffer_is_host(src0->buffer)) {
++            vk_device dev = ctx->device; ggml_vk_dynamic_import_host_buffer(dev, src0);
++            ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
++        }
++        if (!d_Qy && ctx->device->external_memory_host && src1->buffer && ggml_backend_buffer_is_host(src1->buffer)) {
++            vk_device dev = ctx->device; ggml_vk_dynamic_import_host_buffer(dev, src1);
++            ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
++        }
++        if (!d_ids && ctx->device->external_memory_host && ids->buffer && ggml_backend_buffer_is_host(ids->buffer)) {
++            vk_device dev = ctx->device; ggml_vk_dynamic_import_host_buffer(dev, ids);
++            ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
++        }
++
+         src0_uma = d_Qx != nullptr;
+         src1_uma = d_Qy != nullptr;
+         ids_uma = d_ids != nullptr;
+@@ -15513,12 +15571,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
@@ -54,3 +171,33 @@ index 5c449414c..434965bba 100644
          // pipeline parallelism requires support for async compute and events in all devices
          if (pipeline_parallel) {
              for (auto & backend : backends) {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 11c5cd23e..a9f3b2f94 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -7584,6 +7584,25 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                 bufs.emplace_back(buf);
+                 buf_map.emplace(idx, buf);
+             }
++        } else if (ml.use_mmap && use_mmap_buffer && ggml_backend_buft_is_host(buft) && (is_default_buft || is_host_buft)) {
++            // CPU host buffer with mmap: wrap mmap directly instead of alloc+copy.
++            // This keeps tensor data on page-aligned mmap addresses, enabling
++            // dynamic VK_EXT_external_memory_host import on UMA for zero-copy GPU access.
++            GGML_ASSERT(!ml.no_alloc);
++            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
++                void * addr = nullptr;
++                size_t first, last; // NOLINT
++                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
++                if (first >= last) {
++                    continue;
++                }
++                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + first, last - first);
++                if (buf == nullptr) {
++                    goto fallback_alloc;
++                }
++                bufs.emplace_back(buf);
++                buf_map.emplace(idx, buf);
++            }
+         } else { fallback_alloc:
+             ggml_backend_buffer_t buf;
+             if (ml.no_alloc) {
