@@ -355,38 +355,3 @@ index e510a92ce..740ee0a90 100644
      return false;
  }
  
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..38836f48d 100644
---- a/src/llama-model.cpp
-+++ b/src/llama-model.cpp
-@@ -7584,6 +7584,30 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
-                 bufs.emplace_back(buf);
-                 buf_map.emplace(idx, buf);
-             }
-+        } else if (ml.use_mmap && use_mmap_buffer && (is_default_buft || is_host_buft) && ggml_backend_buft_is_host(buft) && !buffer_from_host_ptr_supported) {
-+            // CPU buffer with mmap: wrap mmap directly instead of malloc+copy.
-+            // Critical for models > RAM with --cpu-moe: expert data stays on mmap
-+            // (demand-paged) instead of being malloc'd (which OOMs on 228 GB models).
-+            // Only for ggml_backend_cpu_buffer_type (NOT Vulkan_Host).
-+            GGML_ASSERT(!ml.no_alloc);
-+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-+                void * addr = nullptr;
-+                size_t first, last; // NOLINT
-+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-+                if (first >= last) {
-+                    continue;
-+                }
-+                // Align first DOWN to TENSOR_ALIGNMENT (32) to prevent get_base padding
-+                // from shifting the buffer base past the mmap boundary.
-+                const size_t tensor_align = 32;
-+                size_t aligned_first = first & ~(tensor_align - 1);
-+                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + aligned_first, last - aligned_first);
-+                if (buf == nullptr) {
-+                    goto fallback_alloc;
-+                }
-+                bufs.emplace_back(buf);
-+                buf_map.emplace(idx, buf);
-+            }
-         } else { fallback_alloc:
-             ggml_backend_buffer_t buf;
-             if (ml.no_alloc) {
