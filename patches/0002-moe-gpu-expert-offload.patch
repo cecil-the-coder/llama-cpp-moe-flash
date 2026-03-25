@@ -64,7 +64,7 @@ index bc57df20b..f5a684914 100644
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..c63b56ff8 100644
+index e510a92ce..fdbb5e17b 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
@@ -164,7 +164,19 @@ index e510a92ce..c63b56ff8 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -15513,12 +15584,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -13440,7 +13511,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+ }
+ 
+ static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
++    // Use minStorageBufferOffsetAlignment (not minMemoryMapAlignment) because
++    // Vulkan_Host buffers may be used directly in compute shaders (e.g., MoE
++    // expert weights with per-op split bypass on UMA).
++    return vk_instance.devices[0]->properties.limits.minStorageBufferOffsetAlignment;
+ 
+     UNUSED(buft);
+ }
+@@ -15513,12 +15587,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
