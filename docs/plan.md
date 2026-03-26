@@ -380,12 +380,19 @@ expert tensors to CPU.
     Alternatively, the hardware difference (Strix Halo vs Strix Point) or
     Talos kernel config may affect external memory host support.
 
-  - [x] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
-    **CONFIRMED WORKING**: The prefetch thread uses `posix_fadvise(WILLNEED)`
-    on the GGUF file descriptor at expert tensor offsets. Since mmap-wrap maps
-    the SAME file, `fadvise` warms the SAME page cache pages. The prefetch
-    thread activates ("94 layers, 128 experts/layer") and contributes to the
-    4.52→6.4 t/s warmup on q4km. No changes needed.
+  - [x] **P3.10** — Selective prefetch for mmap-wrapped buffers (image `8d31671`)
+    Prefetch thread (speculative, all experts) confirmed working with mmap-wrap.
+    Added GGUF-aware selective fadvise in the eval callback: when routing
+    decision for layer N is observed, issues `posix_fadvise(WILLNEED)` for
+    the NEXT layer's selected experts at their GGUF file offsets.
+
+    The callback now fires in ALL modes (not just CALLBACK) when GGUF
+    warmcache is active. This combines:
+    - Background thread: speculative warmup of all experts
+    - Callback: targeted prefetch of only routed experts (8/256)
+
+    For > GTT models, this focuses page cache on actually-used experts
+    instead of thrashing with speculative all-expert warming.
 
   - [ ] **P3.11** — RADV bug report for host memory limitations
     File upstream RADV bug covering three issues:
