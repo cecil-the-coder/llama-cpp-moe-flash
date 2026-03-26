@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..fc1ea6107 100644
+index e510a92ce..27f0833ad 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -4879,6 +4879,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
@@ -69,7 +69,16 @@ index e510a92ce..fc1ea6107 100644
      return false;
  }
  
-@@ -15600,10 +15592,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+@@ -15592,6 +15584,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+     const size_t align = device->min_imported_host_pointer_alignment;
+     uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
+     if (uptr & (align - 1)) {
++        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: ptr %p misaligned (need %zu, off by %zu)\n",
++            ptr, align, uptr & (align - 1));
+         return {};
+     }
+     // Round up size to alignment (the mmap'd region extends to page boundary)
+@@ -15600,10 +15594,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
      const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
  
      vk_buffer buf {};
@@ -87,7 +96,7 @@ index e510a92ce..fc1ea6107 100644
  
      return buf;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..b7347c0c9 100644
+index 11c5cd23e..ed3d58e0a 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -7559,11 +7559,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
@@ -103,16 +112,18 @@ index 11c5cd23e..b7347c0c9 100644
                  void * addr = nullptr;
                  size_t first, last; // NOLINT
                  ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-@@ -7573,12 +7570,46 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -7571,14 +7568,53 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                     continue;
+                 }
                  const size_t max_size = ggml_get_max_tensor_size(ctx);
-                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                 if (buf == nullptr) {
--                    // buffer_from_host_ptr failed (e.g., exceeds device memory limit)
--                    // Fall back to allocating a new buffer and copying data
--                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s (size %.1f MiB), falling back to copy\n",
--                            __func__, ggml_backend_buft_name(buft), (last - first) / (1024.0 * 1024.0));
--                    buf_map.clear();
--                    bufs.clear();
+-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
++                // Align 'first' DOWN to page boundary (4096) for VK_EXT_external_memory_host.
++                // The import requires page-aligned pointers. mmap base (addr) is page-aligned,
++                // but 'first' (offset of first tensor in shard) may not be.
++                const size_t page_align = 4096;
++                size_t aligned_first = (first / page_align) * page_align;
++                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + aligned_first, last - aligned_first, max_size);
++                if (buf == nullptr) {
 +                    // Per-shard fallback: mmap-wrap this shard, keep successful imports.
 +                    // This is critical for models near the GTT limit — most shards import
 +                    // fine, only the one exceeding remaining GTT fails.
@@ -152,7 +163,13 @@ index 11c5cd23e..b7347c0c9 100644
 +                const size_t align = 32;
 +                size_t aligned_first = (first / align) * align;
 +                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + aligned_first, last - aligned_first);
-+                if (buf == nullptr) {
+                 if (buf == nullptr) {
+-                    // buffer_from_host_ptr failed (e.g., exceeds device memory limit)
+-                    // Fall back to allocating a new buffer and copying data
+-                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s (size %.1f MiB), falling back to copy\n",
+-                            __func__, ggml_backend_buft_name(buft), (last - first) / (1024.0 * 1024.0));
+-                    buf_map.clear();
+-                    bufs.clear();
                      goto fallback_alloc;
                  }
                  bufs.emplace_back(buf);
