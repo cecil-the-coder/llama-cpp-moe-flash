@@ -487,6 +487,18 @@ or implement the staging buffer approach from the original design.
    9.7 t/s. GPU offload only helps when data is already in a Vulkan buffer
    (buffer_from_host_ptr success).
 
+   **ROOT CAUSE of buffer_from_host_ptr failures** (found in `663fee9`):
+   The model loader passes `(char*)addr + first` to `buffer_from_host_ptr`.
+   The mmap base (`addr`) is page-aligned (4096), but `first` (offset of
+   first tensor in shard) is NOT page-aligned. `VK_EXT_external_memory_host`
+   requires 4096-byte aligned pointers. The alignment check in
+   `ggml_vk_buffer_from_host_ptr` (line 15586) was silently returning `{}`
+   with no error message — making it appear like a memory/GTT issue.
+
+   Fix: align `first` down to 4096 before passing to `buffer_from_host_ptr`.
+   This should restore import success for ALL shards → Q2_K back to 20+ t/s.
+   For models > GTT, more shards may succeed, reducing the amount on mmap.
+
    **mmap-wrap** is the key innovation: `ggml_backend_cpu_buffer_from_ptr` wraps
    the mmap directly, keeping expert data demand-paged. For models > RAM, this
    prevents the malloc OOM that made q4km (133 GB) and deepseek (228 GB) unable

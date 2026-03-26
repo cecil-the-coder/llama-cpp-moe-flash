@@ -326,12 +326,22 @@ expert tensors to CPU.
 
   **Future improvements (prioritized):**
 
-  - [ ] **P3.9** — Per-shard buffer_from_host_ptr (highest impact)
-    Currently when ONE shard's import fails, ALL successful imports are
-    discarded (`buf_map.clear(); bufs.clear(); goto mmap_wrap`). Fix: keep
-    successful imports, only mmap-wrap the failed shard. This would put most
-    of Q2_K (80 GB) on Vulkan → restore 20+ t/s. For q4km (133 GB), 2 of 3
-    shards could be imported → only ~1/3 on mmap → much less I/O.
+  - [x] **P3.9** — Per-shard buffer_from_host_ptr + page alignment fix
+    Two issues found and fixed:
+
+    **Issue 1**: All-or-nothing shard import. Fixed: keep successful imports,
+    mmap-wrap only failed shards (in `8a37b8d`).
+
+    **Issue 2 (ROOT CAUSE)**: `buffer_from_host_ptr` was silently failing
+    for ALL shards because the pointer `addr + first` was NOT page-aligned.
+    `VK_EXT_external_memory_host` requires 4096-byte alignment. The mmap base
+    (`addr`) is page-aligned, but `first` (offset of first tensor in shard)
+    is NOT. The alignment check at `ggml_vk_buffer_from_host_ptr` line 15586
+    returned `{}` silently — no error message.
+
+    Fixed in `663fee9`: align `first` DOWN to 4096 before passing to
+    `buffer_from_host_ptr`. This should restore import success for ALL shards
+    on under-GTT models → expected 20+ t/s for Q2_K.
 
   - [x] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
     **CONFIRMED WORKING**: The prefetch thread uses `posix_fadvise(WILLNEED)`
