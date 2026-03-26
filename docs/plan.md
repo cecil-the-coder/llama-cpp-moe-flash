@@ -348,8 +348,20 @@ expert tensors to CPU.
     work via suballocation (multiple smaller buffers). `buffer_from_host_ptr` tries
     to create ONE buffer for the entire shard → exceeds 4 GiB → fails.
 
-    Fix needed: split the import range into chunks ≤ 4 GiB, each with its own
-    VkBuffer. Register all chunks in `pinned_memory` for `host_get` lookup.
+    Attempted fix: chunked import (3 GiB chunks, images `bb3ea90`/`71e225a`).
+    **Also fails**: `ErrorOutOfDeviceMemory` at offset 0. RADV cannot import
+    mmap'd virtual pages via `VK_EXT_external_memory_host` at all — the issue
+    is not buffer size but the memory source. The extension only works for
+    `ggml_vk_host_malloc` (pinned) pages, not mmap'd file pages.
+
+    **Conclusion**: `buffer_from_host_ptr` cannot work for mmap'd model data
+    on RADV. The current mmap-wrap + CPU matmul is the best achievable path.
+
+    **RADV limitations summary**:
+    - `maxBufferSize` = 4 GiB (all shard ranges exceed this)
+    - `VK_EXT_external_memory_host` import fails for mmap'd pages (ErrorOutOfDeviceMemory)
+    - Direct pinned memory read by compute shaders → GPU page fault (SIGSEGV)
+    - These are driver-level limitations, not fixable from our side
 
   - [x] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
     **CONFIRMED WORKING**: The prefetch thread uses `posix_fadvise(WILLNEED)`
@@ -358,16 +370,19 @@ expert tensors to CPU.
     thread activates ("94 layers, 128 experts/layer") and contributes to the
     4.52→6.4 t/s warmup on q4km. No changes needed.
 
-  - [ ] **P3.11** — RADV bug report for host memory compute shader access
-    Build image with VK_LAYER_KHRONOS_validation to get the exact Vulkan
-    error. File upstream RADV bug. If fixed, P3.8c bypass eliminates all
-    MoE splits (2 splits, ~20+ t/s for all models regardless of GTT).
+  - [ ] **P3.11** — RADV bug report for host memory limitations
+    File upstream RADV bug covering three issues:
+    1. `VK_EXT_external_memory_host` fails for mmap'd pages (ErrorOutOfDeviceMemory)
+    2. Compute shaders can't read from pinned host memory (GPU page fault)
+    3. `maxBufferSize` = 4 GiB (limits single-buffer imports)
+    Build with `VK_LAYER_KHRONOS_validation` for exact error details.
+    If any of these are fixed, significant performance gains are possible.
 
   - [ ] **P3.12** — Disable --cpu-moe for under-GTT models
-    When buffer_from_host_ptr succeeds for ALL shards, --cpu-moe is
-    counterproductive (forces experts to CPU, adds 190 splits). Auto-detect:
-    if model fits in GTT, skip --cpu-moe. Requires model size vs GTT check
-    in the controller or model loader.
+    On RADV, `buffer_from_host_ptr` fails for mmap'd data regardless of size,
+    so this optimization is blocked until RADV fixes the import limitation.
+    If RADV is fixed: when all shards import successfully, skip --cpu-moe
+    to avoid the 190-split CPU matmul overhead → 20+ t/s for all models.
 
 ---
 

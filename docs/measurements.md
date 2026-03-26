@@ -495,9 +495,23 @@ or implement the staging buffer approach from the original design.
    `ggml_vk_buffer_from_host_ptr` (line 15586) was silently returning `{}`
    with no error message — making it appear like a memory/GTT issue.
 
-   Fix: align `first` down to 4096 before passing to `buffer_from_host_ptr`.
-   This should restore import success for ALL shards → Q2_K back to 20+ t/s.
-   For models > GTT, more shards may succeed, reducing the amount on mmap.
+   Fix attempt 1: align `first` down to 4096. Revealed the REAL limit:
+   `maxBufferSize = 4 GiB` on RADV (not alignment).
+
+   Fix attempt 2: chunked import (3 GiB chunks). Also fails:
+   `ErrorOutOfDeviceMemory` at chunk offset 0. RADV cannot import mmap'd
+   pages via `VK_EXT_external_memory_host` — the extension only works for
+   `ggml_vk_host_malloc` (pinned) memory, not mmap'd file pages.
+
+   **Conclusion**: `buffer_from_host_ptr` will NEVER work for mmap'd model
+   data on current RADV. The 998a216 baseline (20.4 t/s for Q2_K) used
+   `ggml_vk_host_malloc` buffers which ARE importable — but those require
+   malloc+copy from mmap, which OOMs for > RAM models.
+
+   **Current best achievable on RADV (image `3153412`)**:
+   - mmap-wrap + CPU matmul (--cpu-moe)
+   - 9.68 t/s Q2_K, 6.4 t/s q4km, 2.84 t/s deepseek
+   - Over-GTT models load reliably on cold boot (the main achievement)
 
    **mmap-wrap** is the key innovation: `ggml_backend_cpu_buffer_from_ptr` wraps
    the mmap directly, keeping expert data demand-paged. For models > RAM, this
