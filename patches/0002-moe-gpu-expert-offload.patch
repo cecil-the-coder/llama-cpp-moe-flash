@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..e746581d9 100644
+index e510a92ce..a42b26ef8 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -4879,6 +4879,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
@@ -95,7 +95,7 @@ index e510a92ce..e746581d9 100644
      }
  
      return buf;
-@@ -15616,17 +15615,60 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+@@ -15616,17 +15615,61 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
      ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
      auto device = ggml_vk_get_device(ctx->device);
  
@@ -116,7 +116,8 @@ index e510a92ce..e746581d9 100644
      }
  
 -    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
-+    const size_t chunk_size = (size_t)(device->max_buffer_size > 0 ? device->max_buffer_size : 4ULL * 1024 * 1024 * 1024) & ~(size_t)(4095);
++    // Use 75% of max_buffer_size to stay safely under the limit
++    const size_t chunk_size = (size_t)((device->max_buffer_size > 0 ? device->max_buffer_size : 4ULL * 1024 * 1024 * 1024) * 3 / 4) & ~(size_t)(4095);
 +    if (chunk_size == 0) {
 +        return {};
 +    }
