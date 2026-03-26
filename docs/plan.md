@@ -357,11 +357,20 @@ expert tensors to CPU.
     **Conclusion**: `buffer_from_host_ptr` cannot work for mmap'd model data
     on RADV. The current mmap-wrap + CPU matmul is the best achievable path.
 
-    **RADV limitations summary**:
+    **RADV limitations (shadow node, kernel 6.18.15-talos)**:
     - `maxBufferSize` = 4 GiB (all shard ranges exceed this)
     - `VK_EXT_external_memory_host` import fails for mmap'd pages (ErrorOutOfDeviceMemory)
     - Direct pinned memory read by compute shaders → GPU page fault (SIGSEGV)
-    - These are driver-level limitations, not fixable from our side
+
+    **BUT: local machine (Strix Point 890M, kernel 6.19.8-cachyos) WORKS!**
+    - `maxBufferSize` = 2 GiB (smaller, but chunked import compensates)
+    - Chunked import of mmap'd memory: **SUCCESS** for 1-8 GiB
+    - Both malloc'd and mmap'd imports work
+    - The shadow ErrorOutOfDeviceMemory may be driver-version-specific
+
+    This means the chunked import approach IS correct — the shadow node
+    likely needs a RADV/kernel update. Or the GTT was exhausted from
+    prior test runs when the chunk test ran.
 
   - [x] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
     **CONFIRMED WORKING**: The prefetch thread uses `posix_fadvise(WILLNEED)`
