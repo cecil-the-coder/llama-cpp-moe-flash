@@ -406,6 +406,21 @@ expert tensors to CPU.
     starts cold — page cache fills gradually via prefetch + access patterns.
     Given enough requests, Q2K should reach 9.7+ t/s once fully cached.
 
+  - [x] **P3.13** — Hybrid pinned/mmap allocation (image `7cd1d67`)
+    When `buffer_from_host_ptr` fails, check if tensor data fits in
+    available RAM (`MemAvailable × 3/4`). If yes, use `fallback_alloc`
+    (pinned `ggml_vk_host_malloc`, alloc+copy → fast). If no, use
+    `mmap_wrap` (demand-paged → no OOM).
+
+    Results:
+    | Model | Tensors | RAM | Path | TPS |
+    |---|---|---|---|---|
+    | Q2K | 76.7 GiB | 118 GiB | pinned alloc | **9.30** |
+    | q4km | 128.2 GiB | 117 GiB | mmap-wrap | **3.04** (cold) |
+
+    Restores `998a216` performance for under-RAM models while keeping
+    cold boot reliability for over-RAM models.
+
   - [ ] **P3.11** — RADV bug report for host memory limitations
     File upstream RADV bug covering three issues:
     1. `VK_EXT_external_memory_host` fails for mmap'd pages (ErrorOutOfDeviceMemory)
