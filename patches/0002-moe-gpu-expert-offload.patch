@@ -1,20 +1,8 @@
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df20b..4b5bfc0de 100644
+index bc57df20b..f5a684914 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -827,13 +827,27 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
-         if (tensor->op != GGML_OP_ROPE && src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-             int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
-             // check if a backend with higher prio wants to offload the op
--            if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
--                for (int b = 0; b < src_backend_id; b++) {
-+            // Also handle src_backend_id == -1: Vulkan_Host buffers (CPU interface)
-+            // aren't claimed by any backend via supports_buft, but are host-accessible.
-+            int offload_limit = src_backend_id > 0 ? src_backend_id : sched->n_backends - 1;
-+            if (sched->op_offload && (src_backend_id == sched->n_backends - 1 || src_backend_id == -1) && ggml_backend_buffer_is_host(src->buffer)) {
-+                for (int b = 0; b < offload_limit; b++) {
-                     if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
-                         SET_CAUSE(tensor, "1.off");
+@@ -834,6 +834,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                          return b;
                      }
                  }
@@ -22,7 +10,7 @@ index bc57df20b..4b5bfc0de 100644
 +                // The scheduler's selective expert copy handles the host->device data transfer,
 +                // copying only the experts selected by the routing tensor.
 +                if (tensor->op == GGML_OP_MUL_MAT_ID) {
-+                    for (int b = 0; b < offload_limit; b++) {
++                    for (int b = 0; b < src_backend_id; b++) {
 +                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
 +                            SET_CAUSE(tensor, "1.moe");
 +                            return b;
@@ -32,7 +20,7 @@ index bc57df20b..4b5bfc0de 100644
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1191,8 +1205,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1191,8 +1202,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                          int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
@@ -41,12 +29,7 @@ index bc57df20b..4b5bfc0de 100644
 +                            // On UMA with buffer_from_host_ptr, MUL_MAT_ID can import
 +                            // host buffer memory directly — no copy or split needed.
 +                            bool can_import = false;
-+                            // Bypass for CPU host buffers (from --cpu-moe on > GTT models).
-+                            // Uses dynamic VK_EXT_external_memory_host import at dispatch time.
-+                            // Check buft is CPU-type (not Vulkan_Host which causes GPU page faults).
-+                            if (node->op == GGML_OP_MUL_MAT_ID &&
-+                                ggml_backend_buft_is_host(src->buffer->buft) &&
-+                                ggml_backend_buft_get_device(src->buffer->buft) != ggml_backend_get_device(sched->backends[cur_backend_id])) {
++                            if (node->op == GGML_OP_MUL_MAT_ID && ggml_backend_buffer_is_host(src->buffer)) {
 +                                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
 +                                ggml_backend_dev_props dev_props;
 +                                ggml_backend_dev_get_props(dev, &dev_props);
@@ -59,7 +42,7 @@ index bc57df20b..4b5bfc0de 100644
                          }
                      }
                      // check if the split has too many inputs
-@@ -1258,7 +1288,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1258,7 +1280,19 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      }
                  }
  
@@ -67,10 +50,8 @@ index bc57df20b..4b5bfc0de 100644
 +                bool needs_copy = src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id);
 +                // On UMA with buffer_from_host_ptr, skip copy for MUL_MAT_ID host buffer weights —
 +                // the backend can import the memory directly at dispatch time.
-+                // Bypass for CPU host buffers (not Vulkan_Host which causes GPU page faults)
 +                if (needs_copy && node->op == GGML_OP_MUL_MAT_ID &&
-+                    src->buffer && ggml_backend_buft_is_host(src->buffer->buft) &&
-+                    ggml_backend_buft_get_device(src->buffer->buft) != ggml_backend_get_device(sched->backends[cur_backend_id])) {
++                    src->buffer && ggml_backend_buffer_is_host(src->buffer)) {
 +                    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[cur_backend_id]);
 +                    ggml_backend_dev_props dev_props;
 +                    ggml_backend_dev_get_props(dev, &dev_props);
@@ -82,62 +63,11 @@ index bc57df20b..4b5bfc0de 100644
                      // create a copy of the input in the split's backend
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
-@@ -1455,6 +1499,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
-         int split_backend_id = split->backend_id;
-         ggml_backend_t split_backend = sched->backends[split_backend_id];
- 
-+        GGML_LOG_WARN("COMPUTE_SPLIT: split=%d/%d backend=%s n_inputs=%d n_nodes=%d\n",
-+            split_id, sched->n_splits, ggml_backend_name(split_backend),
-+            split->n_inputs, split->graph.n_nodes);
-+
-         if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
-             ggml_backend_synchronize(split_backend);
-         }
-@@ -1465,6 +1513,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
-             struct ggml_tensor * input = split->inputs[input_id];
-             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
- 
-+            GGML_LOG_WARN("  INPUT: %s buf=%s is_input=%d\n",
-+                input->name, input->buffer ? ggml_backend_buffer_name(input->buffer) : "null",
-+                (input->flags & GGML_TENSOR_FLAG_INPUT) ? 1 : 0);
-+
-             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..740ee0a90 100644
+index e510a92ce..a6875ca69 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -1,5 +1,6 @@
- #include "ggml-vulkan.h"
- #include <vulkan/vulkan_core.h>
-+#include <csignal>
- #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
- #include <chrono>
- #include "ggml-cpu.h"
-@@ -6261,9 +6262,19 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
- 
- static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
-     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
-+    // On UMA, use the SAME memory type as ggml_vk_create_buffer_device (line 2700):
-+    // eDeviceLocal first, fallback eHostVisible|eHostCoherent. This ensures the
-+    // buffer is shader-compatible. The eHostCached flag used in the non-UMA path
-+    // selects a different memory type index on RADV/AMD that causes GPU page faults
-+    // when compute shaders read from it.
-     vk_buffer buf = ggml_vk_create_buffer(device, size,
--        {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
--         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-+        device->uma ?
-+        std::initializer_list<vk::MemoryPropertyFlags>{
-+            vk::MemoryPropertyFlagBits::eDeviceLocal,
-+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent} :
-+        std::initializer_list<vk::MemoryPropertyFlags>{
-+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
-+            vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
- 
-     if(!(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible)) {
-         fprintf(stderr, "WARNING: failed to allocate %.2f MB of pinned memory\n",
-@@ -6322,6 +6333,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
+@@ -6322,6 +6322,47 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
      }
  }
  
@@ -185,7 +115,7 @@ index e510a92ce..740ee0a90 100644
  static vk_subbuffer ggml_vk_tensor_subbuffer(
      const ggml_backend_vk_context * ctx, const ggml_tensor * tensor, bool allow_misalign = false) {
  
-@@ -6329,6 +6381,16 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
+@@ -6329,11 +6370,26 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
      size_t offset = 0;
      if (ctx->device->uma) {
          ggml_vk_host_get(ctx->device, tensor->data, buffer, offset);
@@ -202,45 +132,17 @@ index e510a92ce..740ee0a90 100644
      }
      if (!buffer) {
          auto buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-@@ -6339,6 +6401,37 @@ static vk_subbuffer ggml_vk_tensor_subbuffer(
- 
-     size_t size = ggml_nbytes(tensor);
- 
-+    // Log every tensor_subbuffer call to find where crash occurs
-+    {
-+        static int total_calls = 0;
-+        total_calls++;
-+        if (total_calls <= 3 || total_calls % 1000 == 0) {
-+            GGML_LOG_WARN("vk_subbuf_call #%d: %s buf=%s offset=%zu size=%zu\n",
-+                total_calls, tensor->name,
-+                tensor->buffer ? ggml_backend_buffer_name(tensor->buffer) : "null",
-+                offset, size);
+         buffer = buf_ctx->dev_buffer;
+         offset = vk_tensor_offset(tensor) + tensor->view_offs;
++        if (ggml_backend_buffer_is_host(tensor->buffer)) {
++            fprintf(stderr, "VKSUB: %s buf=%p dev_buf=%p offset=%zu buf_size=%zu tensor_bytes=%zu view_offs=%zu\n",
++                tensor->name, (void*)tensor->buffer, (void*)buffer.get(), offset,
++                buffer ? buffer->size : 0, ggml_nbytes(tensor), (size_t)tensor->view_offs);
 +        }
-+    }
-+
-+    // Bounds check: ensure offset + size doesn't exceed buffer
-+    if (offset + size > buffer->size) {
-+        GGML_LOG_ERROR("vk_tensor_subbuffer: OOB %s offset=%zu size=%zu buf_size=%zu\n",
-+            tensor->name, offset, size, buffer->size);
-+        GGML_ABORT("buffer out of bounds");
-+    }
-+
-+    // Debug: log ALL tensor resolution failures for host buffers
-+    if (tensor->buffer && ggml_backend_buffer_is_host(tensor->buffer)) {
-+        static int log_count = 0;
-+        if (log_count < 10) {
-+            GGML_LOG_WARN("vk_subbuf: %s buf=%s data=%p offset=%zu size=%zu vkbuf=%zu via=%s\n",
-+                tensor->name, ggml_backend_buffer_name(tensor->buffer),
-+                tensor->data, offset, size, buffer->size,
-+                (offset == (size_t)((uint8_t*)tensor->data - (uint8_t*)ggml_backend_buffer_get_base(tensor->buffer))) ? "host_get" : "dev_buf");
-+            log_count++;
-+        }
-+    }
-+
-     size_t misalign_bytes = offset & (ctx->device->properties.limits.minStorageBufferOffsetAlignment - 1);
-     // The shader must support misaligned offsets when indexing into the buffer
-     GGML_ASSERT(allow_misalign || misalign_bytes == 0);
-@@ -8144,6 +8237,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     }
+     GGML_ASSERT(buffer != nullptr);
+ 
+@@ -8144,6 +8200,21 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
          ggml_vk_host_get(ctx->device, src0->data, d_Qx, qx_buf_offset);
          ggml_vk_host_get(ctx->device, src1->data, d_Qy, qy_buf_offset);
          ggml_vk_host_get(ctx->device, ids->data, d_ids, ids_buf_offset);
@@ -262,18 +164,7 @@ index e510a92ce..740ee0a90 100644
          src0_uma = d_Qx != nullptr;
          src1_uma = d_Qy != nullptr;
          ids_uma = d_ids != nullptr;
-@@ -13411,22 +13519,23 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
-         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-     }
- 
-+    if (ptr == nullptr) {
-+        // host_malloc returned nullptr (e.g., GTT exhausted on UMA)
-+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-+    }
-+
-     // Look up the pinned vk_buffer that ggml_vk_host_malloc registered
-     vk_buffer vk_buf = nullptr;
-     size_t buf_offset = 0;
+@@ -13417,16 +13488,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
      if (vk_buf) {
@@ -296,7 +187,7 @@ index e510a92ce..740ee0a90 100644
      }
  
      // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
-@@ -13440,7 +13549,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13440,7 +13507,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -308,41 +199,7 @@ index e510a92ce..740ee0a90 100644
  
      UNUSED(buft);
  }
-@@ -14219,6 +14331,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
- 
-         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
-         ctx->fused_topk_moe_scale = false;
-+        {
-+            static int node_count = 0;
-+            node_count++;
-+            if (node_count <= 5 || node_count % 500 == 0) {
-+                GGML_LOG_WARN("vk_graph: node #%d %s op=%s\n", node_count,
-+                    cgraph->nodes[i]->name, ggml_op_name(cgraph->nodes[i]->op));
-+            }
-+        }
-         const char *fusion_string {};
-         if (!ctx->device->disable_fusion) {
-             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
-@@ -14798,6 +14918,18 @@ static ggml_guid_t ggml_backend_vk_guid() {
- ggml_backend_t ggml_backend_vk_init(size_t dev_num) {
-     VK_LOG_DEBUG("ggml_backend_vk_init(" << dev_num << ")");
- 
-+    // Install SIGSEGV handler for debugging GPU faults
-+    static bool signal_installed = false;
-+    if (!signal_installed) {
-+        signal(SIGSEGV, [](int sig) {
-+            GGML_LOG_ERROR("\n*** SIGSEGV caught ***\n");
-+            ggml_print_backtrace();
-+            signal(sig, SIG_DFL);
-+            raise(sig);
-+        });
-+        signal_installed = true;
-+    }
-+
-     ggml_backend_vk_context * ctx = new ggml_backend_vk_context;
-     ggml_vk_init(ctx, dev_num);
- 
-@@ -15513,12 +15645,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15583,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
@@ -355,3 +212,59 @@ index e510a92ce..740ee0a90 100644
      return false;
  }
  
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index e5b83e144..e9e378b56 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -317,7 +317,10 @@ void * ggml_aligned_malloc(size_t size) {
+ #if defined(__s390x__)
+     const int alignment = 256;
+ #else
+-    const int alignment = 64;
++    // 4096 alignment enables VK_EXT_external_memory_host import on UMA
++    // (page alignment required). 4096 is a multiple of 64 so all existing
++    // alignment requirements are still satisfied.
++    const int alignment = 4096;
+ #endif
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 11c5cd23e..910fac30e 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -7584,6 +7584,35 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                 bufs.emplace_back(buf);
+                 buf_map.emplace(idx, buf);
+             }
++        } else if (ml.use_mmap && use_mmap_buffer && (is_default_buft || is_host_buft) && ggml_backend_buft_is_host(buft) && !buffer_from_host_ptr_supported) {
++            // CPU/Vulkan_Host with mmap: wrap mmap directly instead of malloc+copy.
++            // Critical for models > RAM: expert data stays demand-paged on mmap.
++            GGML_ASSERT(!ml.no_alloc);
++            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
++                void * addr = nullptr;
++                size_t first, last; // NOLINT
++                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
++                if (first >= last) {
++                    continue;
++                }
++                // Align first DOWN to TENSOR_ALIGNMENT so get_base() doesn't pad past it
++                const size_t align = TENSOR_ALIGNMENT;
++                size_t aligned_first = (first / align) * align;
++                size_t buf_size = last - aligned_first;
++
++                LLAMA_LOG_INFO("%s: mmap-wrap %s shard %u: addr=%p first=%zu aligned=%zu last=%zu size=%.1f MiB\n",
++                    __func__, ggml_backend_buft_name(buft), idx, addr, first, aligned_first, last, buf_size / (1024.0 * 1024.0));
++
++                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + aligned_first, buf_size);
++                if (buf == nullptr) {
++                    LLAMA_LOG_WARN("%s: mmap-wrap failed, falling back to alloc\n", __func__);
++                    buf_map.clear();
++                    bufs.clear();
++                    goto fallback_alloc;
++                }
++                bufs.emplace_back(buf);
++                buf_map.emplace(idx, buf);
++            }
+         } else { fallback_alloc:
+             ggml_backend_buffer_t buf;
+             if (ml.no_alloc) {
