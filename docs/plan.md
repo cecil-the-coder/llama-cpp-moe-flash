@@ -340,8 +340,16 @@ expert tensors to CPU.
     returned `{}` silently — no error message.
 
     Fixed in `663fee9`: align `first` DOWN to 4096 before passing to
-    `buffer_from_host_ptr`. This should restore import success for ALL shards
-    on under-GTT models → expected 20+ t/s for Q2_K.
+    `buffer_from_host_ptr`. BUT: revealed the REAL limit — `maxBufferSize`
+    is only **4 GiB** on RADV/Strix Halo. No single shard fits.
+
+    **Issue 3 (ACTUAL LIMIT)**: `VkPhysicalDeviceMaintenance4Properties::maxBufferSize`
+    = 4 GiB on RADV. All shard mapping ranges exceed this. Regular Vulkan buffers
+    work via suballocation (multiple smaller buffers). `buffer_from_host_ptr` tries
+    to create ONE buffer for the entire shard → exceeds 4 GiB → fails.
+
+    Fix needed: split the import range into chunks ≤ 4 GiB, each with its own
+    VkBuffer. Register all chunks in `pinned_memory` for `host_get` lookup.
 
   - [x] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
     **CONFIRMED WORKING**: The prefetch thread uses `posix_fadvise(WILLNEED)`
