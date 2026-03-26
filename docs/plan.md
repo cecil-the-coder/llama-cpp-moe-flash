@@ -333,11 +333,12 @@ expert tensors to CPU.
     of Q2_K (80 GB) on Vulkan → restore 20+ t/s. For q4km (133 GB), 2 of 3
     shards could be imported → only ~1/3 on mmap → much less I/O.
 
-  - [ ] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
-    The prefetch thread (LLAMA_FLASH_MOE_ENABLED=1) does posix_fadvise(WILLNEED)
-    to warm page cache for upcoming experts. Check if it activates for
-    mmap-wrapped CPU_Mapped buffers. If not, enable it — reduces cold page
-    fault stalls for > GTT models.
+  - [x] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
+    **CONFIRMED WORKING**: The prefetch thread uses `posix_fadvise(WILLNEED)`
+    on the GGUF file descriptor at expert tensor offsets. Since mmap-wrap maps
+    the SAME file, `fadvise` warms the SAME page cache pages. The prefetch
+    thread activates ("94 layers, 128 experts/layer") and contributes to the
+    4.52→6.4 t/s warmup on q4km. No changes needed.
 
   - [ ] **P3.11** — RADV bug report for host memory compute shader access
     Build image with VK_LAYER_KHRONOS_validation to get the exact Vulkan
