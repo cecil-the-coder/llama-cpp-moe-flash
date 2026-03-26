@@ -274,22 +274,40 @@ expert tensors to CPU.
         The SAME data works when memcpy'd to a Vulkan compute buffer
         (94-split selective copy path).
 
-        **CONFIRMED: RADV driver limitation.** Pinned host memory from
-        `ggml_vk_host_malloc` (eHostVisible|eHostCoherent|eHostCached) cannot
-        be read by compute shaders as storage buffer input, despite UMA.
+        **Two separate issues discovered:**
 
-        Evidence:
-        - Signal handler didn't catch SIGSEGV → GPU page fault from driver
-        - compute_splits never reached → crash during alloc_graph
-        - tensor_subbuffer never called → crash before any op dispatch
-        - Bounds check passes → offset+size within buffer
-        - Re-importing via VK_EXT_external_memory_host doesn't fix it
-          (same memory type on UMA)
-        - Same data works when memcpy'd to regular Vulkan compute buffer
+        **Issue 1: RADV GPU page fault with Vulkan_Host pinned memory**
+        Pinned memory from `ggml_vk_host_malloc` cannot be read by compute
+        shaders as storage buffer input on RADV/AMD UMA. Signal handler
+        didn't catch SIGSEGV → GPU fault from driver. Re-importing via
+        VK_EXT_external_memory_host and changing memory type (eDeviceLocal)
+        doesn't help. Bypass restricted to plain CPU buffers only (not
+        Vulkan_Host) via `buft_is_host + buft_device != split_device` check.
 
-        **P3.8c split bypass is architecturally correct but blocked by this
-        driver limitation.** Need Vulkan validation layers to determine if
-        this is a RADV bug or Vulkan spec-conformant behavior.
+        **Issue 2: Over-GTT models can't load fresh (malloc OOM)**
+        `--cpu-moe` fallback_alloc mallocs ALL expert data (~120 GB q4km,
+        ~210 GB deepseek). On 125 GB RAM → OOM. Earlier 4.71/1.48 t/s
+        results were from warm-cache sessions only. Image `d101d54` also
+        fails on fresh boot. The mmap-wrap approach prevents this OOM
+        (node survived with `b52361a`) but causes glibc heap corruption
+        (`malloc(): unaligned tcache chunk detected`).
+
+        **mmap-wrap heap corruption** (blocks over-GTT testing):
+        `ggml_backend_cpu_buffer_from_ptr` wrapping mmap'd expert data.
+        Corruption persists even after:
+        - Reverting 4096 alignment (back to 64)
+        - Aligning `first` down to TENSOR_ALIGNMENT
+        - Removing mmap-wrap entirely (still crashes on later images
+          due to other patch changes — but d101d54 without mmap-wrap loads
+          q4km on warm cache)
+
+        Root cause likely: `get_base` pads pointer to TENSOR_ALIGNMENT,
+        shifting buffer base. Tensors placed by gallocr extend past the
+        mmap boundary. Or `load_all_data` writes to incorrect addresses
+        relative to the mmap-wrapped buffer.
+
+        **Next step**: Debug the mmap-wrap corruption with bounds checking
+        in `ggml_backend_tensor_alloc` and `ggml_backend_tensor_set`.
 
 ---
 
