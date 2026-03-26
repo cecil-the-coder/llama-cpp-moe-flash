@@ -471,12 +471,36 @@ or implement the staging buffer approach from the original design.
    memory heaps), but on UMA it should (same physical memory). May need Vulkan
    validation layers (`VK_LAYER_KHRONOS_validation`) to get the actual error.
 
-   **Baseline comparison** (image `998a216`, no offload, no bypass):
+   **6e. Clean minimal patch — mmap-wrap + CPU matmul (image `3153412`, deployed)**:
+
+   Removed MUL_MAT_ID GPU offload (slower than CPU for mmap'd data: 2 vs 9.7 t/s).
+   Kept mmap-wrap + Vulkan_Host SIGSEGV fix + CPU matmul (--cpu-moe).
+
+   | Model | Size | Splits (bs=1) | Cold TPS | Warm TPS | Notes |
+   |---|---|---|---|---|---|
+   | qwen3-235b Q2_K | 80 GB | 190 | 9.68 | ~10 | Matches 998a216 baseline |
+   | qwen3-235b Q4_K_M | 133 GB | 190 | 4.52 | **6.4** | Previously OOM'd cold |
+
+   Key insight: **GPU offload is slower than CPU for mmap'd expert data.**
+   The selective expert copy (mmap page fault + memcpy to Vulkan + GPU compute)
+   at 2 t/s is much slower than CPU matmul (mmap page fault + CPU compute) at
+   9.7 t/s. GPU offload only helps when data is already in a Vulkan buffer
+   (buffer_from_host_ptr success).
+
+   **mmap-wrap** is the key innovation: `ggml_backend_cpu_buffer_from_ptr` wraps
+   the mmap directly, keeping expert data demand-paged. For models > RAM, this
+   prevents the malloc OOM that made q4km (133 GB) and deepseek (228 GB) unable
+   to load on 125 GB RAM. The mmap-wrap activates when buffer_from_host_ptr fails
+   for host buffer types (CPU, Vulkan_Host).
+
+   **Baseline comparison** (image `998a216`, original):
 
    | Model | Size | Splits (bs=1) | TPS | Notes |
    |---|---|---|---|---|
    | glm-4-7-flash | 17 GB | 94 | ~30 | Expert matmul on CPU |
    | qwen3-235b Q2_K | 80 GB | 94 | 20.4 | Expert matmul on CPU |
+   | qwen3-235b Q4_K_M | 133 GB | 190 | 4.71 | Warm cache only, OOM cold |
+   | deepseek-r1-0528 | 228 GB | 118 | 1.37 | Warm cache only, OOM cold |
 
 7. **GPU memory on UMA** (Strix Halo):
    - Single memory heap: 125 GB (= physical RAM)

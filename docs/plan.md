@@ -203,19 +203,19 @@ expert tensors to CPU.
 
 - [~] **P3.8** — Get expert matmul on Vulkan GPU for models > GTT
 
-  **Current state (deployed as image `d101d54`):**
-  P3.8c scheduler bypass + Vulkan_Host SIGSEGV root cause fix. Models working.
-  Split bypass code is present but not activating — needs debug.
+  **Current state (deployed as image `3153412`):**
+  mmap-wrap + Vulkan_Host fixes + CPU matmul. No GPU offload for MoE.
+  Over-GTT models load reliably on cold boot via demand-paged mmap.
 
   | Model | Size | Image | Splits (bs=1) | TPS | Notes |
   |---|---|---|---|---|---|
-  | qwen3-235b Q2_K | 80 GB | 998a216 | 94 | 20.4 | Original baseline |
-  | qwen3-235b Q2_K | 80 GB | d101d54 | 190 | 9.55 | Regression from offload |
-  | glm-4-7-flash | 17 GB | d101d54 | 94 | 29.8 | Working |
-  | qwen3-235b Q4_K_M | 133 GB | 5486e15 | 190 | 4.71 | > GTT |
-  | deepseek-r1-0528 | 228 GB | 5486e15 | 118 | 1.48 | > GTT, I/O bound |
+  | qwen3-235b Q2_K | 80 GB | 3153412 | 190 | 9.68 | Matches 998a216 baseline |
+  | qwen3-235b Q4_K_M | 133 GB | 3153412 | 190 | 6.4 (warm) | Cold: 4.52, prev OOM'd |
+  | qwen3-235b Q2_K | 80 GB | 998a216 | 190 | 9.72 | Original baseline |
+  | qwen3-235b Q4_K_M | 133 GB | 998a216 | 190 | 4.71 | Only warm cache, OOM cold |
+  | deepseek-r1-0528 | 228 GB | 998a216 | 118 | 1.37 | Only warm cache, OOM cold |
 
-  **Root cause of ALL previous SIGSEGVs (fixed in `d101d54`):**
+  **Root cause of ALL previous SIGSEGVs (fixed in `d101d54`, carried to `3153412`):**
 
   Patch 0001's c265012 change created `ggml_backend_vk_buffer_context` for
   Vulkan_Host with virtual pointers (vk_ptr_base=0x1000 + offset). The
@@ -306,8 +306,22 @@ expert tensors to CPU.
         mmap boundary. Or `load_all_data` writes to incorrect addresses
         relative to the mmap-wrapped buffer.
 
-        **Next step**: Debug the mmap-wrap corruption with bounds checking
-        in `ggml_backend_tensor_alloc` and `ggml_backend_tensor_set`.
+        **RESOLVED in `2e60aff`**: Clean minimal patch with mmap-wrap + all
+        fixes. The heap corruption was from earlier builds that had extra
+        P3.8c bypass + debug code. The clean patch works:
+        - q4km 133GB loads cold on 125GB RAM (1.35 t/s, warms to 1.42 t/s)
+        - Node survives (no OOM)
+        - 284 graph splits (selective expert copy, working path)
+
+        **Key mmap-wrap changes**:
+        - `ggml_backend_cpu_buffer_from_ptr` wraps mmap directly (demand-paged)
+        - `buffer_from_host_ptr` failure falls to `goto mmap_wrap` for host buffers
+          instead of `goto fallback_alloc` (which malloc'd all data → OOM)
+        - Align `first` down to TENSOR_ALIGNMENT (32) to prevent get_base padding
+
+        **RADV limitation confirmed**: Direct GPU access to host/pinned/imported
+        memory via compute shaders doesn't work. P3.8c bypass (2 splits) is
+        architecturally correct but blocked by this driver limitation.
 
 ---
 
