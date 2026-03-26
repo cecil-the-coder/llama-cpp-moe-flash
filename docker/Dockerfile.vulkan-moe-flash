@@ -62,8 +62,6 @@ RUN llama-server --version 2>&1 | head -1 && \
     nm -D /lib64/libllama.so.0 | grep -q moe_flash && echo "moe-flash symbols: OK"
 
 # Default env vars for MoE flash expert streaming
-# Note: LLAMA_ARG_CPU_MOE is set per-model via InferenceModel CRD, not here.
-# Only models > GTT (120 GB) need --cpu-moe. Under-GTT models use
-# buffer_from_host_ptr for zero-copy Vulkan access.
+ENV LLAMA_ARG_CPU_MOE=1
 ENV LLAMA_FLASH_MOE_ENABLED=1
 ENV LLAMA_FLASH_MOE_IOURING=1
