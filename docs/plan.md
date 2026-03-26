@@ -210,7 +210,8 @@ expert tensors to CPU.
   | Model | Size | Image | Splits (bs=1) | TPS | Notes |
   |---|---|---|---|---|---|
   | qwen3-235b Q2_K | 80 GB | 3153412 | 190 | 9.68 | Matches 998a216 baseline |
-  | qwen3-235b Q4_K_M | 133 GB | 3153412 | 190 | 6.4 (warm) | Cold: 4.52, prev OOM'd |
+  | qwen3-235b Q4_K_M | 133 GB | 3153412 | 190 | 4.52→6.4 | Cold→warm, prev OOM'd |
+  | deepseek-r1-0528 | 228 GB | 3153412 | 118 | 1.69→2.84 | Cold→warm, **2× prev** |
   | qwen3-235b Q2_K | 80 GB | 998a216 | 190 | 9.72 | Original baseline |
   | qwen3-235b Q4_K_M | 133 GB | 998a216 | 190 | 4.71 | Only warm cache, OOM cold |
   | deepseek-r1-0528 | 228 GB | 998a216 | 118 | 1.37 | Only warm cache, OOM cold |
