@@ -421,6 +421,19 @@ expert tensors to CPU.
     Restores `998a216` performance for under-RAM models while keeping
     cold boot reliability for over-RAM models.
 
+  - [x] **P3.14** — Partial page cache prefetch (image `8e87c43`)
+    For models > RAM, prefetch up to `MemAvailable - 8 GiB` via
+    `posix_madvise(MADV_WILLNEED)` during model loading. Triggers async
+    kernel readahead before the first request.
+
+    Results for q4km (133 GiB on 125 GiB RAM, `8e87c43`):
+
+    | Metric | Before (7cd1d67) | After (8e87c43) |
+    |---|---|---|
+    | Prefetched | 0 GiB | 112.8 GiB |
+    | Cold start | 1.62 t/s | **5.45 t/s** (3.4×) |
+    | After 5 req | 1.98 t/s | **6.72 t/s** (3.4×) |
+
   - [ ] **P3.11** — RADV bug report for host memory limitations
     File upstream RADV bug covering three issues:
     1. `VK_EXT_external_memory_host` fails for mmap'd pages (ErrorOutOfDeviceMemory)
