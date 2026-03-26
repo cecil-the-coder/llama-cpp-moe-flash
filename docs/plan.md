@@ -324,6 +324,32 @@ expert tensors to CPU.
         memory via compute shaders doesn't work. P3.8c bypass (2 splits) is
         architecturally correct but blocked by this driver limitation.
 
+  **Future improvements (prioritized):**
+
+  - [ ] **P3.9** — Per-shard buffer_from_host_ptr (highest impact)
+    Currently when ONE shard's import fails, ALL successful imports are
+    discarded (`buf_map.clear(); bufs.clear(); goto mmap_wrap`). Fix: keep
+    successful imports, only mmap-wrap the failed shard. This would put most
+    of Q2_K (80 GB) on Vulkan → restore 20+ t/s. For q4km (133 GB), 2 of 3
+    shards could be imported → only ~1/3 on mmap → much less I/O.
+
+  - [ ] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
+    The prefetch thread (LLAMA_FLASH_MOE_ENABLED=1) does posix_fadvise(WILLNEED)
+    to warm page cache for upcoming experts. Check if it activates for
+    mmap-wrapped CPU_Mapped buffers. If not, enable it — reduces cold page
+    fault stalls for > GTT models.
+
+  - [ ] **P3.11** — RADV bug report for host memory compute shader access
+    Build image with VK_LAYER_KHRONOS_validation to get the exact Vulkan
+    error. File upstream RADV bug. If fixed, P3.8c bypass eliminates all
+    MoE splits (2 splits, ~20+ t/s for all models regardless of GTT).
+
+  - [ ] **P3.12** — Disable --cpu-moe for under-GTT models
+    When buffer_from_host_ptr succeeds for ALL shards, --cpu-moe is
+    counterproductive (forces experts to CPU, adds 190 splits). Auto-detect:
+    if model fits in GTT, skip --cpu-moe. Requires model size vs GTT check
+    in the controller or model loader.
+
 ---
 
 ## Phase 4: Integration with inference-budget-controller
