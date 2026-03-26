@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..27f0833ad 100644
+index e510a92ce..e746581d9 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -4879,6 +4879,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
@@ -95,6 +95,71 @@ index e510a92ce..27f0833ad 100644
      }
  
      return buf;
+@@ -15616,17 +15615,60 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     auto device = ggml_vk_get_device(ctx->device);
+ 
++    // Try single-buffer import first
+     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+ 
+-    if (!buf) {
++    if (buf) {
++        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
++        return ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
++    }
++
++    // Single import failed (likely exceeds maxBufferSize).
++    // Split into chunks and register each in pinned_memory for host_get.
++    // Return a CPU buffer wrapper — the Vulkan dispatch finds chunks via host_get.
++    if (!device->uma || !device->external_memory_host) {
+         return {};
+     }
+ 
+-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
++    const size_t chunk_size = (size_t)(device->max_buffer_size > 0 ? device->max_buffer_size : 4ULL * 1024 * 1024 * 1024) & ~(size_t)(4095);
++    if (chunk_size == 0) {
++        return {};
++    }
+ 
+-    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
++    size_t imported = 0;
++    for (size_t off = 0; off < size; off += chunk_size) {
++        size_t this_size = std::min(chunk_size, size - off);
++        // Ensure page alignment
++        this_size = (this_size + 4095) & ~(size_t)4095;
++        if (off + this_size > size) {
++            this_size = ((size - off) + 4095) & ~(size_t)4095;
++        }
+ 
+-    return ret;
++        vk_buffer chunk = ggml_vk_buffer_from_host_ptr(device, (char *)ptr + off, this_size);
++        if (!chunk) {
++            GGML_LOG_WARN("ggml_vulkan: chunked import failed at offset %zu (chunk %.1f MiB)\n",
++                off, this_size / (1024.0 * 1024.0));
++            break;
++        }
++
++        // Register in pinned_memory for host_get lookup
++        std::lock_guard<std::recursive_mutex> guard(device->mutex);
++        device->pinned_memory.push_back(std::make_tuple((char *)ptr + off, this_size, chunk));
++        imported += this_size;
++    }
++
++    if (imported < size) {
++        // Partial import — clean up and fail
++        // (pinned_memory entries will be orphaned but harmless)
++        return {};
++    }
++
++    GGML_LOG_INFO("ggml_vulkan: imported %.1f GiB via %zu chunks of %.1f GiB\n",
++        size / (1024.0 * 1024.0 * 1024.0), (size + chunk_size - 1) / chunk_size,
++        chunk_size / (1024.0 * 1024.0 * 1024.0));
++
++    // Return CPU buffer wrapper — tensors have real host pointers, host_get resolves them
++    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
+ }
+ 
+ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 11c5cd23e..ed3d58e0a 100644
 --- a/src/llama-model.cpp
