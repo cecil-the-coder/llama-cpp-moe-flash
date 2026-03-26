@@ -162,10 +162,20 @@ index e510a92ce..a42b26ef8 100644
  
  static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..418b30e2f 100644
+index 11c5cd23e..9cad64595 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -7493,33 +7493,55 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -27,6 +27,9 @@
+ #include <regex>
+ #include <sstream>
+ #include <stdexcept>
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
+ 
+ const char * llm_type_name(llm_type type) {
+     switch (type) {
+@@ -7493,33 +7496,55 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
      // Prefetching pages in the entire model, which OOMs for models > RAM.
      // With --cpu-moe, experts stay mmap'd and are paged in on demand.
      bool do_prefetch = true;
@@ -234,7 +244,7 @@ index 11c5cd23e..418b30e2f 100644
      pimpl->mappings.reserve(ml.mappings.size());
  
      // create the backend buffers
-@@ -7559,11 +7581,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -7559,11 +7584,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
          std::vector<ggml_backend_buffer_ptr> bufs;
          if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && (is_default_buft || is_host_buft)) {
              GGML_ASSERT(!ml.no_alloc);
@@ -247,7 +257,7 @@ index 11c5cd23e..418b30e2f 100644
                  void * addr = nullptr;
                  size_t first, last; // NOLINT
                  ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-@@ -7571,14 +7590,119 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -7571,14 +7593,119 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                      continue;
                  }
                  const size_t max_size = ggml_get_max_tensor_size(ctx);
