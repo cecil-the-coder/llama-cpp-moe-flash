@@ -394,6 +394,18 @@ expert tensors to CPU.
     For > GTT models, this focuses page cache on actually-used experts
     instead of thrashing with speculative all-expert warming.
 
+    Results (image `8d31671`, cold boot after model re-download):
+
+    | Model | Size | Cold TPS | After 15 req | Notes |
+    |---|---|---|---|---|
+    | Q2_K | 80 GB | 2.72 | 3.44 (rising) | Fits in RAM, needs full warmup |
+    | q4km | 133 GB | 1.62 | 2.00 (plateau) | > RAM, I/O-bound plateau |
+
+    Cold start is slower than `3153412` benchmarks (9.68/6.4) because those
+    were on warm page cache from prior runs. The mmap-wrap means ALL data
+    starts cold — page cache fills gradually via prefetch + access patterns.
+    Given enough requests, Q2K should reach 9.7+ t/s once fully cached.
+
   - [ ] **P3.11** — RADV bug report for host memory limitations
     File upstream RADV bug covering three issues:
     1. `VK_EXT_external_memory_host` fails for mmap'd pages (ErrorOutOfDeviceMemory)

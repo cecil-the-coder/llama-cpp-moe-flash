@@ -508,10 +508,35 @@ or implement the staging buffer approach from the original design.
    `ggml_vk_host_malloc` buffers which ARE importable — but those require
    malloc+copy from mmap, which OOMs for > RAM models.
 
-   **Current best achievable on RADV (image `3153412`)**:
-   - mmap-wrap + CPU matmul (--cpu-moe)
-   - 9.68 t/s Q2_K, 6.4 t/s q4km, 2.84 t/s deepseek
+   **Current best achievable on RADV (image `8d31671`)**:
+   - mmap-wrap + CPU matmul (--cpu-moe) + selective prefetch
+   - Cold boot: 2.72 t/s Q2_K, 1.62 t/s q4km (page cache cold)
+   - Warm: 9.68 t/s Q2_K, 6.4 t/s q4km, 2.84 t/s deepseek
    - Over-GTT models load reliably on cold boot (the main achievement)
+   - Warmup ramp: 15+ requests to approach warm performance
+
+   **RADV driver bugs (confirmed on both Strix Halo + Strix Point)**:
+   - `VK_EXT_external_memory_host`: import of mmap'd pages succeeds
+     (VkBuffer created) but compute shader access causes GPU page fault.
+     Confirmed on Mesa 25.2.8 (local) and 25.3.6 (shadow). Not kernel-
+     version-specific. Need to file upstream RADV bug with test case.
+   - `maxBufferSize` = 2-4 GiB: limits single-buffer imports.
+     Chunked import works for buffer creation but GPU access still faults.
+
+   **Baseline comparison** (image `998a216`, original):
+
+   | Model | Size | Splits (bs=1) | TPS | Notes |
+   |---|---|---|---|---|
+   | glm-4-7-flash | 17 GB | 94 | ~30 | Expert matmul on CPU |
+   | qwen3-235b Q2_K | 80 GB | 94 | 20.4 | Expert matmul on CPU |
+   | qwen3-235b Q4_K_M | 133 GB | 190 | 4.71 | Warm cache only, OOM cold |
+   | deepseek-r1-0528 | 228 GB | 118 | 1.37 | Warm cache only, OOM cold |
+
+   Note: `998a216` used `ggml_vk_host_malloc` (pinned memory) for expert
+   data, which IS importable and shader-accessible. But it requires
+   malloc+copy from mmap → OOMs for > RAM models. The mmap-wrap trade-off:
+   slower warm performance (mmap page faults vs zero-copy pinned) but
+   reliable cold boot for any model size.
 
    **mmap-wrap** is the key innovation: `ggml_backend_cpu_buffer_from_ptr` wraps
    the mmap directly, keeping expert data demand-paged. For models > RAM, this
