@@ -162,7 +162,7 @@ index e510a92ce..a42b26ef8 100644
  
  static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..ed3d58e0a 100644
+index 11c5cd23e..524a95fa8 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -7559,11 +7559,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
@@ -178,7 +178,7 @@ index 11c5cd23e..ed3d58e0a 100644
                  void * addr = nullptr;
                  size_t first, last; // NOLINT
                  ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-@@ -7571,14 +7568,53 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -7571,14 +7568,119 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                      continue;
                  }
                  const size_t max_size = ggml_get_max_tensor_size(ctx);
@@ -196,6 +196,44 @@ index 11c5cd23e..ed3d58e0a 100644
 +                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s shard %u (size %.1f MiB), using mmap\n",
 +                            __func__, ggml_backend_buft_name(buft), idx, (last - first) / (1024.0 * 1024.0));
 +                    if (ggml_backend_buft_is_host(buft)) {
++                        // Hybrid: use mmap-wrap only if model exceeds available memory.
++                        // Otherwise use fallback_alloc (pinned alloc+copy) which is ~3× faster
++                        // because pinned memory doesn't have page fault overhead.
++                        bool model_fits_in_ram = true;
++#if defined(__linux__)
++                        {
++                            size_t mem_available = 0;
++                            FILE * meminfo = fopen("/proc/meminfo", "r");
++                            if (meminfo) {
++                                char line[256];
++                                while (fgets(line, sizeof(line), meminfo)) {
++                                    if (strncmp(line, "MemAvailable:", 13) == 0) {
++                                        mem_available = strtoull(line + 13, nullptr, 10) * 1024;
++                                        break;
++                                    }
++                                }
++                                fclose(meminfo);
++                            }
++                            // Sum total tensor data across all shards for this buft context
++                            size_t total_tensor_size = 0;
++                            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                                total_tensor_size += ggml_nbytes(t);
++                            }
++                            model_fits_in_ram = (mem_available > 0 && total_tensor_size < mem_available * 3 / 4);
++                            LLAMA_LOG_INFO("%s: %s tensors: %.1f GiB, available RAM: %.1f GiB → %s\n",
++                                __func__, ggml_backend_buft_name(buft),
++                                total_tensor_size / (1024.0 * 1024.0 * 1024.0),
++                                mem_available / (1024.0 * 1024.0 * 1024.0),
++                                model_fits_in_ram ? "pinned alloc" : "mmap-wrap");
++                        }
++#endif
++                        if (model_fits_in_ram) {
++                            // Use fallback_alloc: pinned memory, alloc+copy, fast (~9.7 t/s)
++                            buf_map.clear();
++                            bufs.clear();
++                            goto fallback_alloc;
++                        }
++                        // mmap-wrap: demand-paged, no OOM for > RAM models
 +                        const size_t align = 32;
 +                        size_t aligned_first = (first / align) * align;
 +                        buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + aligned_first, last - aligned_first);
@@ -218,6 +256,34 @@ index 11c5cd23e..ed3d58e0a 100644
 +        } else if (ml.use_mmap && use_mmap_buffer && (is_default_buft || is_host_buft) && ggml_backend_buft_is_host(buft)) { mmap_wrap:
 +            // Host buffer with mmap: wrap mmap directly (demand-paged).
 +            // Prevents malloc OOM for models > RAM with --cpu-moe.
++            // Check if model fits in RAM — if so, use pinned alloc instead (faster).
++            {
++#if defined(__linux__)
++                size_t mem_available = 0;
++                FILE * meminfo = fopen("/proc/meminfo", "r");
++                if (meminfo) {
++                    char line[256];
++                    while (fgets(line, sizeof(line), meminfo)) {
++                        if (strncmp(line, "MemAvailable:", 13) == 0) {
++                            mem_available = strtoull(line + 13, nullptr, 10) * 1024;
++                            break;
++                        }
++                    }
++                    fclose(meminfo);
++                }
++                size_t total_tensor_size = 0;
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                    total_tensor_size += ggml_nbytes(t);
++                }
++                if (mem_available > 0 && total_tensor_size < mem_available * 3 / 4) {
++                    LLAMA_LOG_INFO("%s: %s fits in RAM (%.1f < %.1f GiB), using pinned alloc\n",
++                        __func__, ggml_backend_buft_name(buft),
++                        total_tensor_size / (1024.0 * 1024.0 * 1024.0),
++                        mem_available / (1024.0 * 1024.0 * 1024.0));
++                    goto fallback_alloc;
++                }
++#endif
++            }
 +            GGML_ASSERT(!ml.no_alloc);
 +            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
 +                void * addr = nullptr;
