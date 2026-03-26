@@ -368,9 +368,17 @@ expert tensors to CPU.
     - Both malloc'd and mmap'd imports work
     - The shadow ErrorOutOfDeviceMemory may be driver-version-specific
 
-    This means the chunked import approach IS correct — the shadow node
-    likely needs a RADV/kernel update. Or the GTT was exhausted from
-    prior test runs when the chunk test ran.
+    This means the chunked import approach IS correct.
+
+    **Driver comparison**:
+    - Shadow: Mesa 25.3.6, kernel 6.18.15-talos, Strix Halo (GFX1151)
+    - Local:  Mesa 25.2.8, kernel 6.19.8-cachyos, Strix Point (890M)
+
+    Mesa is NEWER on shadow (25.3 vs 25.2). The difference is likely the
+    **kernel** (6.18 vs 6.19) — the amdgpu kernel module handles the actual
+    `VK_EXT_external_memory_host` memory mapping. Shadow needs kernel 6.19+.
+    Alternatively, the hardware difference (Strix Halo vs Strix Point) or
+    Talos kernel config may affect external memory host support.
 
   - [x] **P3.10** — Verify io_uring prefetch for mmap-wrapped buffers
     **CONFIRMED WORKING**: The prefetch thread uses `posix_fadvise(WILLNEED)`
