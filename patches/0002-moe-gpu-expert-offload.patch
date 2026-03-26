@@ -162,10 +162,79 @@ index e510a92ce..a42b26ef8 100644
  
  static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..524a95fa8 100644
+index 11c5cd23e..418b30e2f 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -7559,11 +7559,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -7493,33 +7493,55 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+     // Prefetching pages in the entire model, which OOMs for models > RAM.
+     // With --cpu-moe, experts stay mmap'd and are paged in on demand.
+     bool do_prefetch = true;
+-    {
+-        size_t model_size = 0;
+-        for (const auto & file : ml.files) {
+-            model_size += file->size();
+-        }
+-        size_t mem_available = 0;
++    size_t model_size = 0;
++    size_t mem_available = 0;
++    for (const auto & file : ml.files) {
++        model_size += file->size();
++    }
+ #if defined(__linux__)
+-        // Read MemAvailable from /proc/meminfo
++    {
+         FILE * meminfo = fopen("/proc/meminfo", "r");
+         if (meminfo) {
+             char line[256];
+             while (fgets(line, sizeof(line), meminfo)) {
+                 if (strncmp(line, "MemAvailable:", 13) == 0) {
+-                    mem_available = strtoull(line + 13, nullptr, 10) * 1024; // kB to bytes
++                    mem_available = strtoull(line + 13, nullptr, 10) * 1024;
+                     break;
+                 }
+             }
+             fclose(meminfo);
+         }
++    }
+ #endif
+-        if (mem_available > 0 && model_size > mem_available) {
+-            LLAMA_LOG_INFO("%s: model size (%.1f GiB) exceeds available memory (%.1f GiB), disabling mmap prefetch\n",
+-                    __func__, model_size / (1024.0 * 1024.0 * 1024.0), mem_available / (1024.0 * 1024.0 * 1024.0));
+-            do_prefetch = false;
+-        }
++    if (mem_available > 0 && model_size > mem_available) {
++        LLAMA_LOG_INFO("%s: model size (%.1f GiB) exceeds available memory (%.1f GiB), using partial prefetch\n",
++                __func__, model_size / (1024.0 * 1024.0 * 1024.0), mem_available / (1024.0 * 1024.0 * 1024.0));
++        do_prefetch = false;
+     }
+     ml.init_mappings(do_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++
++    // Partial prefetch for models > RAM: warm page cache with as much as fits.
++    // posix_madvise(MADV_WILLNEED) triggers async kernel readahead without blocking.
++    // Leave 8 GiB headroom for KV cache, compute buffers, and OS.
++    if (!do_prefetch && mem_available > 0) {
++#if defined(__linux__)
++        const size_t headroom = 8ULL * 1024 * 1024 * 1024;
++        size_t prefetch_budget = mem_available > headroom ? mem_available - headroom : 0;
++        size_t prefetched = 0;
++        for (const auto & mapping : ml.mappings) {
++            if (!mapping || prefetch_budget == 0) continue;
++            size_t map_size = mapping->size();
++            size_t to_prefetch = std::min(map_size, prefetch_budget);
++            posix_madvise((char *)mapping->addr(), to_prefetch, POSIX_MADV_WILLNEED);
++            prefetched += to_prefetch;
++            prefetch_budget -= to_prefetch;
++        }
++        if (prefetched > 0) {
++            LLAMA_LOG_INFO("%s: partial prefetch: advising %.1f GiB of %.1f GiB model data\n",
++                __func__, prefetched / (1024.0 * 1024.0 * 1024.0), model_size / (1024.0 * 1024.0 * 1024.0));
++        }
++#endif
++    }
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+@@ -7559,11 +7581,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
          std::vector<ggml_backend_buffer_ptr> bufs;
          if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && (is_default_buft || is_host_buft)) {
              GGML_ASSERT(!ml.no_alloc);
@@ -178,7 +247,7 @@ index 11c5cd23e..524a95fa8 100644
                  void * addr = nullptr;
                  size_t first, last; // NOLINT
                  ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-@@ -7571,14 +7568,119 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -7571,14 +7590,119 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                      continue;
                  }
                  const size_t max_size = ggml_get_max_tensor_size(ctx);
