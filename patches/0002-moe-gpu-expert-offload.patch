@@ -59,29 +59,56 @@ index e510a92ce..bf4c1c10b 100644
  }
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..dfdfe0b31 100644
+index 11c5cd23e..b7347c0c9 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
-@@ -7573,12 +7573,35 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+@@ -7559,11 +7559,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+         std::vector<ggml_backend_buffer_ptr> bufs;
+         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && (is_default_buft || is_host_buft)) {
+             GGML_ASSERT(!ml.no_alloc);
++            bool any_failed = false;
+             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
+-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
+-                //     then we could just use metal for all layers
+-                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
+                 void * addr = nullptr;
+                 size_t first, last; // NOLINT
+                 ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+@@ -7573,12 +7570,46 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                  const size_t max_size = ggml_get_max_tensor_size(ctx);
                  ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                  if (buf == nullptr) {
 -                    // buffer_from_host_ptr failed (e.g., exceeds device memory limit)
 -                    // Fall back to allocating a new buffer and copying data
 -                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s (size %.1f MiB), falling back to copy\n",
-+                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s (size %.1f MiB)\n",
-                             __func__, ggml_backend_buft_name(buft), (last - first) / (1024.0 * 1024.0));
-                     buf_map.clear();
-                     bufs.clear();
-+                    // For host buffers, fall to mmap-wrap (demand-paged) instead of
-+                    // fallback_alloc (which mallocs all data → OOM for models > RAM)
+-                            __func__, ggml_backend_buft_name(buft), (last - first) / (1024.0 * 1024.0));
+-                    buf_map.clear();
+-                    bufs.clear();
++                    // Per-shard fallback: mmap-wrap this shard, keep successful imports.
++                    // This is critical for models near the GTT limit — most shards import
++                    // fine, only the one exceeding remaining GTT fails.
++                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s shard %u (size %.1f MiB), using mmap\n",
++                            __func__, ggml_backend_buft_name(buft), idx, (last - first) / (1024.0 * 1024.0));
 +                    if (ggml_backend_buft_is_host(buft)) {
-+                        goto mmap_wrap;
++                        const size_t align = 32;
++                        size_t aligned_first = (first / align) * align;
++                        buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + aligned_first, last - aligned_first);
 +                    }
-+                    goto fallback_alloc;
++                    if (buf == nullptr) {
++                        // Non-host buft or mmap-wrap failed — abandon all and fallback
++                        buf_map.clear();
++                        bufs.clear();
++                        goto fallback_alloc;
++                    }
++                    any_failed = true;
 +                }
 +                bufs.emplace_back(buf);
 +                buf_map.emplace(idx, buf);
++            }
++            if (any_failed) {
++                LLAMA_LOG_INFO("%s: %s: %zu shards imported, some via mmap fallback\n",
++                    __func__, ggml_backend_buft_name(buft), bufs.size());
 +            }
 +        } else if (ml.use_mmap && use_mmap_buffer && (is_default_buft || is_host_buft) && ggml_backend_buft_is_host(buft)) { mmap_wrap:
 +            // Host buffer with mmap: wrap mmap directly (demand-paged).
