@@ -1,8 +1,19 @@
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..bf4c1c10b 100644
+index e510a92ce..fc1ea6107 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -13407,7 +13407,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -4879,6 +4879,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->max_buffer_size = device->max_memory_allocation_size;
+         }
+ 
++        GGML_LOG_INFO("ggml_vulkan: max_buffer_size = %.1f GiB, max_memory_alloc = %.1f GiB\n",
++            device->max_buffer_size / (1024.0 * 1024.0 * 1024.0),
++            device->max_memory_allocation_size / (1024.0 * 1024.0 * 1024.0));
++
+         const char* GGML_VK_SUBALLOCATION_BLOCK_SIZE = getenv("GGML_VK_SUBALLOCATION_BLOCK_SIZE");
+ 
+         if (GGML_VK_SUBALLOCATION_BLOCK_SIZE != nullptr) {
+@@ -13407,7 +13411,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
          ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
      } catch (vk::SystemError& e) {
          GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
@@ -13,7 +24,7 @@ index e510a92ce..bf4c1c10b 100644
          return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
      }
  
-@@ -13416,18 +13418,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13416,18 +13422,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      size_t buf_offset = 0;
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
@@ -36,7 +47,7 @@ index e510a92ce..bf4c1c10b 100644
  
      // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
      ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-@@ -13440,7 +13434,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13440,7 +13438,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -45,7 +56,7 @@ index e510a92ce..bf4c1c10b 100644
  
      UNUSED(buft);
  }
-@@ -15513,12 +15507,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15511,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
@@ -58,6 +69,23 @@ index e510a92ce..bf4c1c10b 100644
      return false;
  }
  
+@@ -15600,10 +15592,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
+ 
+     vk_buffer buf {};
++    if (size > device->max_buffer_size) {
++        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: size %.1f GiB exceeds max_buffer_size %.1f GiB\n",
++            size / (1024.0 * 1024.0 * 1024.0), device->max_buffer_size / (1024.0 * 1024.0 * 1024.0));
++        return {};
++    }
+     try {
+         buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
+     } catch (vk::SystemError& e) {
+-        GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
++        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr failed: %s (size=%.1f GiB)\n", e.what(), size / (1024.0 * 1024.0 * 1024.0));
+     }
+ 
+     return buf;
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 index 11c5cd23e..b7347c0c9 100644
 --- a/src/llama-model.cpp
