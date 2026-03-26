@@ -434,6 +434,20 @@ expert tensors to CPU.
     | Cold start | 1.62 t/s | **5.45 t/s** (3.4×) |
     | After 5 req | 1.98 t/s | **6.72 t/s** (3.4×) |
 
+  - [x] **P3.15** — madvise tuning for mmap-wrapped expert data (image `836d36a`)
+    `MADV_RANDOM`: disables kernel sequential readahead (expert access is
+    routing-dependent, random). `MADV_HUGEPAGE`: enables transparent huge
+    pages (2MB vs 4KB) to reduce TLB misses during CPU matmul.
+
+    Results for q4km (vs `8e87c43` without madvise):
+
+    | Metric | Without | With | Change |
+    |---|---|---|---|
+    | Cold start | 5.45 t/s | **6.46 t/s** | +19% |
+    | Warm (5 req) | 6.72 t/s | 6.64 t/s | ~same |
+
+    Cold start nearly matches warm performance from the first request.
+
   - [ ] **P3.11** — RADV bug report for host memory limitations
     File upstream RADV bug covering three issues:
     1. `VK_EXT_external_memory_host` fails for mmap'd pages (ErrorOutOfDeviceMemory)
