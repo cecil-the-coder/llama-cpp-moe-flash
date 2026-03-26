@@ -229,7 +229,7 @@ index e5b83e144..e9e378b56 100644
  
  #if defined(_MSC_VER) || defined(__MINGW32__)
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 11c5cd23e..910fac30e 100644
+index 11c5cd23e..eba2c4237 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -7584,6 +7584,35 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
@@ -247,8 +247,8 @@ index 11c5cd23e..910fac30e 100644
 +                if (first >= last) {
 +                    continue;
 +                }
-+                // Align first DOWN to TENSOR_ALIGNMENT so get_base() doesn't pad past it
-+                const size_t align = TENSOR_ALIGNMENT;
++                // Align first DOWN to TENSOR_ALIGNMENT (32) so get_base() doesn't pad past it
++                const size_t align = 32;
 +                size_t aligned_first = (first / align) * align;
 +                size_t buf_size = last - aligned_first;
 +
