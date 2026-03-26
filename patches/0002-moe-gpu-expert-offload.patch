@@ -240,7 +240,7 @@ index 11c5cd23e..ed3d58e0a 100644
                  }
                  bufs.emplace_back(buf);
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index f531fc6d7..944979f1e 100644
+index f531fc6d7..d6efbc4ac 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
 @@ -1050,6 +1050,25 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
@@ -269,17 +269,14 @@ index f531fc6d7..944979f1e 100644
      return true;
  }
  
-@@ -1261,6 +1280,13 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+@@ -1261,6 +1280,10 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
  
  bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx) {
      if (!ctx) return false;
-+    // Enable callback in ALL modes when GGUF warmcache is active.
-+    // In prefetch mode: background thread does speculative prefetch (all experts),
-+    // callback does selective prefetch (only routed experts for next layer).
-+    // Both work together for best page cache hit rate.
-+    if (ctx->gguf_warmcache && ctx->gguf_src.fd >= 0) {
-+        return true;
-+    }
++    // Only enable callback in explicit CALLBACK mode.
++    // The eval callback requires synchronous tensor readback from Vulkan
++    // which stalls the GPU pipeline — 3× slower than no callback.
++    // The background prefetch thread (PREFETCH mode) is sufficient.
      return ctx->mode == MOE_FLASH_MODE_CALLBACK;
  }
  
