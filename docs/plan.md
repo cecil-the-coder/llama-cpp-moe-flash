@@ -70,15 +70,22 @@ The original 20.4 t/s was from OLDER GGUF files where `buffer_from_host_ptr` suc
 (shard mapping ranges were under 4 GiB maxBufferSize). The re-downloaded files have
 47 GiB ranges → import always fails → 190 splits.
 
-**Path to 20+ t/s**: make `buffer_from_host_ptr` succeed. Options:
-1. **Per-tensor import** — split the 47 GiB mapping range into individual tensor
-   imports (each typically a few hundred MB, well under 4 GiB maxBufferSize).
-   Requires model loader changes to import tensors individually instead of as
-   one buffer per shard. Most tractable option.
-2. Use GGUF files with smaller shard ranges (re-quantize with different split)
-3. GGML_VK_FORCE_MAX_BUFFER_SIZE — tested, driver returns ErrorOutOfDeviceMemory
-   for 46 GiB even with override. The 4 GiB limit is a real driver constraint.
-4. Fix chunked import GPU page fault — RADV driver bug, not in our control
+**ROOT CAUSE FOUND**: `VK_EXT_external_memory_host` on RADV only works for
+`MAP_PRIVATE|MAP_ANONYMOUS` mmap, NOT file-backed mmap (`MAP_SHARED` or
+`MAP_PRIVATE` with a file descriptor). Tested locally: 64 MB anonymous → SUCCESS,
+64 MB file-backed → FAILED (ErrorOutOfDeviceMemory). This means `buffer_from_host_ptr`
+can NEVER import GGUF mmap'd data on RADV.
+
+The original 20.4 t/s was likely from a run WITHOUT `--cpu-moe` where the model
+loaded entirely via `ggml_vk_create_buffer_device` (regular Vulkan alloc+copy from
+mmap, suballocated). The `buffer_from_host_ptr` path was never the source of 20 t/s.
+
+**Actual path to faster performance**:
+1. Remove `--cpu-moe` for models ≤ GTT — lets all data go to Vulkan device memory
+   via regular alloc+copy. No mmap import needed. BUT: this malloc+copies ~80 GB
+   which risks OOM on 125 GB RAM (needs hybrid check).
+2. Investigate why `998a216` recently gets 8.6 t/s (same as `836d36a`) when it
+   originally got 20.4 — may be controller arg differences or GGUF version changes.
 
 ---
 
