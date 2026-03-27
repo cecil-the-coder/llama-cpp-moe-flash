@@ -71,10 +71,14 @@ The original 20.4 t/s was from OLDER GGUF files where `buffer_from_host_ptr` suc
 47 GiB ranges → import always fails → 190 splits.
 
 **Path to 20+ t/s**: make `buffer_from_host_ptr` succeed. Options:
-1. Use GGUF files with smaller shard ranges (re-quantize with different split)
-2. GGML_VK_FORCE_MAX_BUFFER_SIZE env var (if RADV actually supports > 4 GiB)
-3. Fix chunked import GPU page fault (RADV driver bug)
-4. Split the mapping range into per-tensor imports (significant model loader work)
+1. **Per-tensor import** — split the 47 GiB mapping range into individual tensor
+   imports (each typically a few hundred MB, well under 4 GiB maxBufferSize).
+   Requires model loader changes to import tensors individually instead of as
+   one buffer per shard. Most tractable option.
+2. Use GGUF files with smaller shard ranges (re-quantize with different split)
+3. GGML_VK_FORCE_MAX_BUFFER_SIZE — tested, driver returns ErrorOutOfDeviceMemory
+   for 46 GiB even with override. The 4 GiB limit is a real driver constraint.
+4. Fix chunked import GPU page fault — RADV driver bug, not in our control
 
 ---
 
