@@ -17,8 +17,10 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
 
 COPY patches/0001-moe-flash-complete.patch /build/
 COPY patches/0002-moe-gpu-expert-offload.patch /build/
+COPY patches/0003-tq2-kv-type-system.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
-    && git apply /build/0002-moe-gpu-expert-offload.patch
+    && git apply /build/0002-moe-gpu-expert-offload.patch \
+    && git apply /build/0003-tq2-kv-type-system.patch
 
 # Build with Vulkan + io_uring
 # Enable AVX512 + extensions for Strix Halo (Zen 5).
