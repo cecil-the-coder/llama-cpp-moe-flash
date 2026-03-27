@@ -1,18 +1,28 @@
 # Measurements
 
-## Final Performance (image `6c04589`)
+## Final Performance (image `ec62d43`, AVX512+VNNI+BF16)
 
 Single backend (cpumoe, CPU_MOE=1) with auto-detect on shadow node (AMD Strix Halo, 125 GB RAM, 120 GB GTT):
 
-| Model | Size | Auto-detect | TPS | Splits | Notes |
-|---|---|---|---|---|---|
-| glm-4-7-flash | 17 GB | clears override | **50.57** | 2 | Vulkan alloc |
-| qwen3-235b Q2_K | 80 GB | clears override | **20.21-20.77** | 2 | Vulkan alloc |
-| qwen3-235b Q4_K_M | 133 GB | keeps override | 2.72→6.0-6.3 | 190 | mmap-wrap + partial prefetch |
-| deepseek-r1-0528 | 228 GB | keeps override | 1.63→1.8 | 118 | mmap-wrap + partial prefetch |
+| Model | Size | TPS | Loading |
+|---|---|---|---|
+| glm-4-7-flash | 17 GB | **50.57** | standard (full GPU offload) |
+| qwen3-235b Q2_K | 80 GB | **20.47** | standard (full GPU offload) |
+| qwen3-235b Q4_K_M | 133 GB | 6.36→**6.2** | patched: mmap experts + partial prefetch |
+| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | patched: mmap experts + partial prefetch |
 
-`llama_params_fit` auto-detect: checks if full model (without --cpu-moe) fits in device memory.
-If fits → clears override → experts on GPU (20-50 t/s). If not → keeps override → mmap-wrap (1.8-6.3 t/s).
+### AVX512 Impact (q4km, CPU expert matmul)
+
+| Metric | AVX2 only | AVX512+VNNI+BF16 | Change |
+|---|---|---|---|
+| Cold start | 2.72 t/s | **6.36 t/s** | **+134%** |
+| Warm | 5.89-6.3 t/s | 6.2 t/s | ~same (I/O bound) |
+
+Cold start improved 2.3× because AVX512 VNNI accelerates the quantized dot product
+inner loop (`_mm256_dpbusd_epi32` replaces 2-step `maddubs + madd`). Warm performance
+is unchanged because q4km exceeds RAM — page faulting dominates, not compute.
+
+GPU-path models (Q2K, glm) are unaffected — AVX512 only helps the CPU expert matmul.
 
 ### RADV Driver Findings
 - `maxBufferSize` = 2-4 GiB (can't import large shard ranges)
