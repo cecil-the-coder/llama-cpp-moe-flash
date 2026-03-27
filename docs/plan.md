@@ -121,12 +121,15 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 - [x] **glm-4-7-flash** on moe-flash — 50.57 t/s, 2 splits
 
 ### To test
-- [ ] **deepseek-r1-0528** on moe-flash-cpumoe — verify cold boot + partial prefetch
+- [ ] **deepseek-r1-0528** on moe-flash-cpumoe — downloading (~35 min at 110 MB/s)
 
 ### Cleanup
 - [ ] **Strip debug/dead code from patch** — target minimal diff
 - [ ] **Update measurements.md** — consolidate final benchmark numbers
-- [ ] **Auto-detect --cpu-moe** — safety net for misassigned models (nice-to-have)
+- [ ] **Auto-detect --cpu-moe** — safety net for misassigned models (nice-to-have).
+  Would need implementation at `common_init_result` level (before `llama_params_fit`).
+  `llama_params_fit` already offloads MoE layers for overflow, but doesn't trigger
+  mmap-wrap (demand-paged) path. Two-backend approach is simpler and works.
 
 ### Blocked on RADV
 - [ ] **GPU expert matmul** — compute shaders can't read from pinned/imported host
