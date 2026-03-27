@@ -65,9 +65,16 @@ non-expert shard as a regular Vulkan buffer (not pinned), so the GPU never read
 from pinned memory. With our code, `buffer_from_host_ptr` fails (maxBufferSize 4G)
 → falls to pinned alloc → GPU fault.
 
-**Blocked by RADV**: 9.30 t/s is the achievable ceiling for Q2K until RADV fixes
-pinned memory access for compute shaders, or `buffer_from_host_ptr` supports larger
-imports (chunked or increased maxBufferSize).
+**Key discovery**: `998a216` also gets ~8.6 t/s with 190 splits on current GGUF files.
+The original 20.4 t/s was from OLDER GGUF files where `buffer_from_host_ptr` succeeded
+(shard mapping ranges were under 4 GiB maxBufferSize). The re-downloaded files have
+47 GiB ranges → import always fails → 190 splits.
+
+**Path to 20+ t/s**: make `buffer_from_host_ptr` succeed. Options:
+1. Use GGUF files with smaller shard ranges (re-quantize with different split)
+2. GGML_VK_FORCE_MAX_BUFFER_SIZE env var (if RADV actually supports > 4 GiB)
+3. Fix chunked import GPU page fault (RADV driver bug)
+4. Split the mapping range into per-tensor imports (significant model loader work)
 
 ---
 
