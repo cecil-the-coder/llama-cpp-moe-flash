@@ -9,7 +9,7 @@ Two backends on shadow node (AMD Strix Halo, 125 GB RAM, 120 GB GTT):
 | glm-4-7-flash | 17 GB | moe-flash | **50.57** | 2 | Vulkan alloc, no --cpu-moe |
 | qwen3-235b Q2_K | 80 GB | moe-flash | **20.77** | 2 | Vulkan alloc, no --cpu-moe |
 | qwen3-235b Q4_K_M | 133 GB | cpumoe | 2.96→6.0-6.3 | 190 | mmap-wrap + partial prefetch + madvise |
-| deepseek-r1-0528 | 228 GB | cpumoe | — | — | CRD needs recreating |
+| deepseek-r1-0528 | 228 GB | cpumoe | 1.63→1.8 | 118 | mmap-wrap + partial prefetch (113/228 GiB) |
 
 Key: without `--cpu-moe`, models ≤ GTT go to Vulkan via `create_buffer_device` → 20-50 t/s.
 With `--cpu-moe` (models > RAM), expert data stays on mmap (demand-paged) → 6 t/s warm.

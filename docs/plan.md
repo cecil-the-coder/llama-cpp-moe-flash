@@ -13,7 +13,7 @@
 | glm-4-7-flash | 17 GB | moe-flash | Vulkan alloc, 2 splits | **50.57** |
 | qwen3-235b Q2_K | 80 GB | moe-flash | Vulkan alloc, 2 splits | **20.77** |
 | qwen3-235b Q4_K_M | 133 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | 2.96 cold → 6.0-6.3 warm |
-| deepseek-r1-0528 | 228 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | pending test |
+| deepseek-r1-0528 | 228 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | 1.63 cold → 1.8 warm |
 
 **Key features in patch 0002:**
 - Vulkan_Host CPU buffer interface (SIGSEGV fix)
@@ -120,8 +120,8 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 ### Confirmed (image `3fbe06f`)
 - [x] **glm-4-7-flash** on moe-flash — 50.57 t/s, 2 splits
 
-### To test
-- [ ] **deepseek-r1-0528** on moe-flash-cpumoe — downloading (~137 GB, controller restarts during download but resumes)
+### Confirmed (image `833b07c`)
+- [x] **deepseek-r1-0528** on moe-flash-cpumoe — 1.63 cold → 1.8 warm (228 GB, mmap-wrap)
 
 ### Cleanup
 - [ ] **Strip debug/dead code from patch** — target minimal diff
