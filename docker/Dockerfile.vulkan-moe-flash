@@ -21,11 +21,18 @@ RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
     && git apply /build/0002-moe-gpu-expert-offload.patch
 
 # Build with Vulkan + io_uring
+# Enable AVX512 + extensions for Strix Halo (Zen 5).
+# Stock llama.cpp only enables AVX2 by default — AVX512 is OFF.
+# Strix Halo supports: AVX512F/CD/VL/DQ/BW/VBMI/VNNI/BF16/IFMA.
 RUN cd /build/llama.cpp && cmake -B build \
         -DGGML_VULKAN=ON \
         -DGGML_RPC=OFF \
         -DGGML_CUDA=OFF \
         -DGGML_IOURING=ON \
+        -DGGML_AVX512=ON \
+        -DGGML_AVX512_VBMI=ON \
+        -DGGML_AVX512_VNNI=ON \
+        -DGGML_AVX512_BF16=ON \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_SERVER=ON \
