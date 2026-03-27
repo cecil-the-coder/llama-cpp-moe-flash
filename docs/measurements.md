@@ -1,18 +1,18 @@
 # Measurements
 
-## Final Performance (image `328946f` / `2938e45`)
+## Final Performance (image `3fbe06f`)
 
 Two backends on shadow node (AMD Strix Halo, 125 GB RAM, 120 GB GTT):
 
 | Model | Size | Backend | TPS | Splits | Notes |
 |---|---|---|---|---|---|
-| qwen3-235b Q2_K | 80 GB | moe-flash | **20.73** | 2 | Vulkan alloc, no --cpu-moe |
-| glm-4-7-flash | 17 GB | moe-flash | ~30 | 2 | Vulkan alloc |
-| qwen3-235b Q4_K_M | 133 GB | cpumoe | 6.46→6.64 | 190 | mmap-wrap + prefetch + madvise |
-| deepseek-r1-0528 | 228 GB | cpumoe | ~2→~3 | 118 | mmap-wrap + prefetch (est.) |
+| glm-4-7-flash | 17 GB | moe-flash | **50.57** | 2 | Vulkan alloc, no --cpu-moe |
+| qwen3-235b Q2_K | 80 GB | moe-flash | **20.77** | 2 | Vulkan alloc, no --cpu-moe |
+| qwen3-235b Q4_K_M | 133 GB | cpumoe | 2.96→6.0-6.3 | 190 | mmap-wrap + partial prefetch + madvise |
+| deepseek-r1-0528 | 228 GB | cpumoe | — | — | CRD needs recreating |
 
-Key: without `--cpu-moe`, models ≤ RAM go to Vulkan via `create_buffer_device` → 20+ t/s.
-With `--cpu-moe` (models > RAM), expert data stays on mmap (demand-paged) → 6-7 t/s.
+Key: without `--cpu-moe`, models ≤ GTT go to Vulkan via `create_buffer_device` → 20-50 t/s.
+With `--cpu-moe` (models > RAM), expert data stays on mmap (demand-paged) → 6 t/s warm.
 
 ### RADV Driver Findings
 - `maxBufferSize` = 2-4 GiB (can't import large shard ranges)
