@@ -122,10 +122,10 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 - [x] **deepseek-r1-0528** — 1.63 cold → 1.8 warm (tested on 833b07c)
 - [x] **Auto-detect --cpu-moe** — implemented in `llama_params_fit`, confirmed working
 
-### Cleanup
-- [ ] **Remove moe-flash backend** — all models now on cpumoe, moe-flash is unused
-- [ ] **Strip debug/dead code from patch** — target minimal diff
-- [ ] **Update measurements.md** — consolidate final benchmark numbers
+### Cleanup (done)
+- [x] **Remove moe-flash backend** — deleted from kustomization, Flux pruned it
+- [x] **Strip dead code from patch** — removed GGUF fadvise callback (19 lines)
+- [x] **Update measurements.md** — consolidated with auto-detect results
 
 ### Blocked on RADV
 - [ ] **GPU expert matmul** — compute shaders can't read from pinned/imported host
