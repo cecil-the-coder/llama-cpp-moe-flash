@@ -2,16 +2,18 @@
 
 ## Current State
 
-**Production image: `836d36a`** (deployed via Flux on shadow node)
+**Production image: `328946f`** (deployed via Flux on shadow node)
 
-| Model | Size | Path | Cold TPS | Warm TPS |
+Two backends:
+- `llamacpp-vulkan-moe-flash`: no --cpu-moe, all data on Vulkan → fast
+- `llamacpp-vulkan-moe-flash-cpumoe`: with --cpu-moe, mmap-wrap → > RAM models
+
+| Model | Size | Backend | Path | TPS |
 |---|---|---|---|---|
-| glm-4-7-flash | 17 GB | pinned alloc | ~29 | ~30 |
-| qwen3-235b Q2_K | 80 GB | pinned alloc | 9.30 | ~10 |
-| qwen3-235b Q4_K_M | 133 GB | mmap-wrap | 6.46 | 6.64 |
-| deepseek-r1-0528 | 228 GB | mmap-wrap | ~2-3 (est) | ~3-4 (est) |
-
-**Original baseline (`998a216`)**: Q2_K 20.4 t/s (no --cpu-moe, experts on Vulkan via pinned memory)
+| glm-4-7-flash | 17 GB | moe-flash | Vulkan alloc | ~30 |
+| qwen3-235b Q2_K | 80 GB | moe-flash | Vulkan alloc | **20.73** |
+| qwen3-235b Q4_K_M | 133 GB | moe-flash-cpumoe | mmap-wrap | 6.46 cold → 6.64 warm |
+| deepseek-r1-0528 | 228 GB | moe-flash-cpumoe | mmap-wrap | ~2-3 cold → ~3-4 warm |
 
 **Key features in patch 0002:**
 - Vulkan_Host CPU buffer interface (SIGSEGV fix)
