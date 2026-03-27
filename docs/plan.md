@@ -2,94 +2,158 @@
 
 ## Current State
 
-**Production image: `6c04589`** (deployed on shadow node, auto-detect --cpu-moe)
+**Production image: `6c04589`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
 
-**Single-backend architecture** with auto-detect:
+Single-backend architecture with auto-detect `--cpu-moe`:
 - All models use `moe-flash-cpumoe` backend (`CPU_MOE=1` default)
-- `llama_params_fit` auto-detects: if full model fits in device memory → clears
-  CPU_MOE override → experts on GPU (20+ t/s). If not → keeps override → mmap-wrap (6 t/s)
+- `llama_params_fit` checks if full model fits in device memory without the override
+- If it fits → clears override → full GPU (20-50 t/s)
+- If not → keeps override → mmap-wrap with partial prefetch (1.8-6.3 t/s)
 
-| Model | Size | Auto-detect | Path | TPS (confirmed) |
-|---|---|---|---|---|
-| glm-4-7-flash | 17 GB | clears override | Vulkan alloc, 2 splits | **50.57** |
-| qwen3-235b Q2_K | 80 GB | clears override | Vulkan alloc, 2 splits | **20.21-20.77** |
-| qwen3-235b Q4_K_M | 133 GB | keeps override | mmap-wrap, partial prefetch | 2.72 cold → 6.0-6.3 warm |
-| deepseek-r1-0528 | 228 GB | keeps override | mmap-wrap, partial prefetch | 1.63 cold → 1.8 warm |
-
-**Key features in patch 0002:**
-- **Auto-detect --cpu-moe** in `llama_params_fit` (NEW — single backend for all sizes)
-- Vulkan_Host CPU buffer interface (SIGSEGV fix)
-- Hybrid pinned/mmap allocation (fast for ≤ RAM, safe for > RAM)
-- Partial page cache prefetch (posix_madvise WILLNEED up to MemAvail - 8 GiB)
-- madvise tuning (MADV_RANDOM + MADV_HUGEPAGE for mmap'd expert data)
-- Per-shard buffer_from_host_ptr fallback with page alignment
-- host_malloc nullptr guard (GTT exhausted fallback)
+| Model | Size | TPS | Loading |
+|---|---|---|---|
+| glm-4-7-flash | 17 GB | **50.57** | standard (full GPU offload) |
+| qwen3-235b Q2_K | 80 GB | **20.21-20.77** | standard (full GPU offload) |
+| qwen3-235b Q4_K_M | 133 GB | 2.72→**6.0-6.3** | patched: mmap experts + partial prefetch |
+| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | patched: mmap experts + partial prefetch |
 
 ---
 
-## Q2_K Performance Gap: 9.30 vs 20.4 t/s
+## What the Patch Does
 
-The `998a216` baseline achieved 20.4 t/s because:
-- No `--cpu-moe` → expert weights stayed on Vulkan_Host (pinned memory)
-- Pinned memory was allocated via `ggml_vk_host_malloc` (alloc+copy from mmap)
-- MUL_MAT_ID ran on CPU but expert data was already in host-accessible Vulkan buffers
-- Only 94 graph splits
+**Patch 0002** (456 lines, 5 files) adds to llama.cpp b8298:
 
-Current `836d36a` gets 9.30 t/s because:
-- `--cpu-moe` baked in Dockerfile → experts forced to CPU/Vulkan_Host
-- `buffer_from_host_ptr` fails (maxBufferSize = 4 GiB, shard ranges ~47 GiB)
-- Hybrid detects model fits in RAM → uses pinned alloc (same as 998a216)
-- But 190 splits (vs 94) — the MUL_MAT_ID offload code creates extra splits
+| Feature | File | Lines | Purpose |
+|---|---|---|---|
+| Auto-detect `--cpu-moe` | `src/llama.cpp` | 32 | Single backend for all model sizes |
+| Non-host expert copy | `ggml/src/ggml-backend.cpp` | 11 | Staging buffer for Vulkan_Host buffers |
+| Vulkan_Host CPU interface | `ggml/src/ggml-vulkan.cpp` | ~30 | SIGSEGV fix, nullptr guard, alignment |
+| Hybrid pinned/mmap alloc | `src/llama-model.cpp` | ~120 | mmap-wrap for >RAM, pinned for ≤RAM |
+| Partial prefetch + madvise | `src/llama-model.cpp` | ~30 | WILLNEED up to MemAvail-8G, RANDOM+HUGEPAGE |
+| Callback-only mode guard | `src/llama-moe-flash.cpp` | 4 | Prevent 3× slowdown from sync readback |
 
-**Root cause of the gap**: `buffer_from_host_ptr` failure forces fallback to pinned alloc,
-which works but creates a different buffer type (Vulkan_Host pinned vs Vulkan device).
-The scheduler generates more splits for Vulkan_Host buffers.
+---
 
-**Root cause found**: `998a216` had `supports_buft=true` for Vulkan_Host → 94 splits.
-Our `836d36a` has `supports_buft=false` → 190 splits. Re-enabling it (image `c2f139f`)
-causes GPU page fault (SIGSEGV exit 139).
+## Novelty Analysis
 
-The issue: `998a216` used `ggml_backend_vk_buffer_context` (virtual pointers) for
-Vulkan_Host. The dispatch used `buf_ctx->dev_buffer` which worked. Our fix changed to
-CPU buffer interface (real host pointers) for the selective copy path. The dispatch
-now uses `host_get` → finds the pinned vk_buffer → but the GPU faults reading it.
+### What's standard (same as stock llama.cpp)
+- Full GPU offload for models ≤ GTT — `ggml_vk_create_buffer_device` + suballocation
+- `--cpu-moe` expert offloading to CPU — upstream feature
+- mmap for model loading — Justine Tunney's original llama.cpp optimization
 
-**Both paths resolve to the same physical memory** but through different Vulkan objects.
-The `dev_buffer` path works; the `host_get` path doesn't. This is the same RADV
-limitation as P3.8c.
+### What's novel (within llama.cpp ecosystem)
+1. **mmap-wrap for >RAM expert data** — stock `--cpu-moe` mallocs expert tensors → OOM
+   for models exceeding RAM. We wrap mmap directly as CPU buffer via
+   `ggml_backend_cpu_buffer_from_ptr`, keeping experts demand-paged. This makes
+   133-228 GB models loadable on 125 GB RAM.
 
-**Attempted**: dual-interface buffer (image `09540b1`). Used `vk_buffer_context`
-(virtual pointers) for dispatch + `ggml_backend_tensor_get` for selective copy.
-Achieved 1 graph split but GPU page fault persists — RADV can't read from
-`ggml_vk_host_malloc` pinned memory in compute shaders regardless of access path
-(`dev_buffer` or `host_get`).
+2. **Partial prefetch with safety margin** — `MADV_WILLNEED` up to MemAvailable minus
+   8 GiB. Stock llama.cpp does all-or-nothing prefetch. We prefetch what fits and
+   leave the rest demand-paged.
 
-`998a216` likely worked at 20.4 t/s because `buffer_from_host_ptr` imported the
-non-expert shard as a regular Vulkan buffer (not pinned), so the GPU never read
-from pinned memory. With our code, `buffer_from_host_ptr` fails (maxBufferSize 4G)
-→ falls to pinned alloc → GPU fault.
+3. **Auto-detect `--cpu-moe`** — checks projected memory in `llama_params_fit` and
+   auto-clears the override when model fits. Stock requires manual backend assignment.
+   llama.cpp discussion #18049 describes similar intent but is not merged.
 
-**Key discovery**: `998a216` also gets ~8.6 t/s with 190 splits on current GGUF files.
-The original 20.4 t/s was from OLDER GGUF files where `buffer_from_host_ptr` succeeded
-(shard mapping ranges were under 4 GiB maxBufferSize). The re-downloaded files have
-47 GiB ranges → import always fails → 190 splits.
+4. **io_uring page cache warming** — SQPOLL + registered buffers for zero-copy expert
+   prefetch. No published LLM inference system uses io_uring. (Background thread won
+   over callback mode; io_uring code is in patch 0001.)
 
-**ROOT CAUSE FOUND**: `VK_EXT_external_memory_host` on RADV only works for
-`MAP_PRIVATE|MAP_ANONYMOUS` mmap, NOT file-backed mmap (`MAP_SHARED` or
-`MAP_PRIVATE` with a file descriptor). Tested locally: 64 MB anonymous → SUCCESS,
-64 MB file-backed → FAILED (ErrorOutOfDeviceMemory). This means `buffer_from_host_ptr`
-can NEVER import GGUF mmap'd data on RADV.
+### What others do better
 
-The original 20.4 t/s was likely from a run WITHOUT `--cpu-moe` where the model
-loaded entirely via `ggml_vk_create_buffer_device` (regular Vulkan alloc+copy from
-mmap, suballocated). The `buffer_from_host_ptr` path was never the source of 20 t/s.
+| System | Approach | vs Ours |
+|---|---|---|
+| **KTransformers** | AMX-optimized CPU expert kernels | 28 t/s DeepSeek vs our 1.8 — **15× faster** expert matmul |
+| **Fate** | Cross-layer gate prediction (97% accuracy) | Targeted prefetch vs our blind background sweep |
+| **HOBBIT** | Mixed-precision: cache-miss experts at lower quant | Reduces I/O for cold experts |
+| **flash-moe** | pread() + GCD on Apple Silicon | 4.4 t/s on 397B/48GB MacBook |
+| **Fiddler** | Per-expert CPU-vs-GPU profiling | Optimal placement, not all-or-nothing |
+| **PreScope** | Async I/O decoupled from compute | 141% throughput improvement |
 
-**Actual path to faster performance**:
-1. Remove `--cpu-moe` for models ≤ GTT — lets all data go to Vulkan device memory
-   via regular alloc+copy. No mmap import needed. BUT: this malloc+copies ~80 GB
-   which risks OOM on 125 GB RAM (needs hybrid check).
-2. Investigate why `998a216` recently gets 8.6 t/s (same as `836d36a`) when it
-   originally got 20.4 — may be controller arg differences or GGUF version changes.
+---
+
+## Future Directions
+
+### F1. AMX/AVX512 Expert Kernels (highest impact)
+
+**The bottleneck for >RAM models is CPU expert matmul, not I/O.**
+
+Our deepseek runs at 1.8 t/s. KTransformers achieves 28 t/s on the same model by
+replacing ggml-cpu matmul with custom AMX (Advanced Matrix Extensions) kernels for
+the expert FFN layers. AMX provides 8× throughput over AVX512 for BF16/INT8 matmul.
+
+**Strix Halo has AVX512 but not AMX.** However, AVX512-BF16 + VNNI are available
+and could significantly accelerate expert matmul. Fiddler (ICLR 2025) demonstrates
+AVX512_BF16 CPU kernels achieving competitive expert throughput.
+
+**Approach**: Profile where time is spent in the `--cpu-moe` path. If expert matmul
+dominates (likely), investigate:
+- ggml-cpu AVX512 codegen for MoE expert shapes
+- Custom BLAS dispatch for expert-sized matrices (~6 MB each)
+- Batching multiple expert matmuls to amortize overhead
+
+**Expected impact**: 3-10× improvement on >RAM models (6-18 t/s for deepseek).
+
+### F2. Prediction-Based Expert Prefetch
+
+Current approach: background thread blindly cycles through all experts with
+`posix_fadvise(WILLNEED)`. This warms the page cache uniformly but doesn't
+prioritize experts that will actually be selected by the router.
+
+**Academic state of the art**:
+- **Fate** (2025): cross-layer gate inputs predict next-layer experts with 97.15%
+  accuracy. Shallow-favoring cache achieves 99.08% hit rate.
+- **PreScope** (2025): learnable layer-aware predictor, async I/O optimizer.
+  141% throughput, 74.6% latency improvement.
+- **DuoServe-MoE** (2025): MLP predictor for next-layer experts, GPU cache sized
+  to exactly K experts.
+
+**Approach for our system**: After routing selects K experts for layer N, use the
+gate logits to predict likely experts for layer N+1. Issue targeted `posix_fadvise`
+for only those experts' GGUF regions. This replaces blind prefetch with informed
+prefetch at near-zero cost (gate logits are already computed).
+
+**Challenge**: Requires reading gate logits back from Vulkan, which is the same
+sync stall that made the callback mode 3× slower. Could work if the prediction
+runs on CPU from the routing tensor copy that the scheduler already performs.
+
+**Expected impact**: Better page cache utilization for >RAM models, reducing cold
+expert faults. Most impactful for deepseek (228 GB, only 55% in cache).
+
+### F3. 1 GB Hugepages
+
+llama.cpp issue #12444 reports **10× speedup** for DeepSeek-R1 using hugetlbfs
+with 1 GB pages. Our patch uses `MADV_HUGEPAGE` for transparent 2 MB hugepages,
+but 1 GB pages eliminate far more TLB pressure: 228 GB model = 228 entries
+(1 GB pages) vs 116,736 entries (2 MB) vs 59,768,832 entries (4 KB).
+
+**Approach**: Pre-allocate 1 GB hugepages at boot (`hugepagesz=1G hugepages=100`),
+mmap expert data from hugetlbfs. Requires kernel configuration and may conflict
+with other memory users.
+
+**Expected impact**: Significant for >RAM models where TLB misses compound with
+page faults. Less impactful for ≤RAM models (already fast).
+
+### F4. RADV Driver Fix
+
+Compute shaders can't read from `VK_EXT_external_memory_host` imported or pinned
+host memory on RADV (Mesa 25.2-25.3). If fixed, all expert data could stay in
+Vulkan-accessible host buffers and MUL_MAT_ID could run on GPU with 2 graph splits
+— potentially 20+ t/s for all model sizes regardless of RAM.
+
+**Status**: Confirmed on both Strix Halo (GFX1151) and Strix Point (GFX1150).
+Not yet reported upstream. Would require Mesa/RADV investigation.
+
+### F5. Upstream the Patch
+
+The mmap-wrap + partial prefetch + auto-detect changes are generic enough to
+benefit any UMA system (AMD APUs, future Intel with Battlemage iGPU, Apple Silicon
+in theory). The patch is clean (456 lines) and non-invasive.
+
+**Blockers**: The patch modifies `llama_params_fit` behavior (auto-clearing
+user-set overrides), which may be controversial upstream. The mmap-wrap in
+`llama-model.cpp` adds a new code path with `goto` labels. Would need cleanup
+and testing on CUDA/Metal backends.
 
 ---
 
@@ -100,36 +164,9 @@ Confirmed on both Strix Halo (shadow) and Strix Point (local):
 | Feature | Status |
 |---|---|
 | `maxBufferSize` | 2-4 GiB (all shard ranges exceed) |
-| `VK_EXT_external_memory_host` import (mmap) | Buffer creation OK, compute shader read → GPU page fault |
-| `VK_EXT_external_memory_host` import (pinned) | Works on local (kernel 6.19), fails on shadow (kernel 6.18) |
-| Compute shader read from pinned host memory | GPU page fault on both machines |
-
-The GPU page fault when reading from imported/pinned memory in compute shaders
-blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
-
-**Driver comparison:**
-- Shadow: Mesa 25.3.6, kernel 6.18.15-talos, Strix Halo (GFX1151)
-- Local: Mesa 25.2.8, kernel 6.19.8-cachyos, Strix Point (890M)
-
----
-
-## Remaining Tasks
-
-### Confirmed (image `6c04589`, single cpumoe backend, auto-detect)
-- [x] **Q2K** — auto-detect clears override → 20.21 t/s, 2 splits
-- [x] **q4km** — auto-detect keeps override → 2.72 cold → 6.0-6.3 warm
-- [x] **glm-4-7-flash** — 50.57 t/s (tested on 833b07c, functionally identical)
-- [x] **deepseek-r1-0528** — 1.63 cold → 1.8 warm (tested on 833b07c)
-- [x] **Auto-detect --cpu-moe** — implemented in `llama_params_fit`, confirmed working
-
-### Cleanup (done)
-- [x] **Remove moe-flash backend** — deleted from kustomization, Flux pruned it
-- [x] **Strip dead code from patch** — removed GGUF fadvise callback (19 lines)
-- [x] **Update measurements.md** — consolidated with auto-detect results
-
-### Blocked on RADV
-- [ ] **GPU expert matmul** — compute shaders can't read from pinned/imported host
-  memory on RADV. If driver fixes this: all models → 20+ t/s regardless of size.
+| `VK_EXT_external_memory_host` import (file-backed mmap) | Always fails on RADV |
+| `VK_EXT_external_memory_host` import (anonymous mmap) | Works |
+| Compute shader read from pinned host memory | GPU page fault |
 
 ---
 
@@ -151,18 +188,12 @@ llama_params_fit auto-detect:
 
 ## Completed Phases
 
-- **Phase 0**: Measurement & baseline (P0.1-P0.6)
-- **Phase 1**: Expert file splitter tool (P1.1-P1.5)
-- **Phase 2**: io_uring prefetch prototype (P2.1-P2.4)
-- **Phase 3**: Vulkan integration
-  - P3.1-P3.7: Page cache warming, buffer_from_host_ptr, --cpu-moe
-  - P3.8: GPU expert matmul (blocked by RADV)
-  - P3.9: Per-shard import + page alignment fix
-  - P3.10: Selective prefetch (reverted — 3× slower from Vulkan sync stall)
-  - P3.13: Hybrid pinned/mmap allocation
-  - P3.14: Partial page cache prefetch
-  - P3.15: madvise tuning (MADV_RANDOM + MADV_HUGEPAGE)
-- **Phase 4**: Integration with inference-budget-controller (P4.1-P4.4)
+- **Phase 0**: Measurement & baseline
+- **Phase 1**: Expert file splitter tool
+- **Phase 2**: io_uring prefetch prototype
+- **Phase 3**: Vulkan integration (host buffer fix, hybrid alloc, prefetch, madvise)
+- **Phase 4**: Integration with inference-budget-controller
+- **Phase 5**: Auto-detect `--cpu-moe` + single-backend deployment
 
 ## CI/CD
 
@@ -170,4 +201,4 @@ llama_params_fit auto-detect:
 - Images: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:<sha>`
 - Workflow: `.github/workflows/build-image.yml` (triggers on `patches/` or `docker/`)
 - eh-ops-private: `github.com/themicknugget/eh-ops-private` (Flux-managed)
-- Backend: `llamacpp-vulkan-moe-flash` in `backends/kustomization.yaml`
+- Backend: `llamacpp-vulkan-moe-flash-cpumoe` in `backends/kustomization.yaml`
