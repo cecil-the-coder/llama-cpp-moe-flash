@@ -1,5 +1,41 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index bc57df20b..12c1ed90e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1530,13 +1530,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+-
+-                        ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
++                        const size_t copy_size = expert_size_copy + padding_end;
++
++                        if (ggml_backend_buffer_is_host(input->buffer)) {
++                            // Host buffer: direct pointer access (fast path)
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + expert_offset, expert_offset,
++                                copy_size);
++                        } else {
++                            // Non-host buffer (e.g., Vulkan_Host with virtual pointers):
++                            // read through backend API, then write to split buffer
++                            std::vector<uint8_t> staging(copy_size);
++                            ggml_backend_tensor_get(input, staging.data(), expert_offset, copy_size);
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                staging.data(), expert_offset,
++                                copy_size);
++                        }
+                     };
+ 
+                     int id = 0;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..a42b26ef8 100644
+index e510a92ce..57f434c3b 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -4879,6 +4879,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
@@ -24,30 +60,31 @@ index e510a92ce..a42b26ef8 100644
          return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
      }
  
-@@ -13416,18 +13422,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
-     size_t buf_offset = 0;
+@@ -13417,10 +13423,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
--    if (vk_buf) {
+     if (vk_buf) {
 -        // Create a proper Vulkan buffer context so that the dispatch code
 -        // can cast buffer->context to ggml_backend_vk_buffer_context.
 -        // This is critical for supports_buft to work without SIGSEGV.
 -        // Copy (not move) the shared_ptr — pinned_memory also holds a reference
--        vk_buffer vk_buf_copy = vk_buf;
--        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(
--            vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
--
--        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
--        return buffer;
--    }
-+    // Use CPU buffer interface with real host pointers. The Vulkan dispatch finds
-+    // the vk_buffer via host_get (pinned_memory). Using vk_buffer_interface would
-+    // set virtual pointers (0x1000+offset) that crash the selective expert copy.
-+    GGML_UNUSED(vk_buf);
++        // Use Vulkan buffer context with virtual pointers (vk_ptr_base + offset).
++        // The dispatch accesses data via buf_ctx->dev_buffer — this works on RADV/UMA.
++        // The selective expert copy uses ggml_backend_tensor_get (not direct pointer
++        // dereference) to handle virtual pointers safely.
+         vk_buffer vk_buf_copy = vk_buf;
+         ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(
+             vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
+@@ -13429,7 +13435,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+         return buffer;
+     }
  
-     // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
+-    // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
++    // Fallback: wrap as CPU buffer
      ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
-@@ -13440,7 +13438,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+     buffer->buft = buft;
+     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
+@@ -13440,7 +13446,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -56,20 +93,23 @@ index e510a92ce..a42b26ef8 100644
  
      UNUSED(buft);
  }
-@@ -15513,12 +15511,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,10 +15519,12 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
 -    // Vulkan_Host buffers now use ggml_backend_vk_buffer_context (with dev_buffer),
 -    // so they can be safely used in Vulkan dispatch without graph splits.
--    if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
++    // On UMA, Vulkan_Host buffers use vk_buffer_context with dev_buffer.
++    // The dispatch accesses them via dev_buffer path — no splits needed.
+     if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
 -        return true;
--    }
--
-     return false;
- }
++        ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
++        auto device = ggml_vk_get_device(ctx->device);
++        return device->uma;
+     }
  
-@@ -15592,6 +15584,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+     return false;
+@@ -15592,6 +15600,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
      const size_t align = device->min_imported_host_pointer_alignment;
      uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
      if (uptr & (align - 1)) {
@@ -78,7 +118,7 @@ index e510a92ce..a42b26ef8 100644
          return {};
      }
      // Round up size to alignment (the mmap'd region extends to page boundary)
-@@ -15600,10 +15594,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+@@ -15600,10 +15610,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
      const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
  
      vk_buffer buf {};
@@ -95,7 +135,7 @@ index e510a92ce..a42b26ef8 100644
      }
  
      return buf;
-@@ -15616,17 +15615,61 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+@@ -15616,17 +15631,61 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
      ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
      auto device = ggml_vk_get_device(ctx->device);
  
@@ -112,17 +152,16 @@ index e510a92ce..a42b26ef8 100644
 +    // Split into chunks and register each in pinned_memory for host_get.
 +    // Return a CPU buffer wrapper — the Vulkan dispatch finds chunks via host_get.
 +    if (!device->uma || !device->external_memory_host) {
++        return {};
++    }
++
++    // Use 75% of max_buffer_size to stay safely under the limit
++    const size_t chunk_size = (size_t)((device->max_buffer_size > 0 ? device->max_buffer_size : 4ULL * 1024 * 1024 * 1024) * 3 / 4) & ~(size_t)(4095);
++    if (chunk_size == 0) {
          return {};
      }
  
 -    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
-+    // Use 75% of max_buffer_size to stay safely under the limit
-+    const size_t chunk_size = (size_t)((device->max_buffer_size > 0 ? device->max_buffer_size : 4ULL * 1024 * 1024 * 1024) * 3 / 4) & ~(size_t)(4095);
-+    if (chunk_size == 0) {
-+        return {};
-+    }
- 
--    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
 +    size_t imported = 0;
 +    for (size_t off = 0; off < size; off += chunk_size) {
 +        size_t this_size = std::min(chunk_size, size - off);
@@ -132,14 +171,15 @@ index e510a92ce..a42b26ef8 100644
 +            this_size = ((size - off) + 4095) & ~(size_t)4095;
 +        }
  
--    return ret;
+-    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
 +        vk_buffer chunk = ggml_vk_buffer_from_host_ptr(device, (char *)ptr + off, this_size);
 +        if (!chunk) {
 +            GGML_LOG_WARN("ggml_vulkan: chunked import failed at offset %zu (chunk %.1f MiB)\n",
 +                off, this_size / (1024.0 * 1024.0));
 +            break;
 +        }
-+
+ 
+-    return ret;
 +        // Register in pinned_memory for host_get lookup
 +        std::lock_guard<std::recursive_mutex> guard(device->mutex);
 +        device->pinned_memory.push_back(std::make_tuple((char *)ptr + off, this_size, chunk));
