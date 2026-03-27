@@ -76,19 +76,19 @@ Figures are for Qwen3-235B / DeepSeek-R1 at HSK=128 with typical MoE layer count
 Items must be implemented in the order listed; later items depend on earlier ones.
 The critical path is: 1 → 2 → 5 → 9 (everything unblocks after item 9 compiles).
 
-- [ ] Item 1: `ggml/include/ggml.h` — add `GGML_TYPE_TQ2_KV = 41`, increment `GGML_TYPE_COUNT` to 42. (~3 lines, no deps)
-- [ ] Item 2: `ggml/src/ggml-common.h` — add `QK_TQ2_KV=128`, `block_tq2_kv` struct with `static_assert` that `sizeof(block_tq2_kv) == 34`. (~4 lines, deps: 1)
-- [ ] Item 3: `ggml/src/ggml.c` — add type_traits entry (`blck_size=128`, `type_size=34`) plus reference CPU encode/decode functions with NaN guard. (~50 lines, deps: 1, 2)
-- [ ] Item 4: `common/arg.cpp` — add `GGML_TYPE_TQ2_KV` to `kv_cache_types[]` array so `-ctk tq2_kv` is accepted as a CLI argument. (~1 line, deps: 1)
-- [ ] Item 5: `ggml-vulkan/vulkan-shaders/types.glsl` — add `QUANT_K_TQ2_KV=128`, the block struct, and a packed16 alias under `DATA_A_TQ2_KV` guard. (~12 lines, no C deps)
-- [ ] Item 6: `ggml-vulkan/vulkan-shaders/flash_attn_base.glsl` — add `dequantize4()` overload for `DATA_A_TQ2_KV` with `BLOCK_SIZE=128`, `BLOCK_BYTE_SIZE=34`, LDS staging. (~20 lines, deps: 5)
-- [ ] Item 7: `ggml-vulkan/vulkan-shaders/copy_to_quant.comp` — add `DATA_A_TQ2_KV` quantize block: per-warp max_abs reduction, NaN guard, `d=max_abs/1.5`, 2-bit pack into `qs[]`. (~30 lines, deps: 5)
-- [ ] Item 8: `ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` — register tq2_kv in the coopmat1 FA shader generation loop; add tq2_kv to the SET_ROWS type loop. (~15 lines, deps: 5, 6, 7)
-- [ ] Item 9: `ggml-vulkan/ggml-vulkan.cpp` — `CREATE_FA` for TQ2_KV (coopmat1 only), SET_ROWS pipeline registration, `supports_op` additions (FA gated on `coopmat1_fa_support`, SET_ROWS accepted, CPU FA rejected). (~20 lines, deps: 1, 6, 8)
-- [ ] Item 10: `ggml-vulkan/CMakeLists.txt` — add tq2_kv to the explicit shader list if the build system requires it (may be a no-op if shaders are globbed). (~2–5 lines, deps: 8)
+- [x] Item 1: `ggml/include/ggml.h` — add `GGML_TYPE_TQ2_KV = 41`, increment `GGML_TYPE_COUNT` to 42. (~3 lines, no deps)
+- [x] Item 2: `ggml/src/ggml-common.h` — add `QK_TQ2_KV=128`, `block_tq2_kv` struct with `static_assert` that `sizeof(block_tq2_kv) == 34`. (~4 lines, deps: 1)
+- [x] Item 3: `ggml/src/ggml.c` — add type_traits entry (`blck_size=128`, `type_size=34`) plus reference CPU encode/decode functions with NaN guard. (~50 lines, deps: 1, 2)
+- [x] Item 4: `common/arg.cpp` — add `GGML_TYPE_TQ2_KV` to `kv_cache_types[]` array so `-ctk tq2_kv` is accepted as a CLI argument. (~1 line, deps: 1)
+- [x] Item 5: `ggml-vulkan/vulkan-shaders/types.glsl` — add `QUANT_K_TQ2_KV=128`, the block struct, and a packed16 alias under `DATA_A_TQ2_KV` guard. (~12 lines, no C deps)
+- [x] Item 6: `ggml-vulkan/vulkan-shaders/flash_attn_base.glsl` — add `dequantize4()` overload for `DATA_A_TQ2_KV` with `BLOCK_SIZE=128`, `BLOCK_BYTE_SIZE=34`, LDS staging. (~20 lines, deps: 5)
+- [x] Item 7: `ggml-vulkan/vulkan-shaders/copy_to_quant.comp` — add `DATA_A_TQ2_KV` quantize block: per-warp max_abs reduction, NaN guard, `d=max_abs/1.5`, 2-bit pack into `qs[]`. (~30 lines, deps: 5)
+- [x] Item 8: `ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` — register tq2_kv in the coopmat1 FA shader generation loop; add tq2_kv to the SET_ROWS type loop. (~15 lines, deps: 5, 6, 7)
+- [x] Item 9: `ggml-vulkan/ggml-vulkan.cpp` — `CREATE_FA` for TQ2_KV (coopmat1 only), SET_ROWS pipeline registration, `supports_op` additions (FA gated on `coopmat1_fa_support`, SET_ROWS accepted, CPU FA rejected). (~20 lines, deps: 1, 6, 8)
+- [x] Item 10: `ggml-vulkan/CMakeLists.txt` — add tq2_kv to the explicit shader list if the build system requires it (may be a no-op if shaders are globbed). (~2–5 lines, deps: 8)
 - [ ] Item 11: `src/llama-context.cpp` — **no code change needed**. The existing HSK divisibility check handles TQ2_KV correctly via `ggml_blck_size(128)`. (0 lines)
 - [ ] Item 12: `src/llama-graph.cpp` — **no code change needed**. SET_ROWS dispatch is handled at the backend level, not in the graph builder. (0 lines)
-- [ ] Item 13: `tests/test-backend-ops.cpp` — add `GGML_TYPE_TQ2_KV` to the `flash_attn_ext` `type_KV` loop for HSK=128; set NMSE threshold to 0.05. (~5 lines, deps: 1, 6, 9)
+- [x] Item 13: `tests/test-backend-ops.cpp` — add `GGML_TYPE_TQ2_KV` to the `flash_attn_ext` `type_KV` loop for HSK=128; set NMSE threshold to 0.05. (~5 lines, deps: 1, 6, 9)
 
 ---
 
