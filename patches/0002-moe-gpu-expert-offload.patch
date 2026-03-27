@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..a42b26ef8 100644
+index e510a92ce..48c93a769 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -4879,6 +4879,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
@@ -56,20 +56,23 @@ index e510a92ce..a42b26ef8 100644
  
      UNUSED(buft);
  }
-@@ -15513,12 +15511,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,10 +15511,12 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
 -    // Vulkan_Host buffers now use ggml_backend_vk_buffer_context (with dev_buffer),
 -    // so they can be safely used in Vulkan dispatch without graph splits.
--    if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
++    // On UMA, Vulkan_Host pinned memory is accessible via host_get.
++    // No copy needed, reduces graph splits from 190 to 94.
+     if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
 -        return true;
--    }
--
-     return false;
- }
++        ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
++        auto device = ggml_vk_get_device(ctx->device);
++        return device->uma;
+     }
  
-@@ -15592,6 +15584,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+     return false;
+@@ -15592,6 +15592,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
      const size_t align = device->min_imported_host_pointer_alignment;
      uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
      if (uptr & (align - 1)) {
@@ -78,7 +81,7 @@ index e510a92ce..a42b26ef8 100644
          return {};
      }
      // Round up size to alignment (the mmap'd region extends to page boundary)
-@@ -15600,10 +15594,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+@@ -15600,10 +15602,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
      const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
  
      vk_buffer buf {};
@@ -95,7 +98,7 @@ index e510a92ce..a42b26ef8 100644
      }
  
      return buf;
-@@ -15616,17 +15615,61 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+@@ -15616,17 +15623,61 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
      ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
      auto device = ggml_vk_get_device(ctx->device);
  
