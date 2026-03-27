@@ -10,7 +10,7 @@
 
 | Model | Size | Backend | Path | TPS (confirmed) |
 |---|---|---|---|---|
-| glm-4-7-flash | 17 GB | moe-flash | Vulkan alloc | pending test |
+| glm-4-7-flash | 17 GB | moe-flash | Vulkan alloc, 2 splits | **50.57** |
 | qwen3-235b Q2_K | 80 GB | moe-flash | Vulkan alloc, 2 splits | **20.77** |
 | qwen3-235b Q4_K_M | 133 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | 2.96 cold → 6.0-6.3 warm |
 | deepseek-r1-0528 | 228 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | pending test |
@@ -117,8 +117,10 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 - [x] **Q2K** on moe-flash (CPU_MOE=0) — 20.77 t/s, 2 splits
 - [x] **q4km** on moe-flash-cpumoe (CPU_MOE=1) — 2.96 cold → 6.0-6.3 warm
 
+### Confirmed (image `3fbe06f`)
+- [x] **glm-4-7-flash** on moe-flash — 50.57 t/s, 2 splits
+
 ### To test
-- [ ] **glm-4-7-flash** on moe-flash — sanity check (~30 t/s expected)
 - [ ] **deepseek-r1-0528** on moe-flash-cpumoe — verify cold boot + partial prefetch
 
 ### Cleanup
