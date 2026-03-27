@@ -4,9 +4,12 @@
 
 **Production image: `328946f`** (deployed via Flux on shadow node)
 
-Two backends:
-- `llamacpp-vulkan-moe-flash`: no --cpu-moe, all data on Vulkan → fast
-- `llamacpp-vulkan-moe-flash-cpumoe`: with --cpu-moe, mmap-wrap → > RAM models
+**IMPORTANT**: The inference controller does NOT pass backend `spec.env` to pods.
+All env vars come from the Docker image's `ENV`. Two-backend approach with env
+overrides doesn't work. Need auto-detection in the code instead.
+
+Currently `LLAMA_ARG_CPU_MOE=1` in Dockerfile (safe for > RAM models).
+For ≤ RAM models, need code-level auto-detection to skip --cpu-moe.
 
 | Model | Size | Backend | Path | TPS |
 |---|---|---|---|---|
