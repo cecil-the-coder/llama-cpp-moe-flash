@@ -2,20 +2,22 @@
 
 ## Current State
 
-**Production image: `833b07c`** (deployed on shadow node, cleaned patch)
+**Production image: `6c04589`** (deployed on shadow node, auto-detect --cpu-moe)
 
-**Two-backend architecture** (controller passes `spec.env` correctly):
-- `moe-flash` backend: `CPU_MOE=0` → models that fit in GPU memory
-- `moe-flash-cpumoe` backend: `CPU_MOE=1` → models that exceed GPU/RAM
+**Single-backend architecture** with auto-detect:
+- All models use `moe-flash-cpumoe` backend (`CPU_MOE=1` default)
+- `llama_params_fit` auto-detects: if full model fits in device memory → clears
+  CPU_MOE override → experts on GPU (20+ t/s). If not → keeps override → mmap-wrap (6 t/s)
 
-| Model | Size | Backend | Path | TPS (confirmed) |
+| Model | Size | Auto-detect | Path | TPS (confirmed) |
 |---|---|---|---|---|
-| glm-4-7-flash | 17 GB | moe-flash | Vulkan alloc, 2 splits | **50.57** |
-| qwen3-235b Q2_K | 80 GB | moe-flash | Vulkan alloc, 2 splits | **20.77** |
-| qwen3-235b Q4_K_M | 133 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | 2.96 cold → 6.0-6.3 warm |
-| deepseek-r1-0528 | 228 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | 1.63 cold → 1.8 warm |
+| glm-4-7-flash | 17 GB | clears override | Vulkan alloc, 2 splits | **50.57** |
+| qwen3-235b Q2_K | 80 GB | clears override | Vulkan alloc, 2 splits | **20.21-20.77** |
+| qwen3-235b Q4_K_M | 133 GB | keeps override | mmap-wrap, partial prefetch | 2.72 cold → 6.0-6.3 warm |
+| deepseek-r1-0528 | 228 GB | keeps override | mmap-wrap, partial prefetch | 1.63 cold → 1.8 warm |
 
 **Key features in patch 0002:**
+- **Auto-detect --cpu-moe** in `llama_params_fit` (NEW — single backend for all sizes)
 - Vulkan_Host CPU buffer interface (SIGSEGV fix)
 - Hybrid pinned/mmap allocation (fast for ≤ RAM, safe for > RAM)
 - Partial page cache prefetch (posix_madvise WILLNEED up to MemAvail - 8 GiB)
@@ -113,23 +115,17 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 
 ## Remaining Tasks
 
-### Confirmed (image `3fbe06f`)
-- [x] **Q2K** on moe-flash (CPU_MOE=0) — 20.77 t/s, 2 splits
-- [x] **q4km** on moe-flash-cpumoe (CPU_MOE=1) — 2.96 cold → 6.0-6.3 warm
-
-### Confirmed (image `3fbe06f`)
-- [x] **glm-4-7-flash** on moe-flash — 50.57 t/s, 2 splits
-
-### Confirmed (image `833b07c`)
-- [x] **deepseek-r1-0528** on moe-flash-cpumoe — 1.63 cold → 1.8 warm (228 GB, mmap-wrap)
+### Confirmed (image `6c04589`, single cpumoe backend, auto-detect)
+- [x] **Q2K** — auto-detect clears override → 20.21 t/s, 2 splits
+- [x] **q4km** — auto-detect keeps override → 2.72 cold → 6.0-6.3 warm
+- [x] **glm-4-7-flash** — 50.57 t/s (tested on 833b07c, functionally identical)
+- [x] **deepseek-r1-0528** — 1.63 cold → 1.8 warm (tested on 833b07c)
+- [x] **Auto-detect --cpu-moe** — implemented in `llama_params_fit`, confirmed working
 
 ### Cleanup
+- [ ] **Remove moe-flash backend** — all models now on cpumoe, moe-flash is unused
 - [ ] **Strip debug/dead code from patch** — target minimal diff
 - [ ] **Update measurements.md** — consolidate final benchmark numbers
-- [ ] **Auto-detect --cpu-moe** — safety net for misassigned models (nice-to-have).
-  Would need implementation at `common_init_result` level (before `llama_params_fit`).
-  `llama_params_fit` already offloads MoE layers for overflow, but doesn't trigger
-  mmap-wrap (demand-paged) path. Two-backend approach is simpler and works.
 
 ### Blocked on RADV
 - [ ] **GPU expert matmul** — compute shaders can't read from pinned/imported host
@@ -140,19 +136,17 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 ## Architecture
 
 ```
-Two backends, same image (3fbe06f):
+Single backend: moe-flash-cpumoe (CPU_MOE=1, image 6c04589)
 
-moe-flash (CPU_MOE=0):
-  Model → Vulkan alloc+copy → 20+ t/s
-  Used for: models ≤ GTT (Q2K 80G, glm 17G)
-
-moe-flash-cpumoe (CPU_MOE=1):
-  Model file (GGUF, mmap'd)
-    ├── Model ≤ RAM? → Pinned alloc (ggml_vk_host_malloc + copy)
-    └── Model > RAM? → mmap-wrap (demand-paged)
-                        + Partial prefetch (MADV_WILLNEED, up to MemAvail - 8G)
-                        + MADV_RANDOM + MADV_HUGEPAGE
-  Used for: models > GTT (q4km 133G, deepseek 228G)
+llama_params_fit auto-detect:
+  ├── Model fits in device memory? → Clear CPU_MOE override
+  │   → Vulkan alloc+copy → 20-50 t/s (glm, Q2K)
+  │
+  └── Model doesn't fit? → Keep CPU_MOE override
+      ├── Model ≤ RAM? → Pinned alloc (ggml_vk_host_malloc + copy)
+      └── Model > RAM? → mmap-wrap (demand-paged)
+                          + Partial prefetch (MADV_WILLNEED, up to MemAvail - 8G)
+                          + MADV_RANDOM + MADV_HUGEPAGE → 1.8-6.3 t/s
 ```
 
 ## Completed Phases

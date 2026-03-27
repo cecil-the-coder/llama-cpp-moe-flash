@@ -1,18 +1,18 @@
 # Measurements
 
-## Final Performance (image `833b07c`)
+## Final Performance (image `6c04589`)
 
-Two backends on shadow node (AMD Strix Halo, 125 GB RAM, 120 GB GTT):
+Single backend (cpumoe, CPU_MOE=1) with auto-detect on shadow node (AMD Strix Halo, 125 GB RAM, 120 GB GTT):
 
-| Model | Size | Backend | TPS | Splits | Notes |
+| Model | Size | Auto-detect | TPS | Splits | Notes |
 |---|---|---|---|---|---|
-| glm-4-7-flash | 17 GB | moe-flash | **50.57** | 2 | Vulkan alloc, no --cpu-moe |
-| qwen3-235b Q2_K | 80 GB | moe-flash | **20.77** | 2 | Vulkan alloc, no --cpu-moe |
-| qwen3-235b Q4_K_M | 133 GB | cpumoe | 2.96→6.0-6.3 | 190 | mmap-wrap + partial prefetch + madvise |
-| deepseek-r1-0528 | 228 GB | cpumoe | 1.63→1.8 | 118 | mmap-wrap + partial prefetch (113/228 GiB) |
+| glm-4-7-flash | 17 GB | clears override | **50.57** | 2 | Vulkan alloc |
+| qwen3-235b Q2_K | 80 GB | clears override | **20.21-20.77** | 2 | Vulkan alloc |
+| qwen3-235b Q4_K_M | 133 GB | keeps override | 2.72→6.0-6.3 | 190 | mmap-wrap + partial prefetch |
+| deepseek-r1-0528 | 228 GB | keeps override | 1.63→1.8 | 118 | mmap-wrap + partial prefetch |
 
-Key: without `--cpu-moe`, models ≤ GTT go to Vulkan via `create_buffer_device` → 20-50 t/s.
-With `--cpu-moe` (models > RAM), expert data stays on mmap (demand-paged) → 6 t/s warm.
+`llama_params_fit` auto-detect: checks if full model (without --cpu-moe) fits in device memory.
+If fits → clears override → experts on GPU (20-50 t/s). If not → keeps override → mmap-wrap (1.8-6.3 t/s).
 
 ### RADV Driver Findings
 - `maxBufferSize` = 2-4 GiB (can't import large shard ranges)
