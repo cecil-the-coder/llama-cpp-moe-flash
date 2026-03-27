@@ -2,25 +2,20 @@
 
 ## Current State
 
-**Building image: `3fbe06f`** (auto-detect --cpu-moe, pending CI + deploy)
+**Production image: `3fbe06f`** (deployed on shadow node)
 
-**Auto-detect --cpu-moe** (implemented in `3fbe06f`): Dockerfile sets `LLAMA_ARG_CPU_MOE=1`
-as safe default, but `llama_params_fit` checks if the full model fits in device memory.
-If it fits, `hp_nex` is set to 0 → experts stay on Vulkan → 20+ t/s. If not, keeps
---cpu-moe → mmap-wrap fallback → 6.5 t/s. Eliminates need for two separate backends.
+**Two-backend architecture** (controller passes `spec.env` correctly):
+- `moe-flash` backend: `CPU_MOE=0` → models that fit in GPU memory
+- `moe-flash-cpumoe` backend: `CPU_MOE=1` → models that exceed GPU/RAM
 
-The inference controller does NOT pass backend `spec.env` to pods, so auto-detection
-in code is the only reliable path.
-
-| Model | Size | Expected Path | Expected TPS |
-|---|---|---|---|
-| glm-4-7-flash | 17 GB | Vulkan alloc (auto-skip cpu-moe) | ~30 |
-| qwen3-235b Q2_K | 80 GB | Vulkan alloc (auto-skip cpu-moe) | **20+** |
-| qwen3-235b Q4_K_M | 133 GB | mmap-wrap (auto-keep cpu-moe) | 6.5 |
-| deepseek-r1-0528 | 228 GB | mmap-wrap (auto-keep cpu-moe) | ~3-4 |
+| Model | Size | Backend | Path | TPS (confirmed) |
+|---|---|---|---|---|
+| glm-4-7-flash | 17 GB | moe-flash | Vulkan alloc | pending test |
+| qwen3-235b Q2_K | 80 GB | moe-flash | Vulkan alloc, 2 splits | **20.77** |
+| qwen3-235b Q4_K_M | 133 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | 2.96 cold → 6.0-6.3 warm |
+| deepseek-r1-0528 | 228 GB | moe-flash-cpumoe | mmap-wrap, partial prefetch | pending test |
 
 **Key features in patch 0002:**
-- **Auto-detect --cpu-moe** based on device memory fit (NEW)
 - Vulkan_Host CPU buffer interface (SIGSEGV fix)
 - Hybrid pinned/mmap allocation (fast for ≤ RAM, safe for > RAM)
 - Partial page cache prefetch (posix_madvise WILLNEED up to MemAvail - 8 GiB)
@@ -118,18 +113,18 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 
 ## Remaining Tasks
 
-### Deploy & test (image `3fbe06f`)
-- [ ] **Wait for CI build** to complete
-- [ ] **Deploy** to shadow node (update Flux image tag)
-- [ ] **Q2K auto-detect test** — should auto-skip --cpu-moe → 20+ t/s
-- [ ] **q4km auto-detect test** — should auto-keep --cpu-moe → 6.5 t/s
-- [ ] **glm-4-7-flash** — sanity check
-- [ ] **deepseek-r1-0528** — verify cold boot + partial prefetch
+### Confirmed (image `3fbe06f`)
+- [x] **Q2K** on moe-flash (CPU_MOE=0) — 20.77 t/s, 2 splits
+- [x] **q4km** on moe-flash-cpumoe (CPU_MOE=1) — 2.96 cold → 6.0-6.3 warm
 
-### Cleanup (after auto-detect confirmed)
-- [ ] **Collapse two backends** to single `moe-flash` backend in eh-ops-private
+### To test
+- [ ] **glm-4-7-flash** on moe-flash — sanity check (~30 t/s expected)
+- [ ] **deepseek-r1-0528** on moe-flash-cpumoe — verify cold boot + partial prefetch
+
+### Cleanup
 - [ ] **Strip debug/dead code from patch** — target minimal diff
 - [ ] **Update measurements.md** — consolidate final benchmark numbers
+- [ ] **Auto-detect --cpu-moe** — safety net for misassigned models (nice-to-have)
 
 ### Blocked on RADV
 - [ ] **GPU expert matmul** — compute shaders can't read from pinned/imported host
@@ -140,18 +135,19 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 ## Architecture
 
 ```
-Model file (GGUF, mmap'd)
-    │
-    ├── Fits in device memory? ──→ Auto-skip --cpu-moe
-    │   (llama_params_fit)          Vulkan alloc+copy → 20+ t/s
-    │
-    └── Doesn't fit? ──→ Keep --cpu-moe (Dockerfile default)
-        │
-        ├── Model ≤ RAM? ──→ Pinned alloc (ggml_vk_host_malloc + copy) → 9.7 t/s
-        │
-        └── Model > RAM? ──→ mmap-wrap (demand-paged)
-                              + Partial prefetch (MADV_WILLNEED, up to MemAvail - 8G)
-                              + MADV_RANDOM + MADV_HUGEPAGE → 6.5 t/s
+Two backends, same image (3fbe06f):
+
+moe-flash (CPU_MOE=0):
+  Model → Vulkan alloc+copy → 20+ t/s
+  Used for: models ≤ GTT (Q2K 80G, glm 17G)
+
+moe-flash-cpumoe (CPU_MOE=1):
+  Model file (GGUF, mmap'd)
+    ├── Model ≤ RAM? → Pinned alloc (ggml_vk_host_malloc + copy)
+    └── Model > RAM? → mmap-wrap (demand-paged)
+                        + Partial prefetch (MADV_WILLNEED, up to MemAvail - 8G)
+                        + MADV_RANDOM + MADV_HUGEPAGE
+  Used for: models > GTT (q4km 133G, deepseek 228G)
 ```
 
 ## Completed Phases
