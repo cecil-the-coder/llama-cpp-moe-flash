@@ -386,36 +386,10 @@ index 11c5cd23e..1daa0b034 100644
                  buf_map.emplace(idx, buf);
              }
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index f531fc6d7..d6efbc4ac 100644
+index f531fc6d7..ed313d817 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
-@@ -1050,6 +1050,25 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
-         }
-     }
- 
-+    // GGUF-aware selective fadvise: hint for NEXT layer's selected experts
-+    // in the GGUF file. Works with mmap-wrapped expert data (no split files needed).
-+    if (ctx->gguf_warmcache && ctx->gguf_src.fd >= 0) {
-+        int next_layer = layer_idx + 1;
-+        if (next_layer < (int)ctx->gguf_src.layers.size()) {
-+            const gguf_layer_source & ls = ctx->gguf_src.layers[next_layer];
-+#if defined(__linux__)
-+            for (int32_t eid : unique_experts) {
-+                if (eid >= 0 && eid < ls.n_experts) {
-+                    for (const auto & part : ls.experts[eid].parts) {
-+                        posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
-+                        ctx->n_prefetch_calls++;
-+                    }
-+                }
-+            }
-+#endif
-+        }
-+    }
-+
-     return true;
- }
- 
-@@ -1261,6 +1280,10 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+@@ -1261,6 +1261,10 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
  
  bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx) {
      if (!ctx) return false;
