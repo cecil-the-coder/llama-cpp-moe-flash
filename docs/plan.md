@@ -2,23 +2,25 @@
 
 ## Current State
 
-**Production image: `328946f`** (deployed via Flux on shadow node)
+**Building image: `3fbe06f`** (auto-detect --cpu-moe, pending CI + deploy)
 
-**IMPORTANT**: The inference controller does NOT pass backend `spec.env` to pods.
-All env vars come from the Docker image's `ENV`. Two-backend approach with env
-overrides doesn't work. Need auto-detection in the code instead.
+**Auto-detect --cpu-moe** (implemented in `3fbe06f`): Dockerfile sets `LLAMA_ARG_CPU_MOE=1`
+as safe default, but `llama_params_fit` checks if the full model fits in device memory.
+If it fits, `hp_nex` is set to 0 → experts stay on Vulkan → 20+ t/s. If not, keeps
+--cpu-moe → mmap-wrap fallback → 6.5 t/s. Eliminates need for two separate backends.
 
-Currently `LLAMA_ARG_CPU_MOE=1` in Dockerfile (safe for > RAM models).
-For ≤ RAM models, need code-level auto-detection to skip --cpu-moe.
+The inference controller does NOT pass backend `spec.env` to pods, so auto-detection
+in code is the only reliable path.
 
-| Model | Size | Backend | Path | TPS |
-|---|---|---|---|---|
-| glm-4-7-flash | 17 GB | moe-flash | Vulkan alloc | ~30 |
-| qwen3-235b Q2_K | 80 GB | moe-flash | Vulkan alloc | **20.73** |
-| qwen3-235b Q4_K_M | 133 GB | moe-flash-cpumoe | mmap-wrap | 6.46 cold → 6.64 warm |
-| deepseek-r1-0528 | 228 GB | moe-flash-cpumoe | mmap-wrap | ~2-3 cold → ~3-4 warm |
+| Model | Size | Expected Path | Expected TPS |
+|---|---|---|---|
+| glm-4-7-flash | 17 GB | Vulkan alloc (auto-skip cpu-moe) | ~30 |
+| qwen3-235b Q2_K | 80 GB | Vulkan alloc (auto-skip cpu-moe) | **20+** |
+| qwen3-235b Q4_K_M | 133 GB | mmap-wrap (auto-keep cpu-moe) | 6.5 |
+| deepseek-r1-0528 | 228 GB | mmap-wrap (auto-keep cpu-moe) | ~3-4 |
 
 **Key features in patch 0002:**
+- **Auto-detect --cpu-moe** based on device memory fit (NEW)
 - Vulkan_Host CPU buffer interface (SIGSEGV fix)
 - Hybrid pinned/mmap allocation (fast for ≤ RAM, safe for > RAM)
 - Partial page cache prefetch (posix_madvise WILLNEED up to MemAvail - 8 GiB)
@@ -116,30 +118,22 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 
 ## Remaining Tasks
 
-### To test
-- [ ] **deepseek-r1-0528** on `836d36a` — verify cold boot + partial prefetch
-- [ ] **glm-4-7-flash** on `836d36a` — sanity check
+### Deploy & test (image `3fbe06f`)
+- [ ] **Wait for CI build** to complete
+- [ ] **Deploy** to shadow node (update Flux image tag)
+- [ ] **Q2K auto-detect test** — should auto-skip --cpu-moe → 20+ t/s
+- [ ] **q4km auto-detect test** — should auto-keep --cpu-moe → 6.5 t/s
+- [ ] **glm-4-7-flash** — sanity check
+- [ ] **deepseek-r1-0528** — verify cold boot + partial prefetch
 
-### To investigate
-- [ ] **Q2K 190 vs 94 splits** — understand why `836d36a` has more splits than `998a216`.
-  Removing the MUL_MAT_ID offload code (dead code since --cpu-moe routes to CPU anyway)
-  might reduce splits back to 94 → possible TPS improvement.
-- [ ] **998a216 buffer_from_host_ptr success** — `998a216` showed `buffer_from_host_ptr`
-  working for some shards (20.4 t/s). Why did it succeed where `836d36a` fails?
-  The `998a216` patch had different Vulkan_Host alloc code (vk_buffer_context with
-  virtual pointers). Maybe the import path was different.
-
-### Cleanup
-- [ ] **Strip debug/dead code from patch** — maxBufferSize logging, alignment warnings,
-  chunked import, P3.8c bypass remnants, selective callback code. Target ~80 lines.
+### Cleanup (after auto-detect confirmed)
+- [ ] **Collapse two backends** to single `moe-flash` backend in eh-ops-private
+- [ ] **Strip debug/dead code from patch** — target minimal diff
 - [ ] **Update measurements.md** — consolidate final benchmark numbers
 
 ### Blocked on RADV
-- [ ] **GPU expert matmul** — P3.8c bypass (2 splits) is architecturally correct.
-  Blocked by GPU page fault on imported/pinned memory. If RADV fixes this:
-  all models → 20+ t/s regardless of size.
-- [ ] **Auto-disable --cpu-moe** — when buffer_from_host_ptr succeeds for all shards,
-  skip --cpu-moe → full Vulkan speed. Blocked by same RADV limitation.
+- [ ] **GPU expert matmul** — compute shaders can't read from pinned/imported host
+  memory on RADV. If driver fixes this: all models → 20+ t/s regardless of size.
 
 ---
 
@@ -148,13 +142,16 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 ```
 Model file (GGUF, mmap'd)
     │
-    ├── Model ≤ RAM? ──→ Pinned alloc (ggml_vk_host_malloc + copy) → 9.7 t/s
-    │                     Expert matmul on CPU (--cpu-moe)
+    ├── Fits in device memory? ──→ Auto-skip --cpu-moe
+    │   (llama_params_fit)          Vulkan alloc+copy → 20+ t/s
     │
-    └── Model > RAM? ──→ mmap-wrap (ggml_backend_cpu_buffer_from_ptr)
-                          + Partial prefetch (MADV_WILLNEED, up to MemAvail - 8G)
-                          + MADV_RANDOM + MADV_HUGEPAGE
-                          Expert matmul on CPU (--cpu-moe) → 6.5 t/s
+    └── Doesn't fit? ──→ Keep --cpu-moe (Dockerfile default)
+        │
+        ├── Model ≤ RAM? ──→ Pinned alloc (ggml_vk_host_malloc + copy) → 9.7 t/s
+        │
+        └── Model > RAM? ──→ mmap-wrap (demand-paged)
+                              + Partial prefetch (MADV_WILLNEED, up to MemAvail - 8G)
+                              + MADV_RANDOM + MADV_HUGEPAGE → 6.5 t/s
 ```
 
 ## Completed Phases
