@@ -35,21 +35,10 @@ index bc57df20b..12c1ed90e 100644
  
                      int id = 0;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92ce..13c3f0e88 100644
+index e510a92ce..fcc4c5294 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -4879,6 +4879,10 @@ static vk_device ggml_vk_get_device(size_t idx) {
-             device->max_buffer_size = device->max_memory_allocation_size;
-         }
- 
-+        GGML_LOG_INFO("ggml_vulkan: max_buffer_size = %.1f GiB, max_memory_alloc = %.1f GiB\n",
-+            device->max_buffer_size / (1024.0 * 1024.0 * 1024.0),
-+            device->max_memory_allocation_size / (1024.0 * 1024.0 * 1024.0));
-+
-         const char* GGML_VK_SUBALLOCATION_BLOCK_SIZE = getenv("GGML_VK_SUBALLOCATION_BLOCK_SIZE");
- 
-         if (GGML_VK_SUBALLOCATION_BLOCK_SIZE != nullptr) {
-@@ -13407,7 +13411,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13407,7 +13407,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
          ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
      } catch (vk::SystemError& e) {
          GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
@@ -60,7 +49,7 @@ index e510a92ce..13c3f0e88 100644
          return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
      }
  
-@@ -13416,20 +13422,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13416,20 +13418,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      size_t buf_offset = 0;
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
@@ -72,21 +61,21 @@ index e510a92ce..13c3f0e88 100644
 -        vk_buffer vk_buf_copy = vk_buf;
 -        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(
 -            vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
+-
+-        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+-        return buffer;
+-    }
 +    // Keep CPU buffer interface — Vulkan dispatch via host_get works for
 +    // selective expert copy (real host pointers). supports_buft + vk_buffer_context
 +    // causes GPU page fault on RADV when compute shaders read from pinned memory.
 +    GGML_UNUSED(vk_buf);
  
--        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
--        return buffer;
--    }
--
 -    // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
 +    // Fallback: wrap as CPU buffer
      ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
      buffer->buft = buft;
      buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
-@@ -13440,7 +13438,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13440,7 +13434,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
  }
  
  static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
@@ -95,7 +84,7 @@ index e510a92ce..13c3f0e88 100644
  
      UNUSED(buft);
  }
-@@ -15513,12 +15511,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
+@@ -15513,12 +15507,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
  
@@ -108,7 +97,7 @@ index e510a92ce..13c3f0e88 100644
      return false;
  }
  
-@@ -15592,6 +15584,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+@@ -15592,6 +15580,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
      const size_t align = device->min_imported_host_pointer_alignment;
      uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
      if (uptr & (align - 1)) {
@@ -117,7 +106,7 @@ index e510a92ce..13c3f0e88 100644
          return {};
      }
      // Round up size to alignment (the mmap'd region extends to page boundary)
-@@ -15600,10 +15594,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+@@ -15600,10 +15590,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
      const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
  
      vk_buffer buf {};
@@ -134,7 +123,7 @@ index e510a92ce..13c3f0e88 100644
      }
  
      return buf;
-@@ -15616,17 +15615,61 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+@@ -15616,17 +15611,15 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
      ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
      auto device = ggml_vk_get_device(ctx->device);
  
@@ -142,61 +131,18 @@ index e510a92ce..13c3f0e88 100644
      vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
  
 -    if (!buf) {
+-        return {};
 +    if (buf) {
 +        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
 +        return ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
-+    }
-+
-+    // Single import failed (likely exceeds maxBufferSize).
-+    // Split into chunks and register each in pinned_memory for host_get.
-+    // Return a CPU buffer wrapper — the Vulkan dispatch finds chunks via host_get.
-+    if (!device->uma || !device->external_memory_host) {
-         return {};
      }
  
 -    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
-+    // Use 75% of max_buffer_size to stay safely under the limit
-+    const size_t chunk_size = (size_t)((device->max_buffer_size > 0 ? device->max_buffer_size : 4ULL * 1024 * 1024 * 1024) * 3 / 4) & ~(size_t)(4095);
-+    if (chunk_size == 0) {
-+        return {};
-+    }
- 
+-
 -    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
-+    size_t imported = 0;
-+    for (size_t off = 0; off < size; off += chunk_size) {
-+        size_t this_size = std::min(chunk_size, size - off);
-+        // Ensure page alignment
-+        this_size = (this_size + 4095) & ~(size_t)4095;
-+        if (off + this_size > size) {
-+            this_size = ((size - off) + 4095) & ~(size_t)4095;
-+        }
- 
+-
 -    return ret;
-+        vk_buffer chunk = ggml_vk_buffer_from_host_ptr(device, (char *)ptr + off, this_size);
-+        if (!chunk) {
-+            GGML_LOG_WARN("ggml_vulkan: chunked import failed at offset %zu (chunk %.1f MiB)\n",
-+                off, this_size / (1024.0 * 1024.0));
-+            break;
-+        }
-+
-+        // Register in pinned_memory for host_get lookup
-+        std::lock_guard<std::recursive_mutex> guard(device->mutex);
-+        device->pinned_memory.push_back(std::make_tuple((char *)ptr + off, this_size, chunk));
-+        imported += this_size;
-+    }
-+
-+    if (imported < size) {
-+        // Partial import — clean up and fail
-+        // (pinned_memory entries will be orphaned but harmless)
-+        return {};
-+    }
-+
-+    GGML_LOG_INFO("ggml_vulkan: imported %.1f GiB via %zu chunks of %.1f GiB\n",
-+        size / (1024.0 * 1024.0 * 1024.0), (size + chunk_size - 1) / chunk_size,
-+        chunk_size / (1024.0 * 1024.0 * 1024.0));
-+
-+    // Return CPU buffer wrapper — tensors have real host pointers, host_get resolves them
-+    return ggml_backend_cpu_buffer_from_ptr(ptr, size);
++    return {};
  }
  
  static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
