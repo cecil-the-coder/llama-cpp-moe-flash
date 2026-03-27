@@ -54,8 +54,20 @@ now uses `host_get` → finds the pinned vk_buffer → but the GPU faults readin
 The `dev_buffer` path works; the `host_get` path doesn't. This is the same RADV
 limitation as P3.8c.
 
-**Possible fix**: dual-interface buffer that uses virtual pointers for dispatch (when
-no copy needed) and real pointers for selective copy (when copy IS needed). Complex.
+**Attempted**: dual-interface buffer (image `09540b1`). Used `vk_buffer_context`
+(virtual pointers) for dispatch + `ggml_backend_tensor_get` for selective copy.
+Achieved 1 graph split but GPU page fault persists — RADV can't read from
+`ggml_vk_host_malloc` pinned memory in compute shaders regardless of access path
+(`dev_buffer` or `host_get`).
+
+`998a216` likely worked at 20.4 t/s because `buffer_from_host_ptr` imported the
+non-expert shard as a regular Vulkan buffer (not pinned), so the GPU never read
+from pinned memory. With our code, `buffer_from_host_ptr` fails (maxBufferSize 4G)
+→ falls to pinned alloc → GPU fault.
+
+**Blocked by RADV**: 9.30 t/s is the achievable ceiling for Q2K until RADV fixes
+pinned memory access for compute shaders, or `buffer_from_host_ptr` supports larger
+imports (chunked or increased maxBufferSize).
 
 ---
 
