@@ -1,0 +1,97 @@
+From: Claude Agent <agent@claude.ai>
+Date: Fri, 27 Mar 2026 23:01:27 +0000
+Subject: [PATCH 0005] feat: TQ2_KV Vulkan backend wiring (pipeline, supports_op, SET_ROWS)
+
+- vulkan-shaders-gen.cpp: register tq2_kv for coopmat1 FA + SET_ROWS
+- ggml-vulkan.cpp: CREATE_FA scalar+coopmat1, supports_op gated on coopmat1,
+  SET_ROWS pipeline init
+- CMakeLists.txt: shaders auto-discovered, no change needed
+---
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -672,6 +672,21 @@
+                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
+                 }
+             }
++
++            // tq2_kv: KV-only quantization type, not in type_names (no mul_mat shaders needed)
++            // Register flash_attn and flash_attn_cm1 shaders for tq2_kv
++            {
++                const std::string tname = "tq2_kv";
++                const std::string data_a_key = "DATA_A_TQ2_KV";
++#if defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
++                if (fp16) {
++                    string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
++                        merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_TQ2_KV"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
++                }
++#endif
++                string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
++                    merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_TQ2_KV"}}), fp16, false, false, f16acc);
++            }
+         }
+     }
+ 
+@@ -763,7 +778,7 @@
+         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+     }
+ 
+-    for (std::string t : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
++    for (std::string t : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tq2_kv"}) {
+         string_to_spv("set_rows_" + t + "_i32",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+         string_to_spv("set_rows_" + t + "_i32_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
+         string_to_spv("set_rows_" + t + "_i64",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3399,11 +3399,13 @@
+         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
+         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
+         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
++        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_SCALAR, )
+     } else {
+         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
+         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
+         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, _fp32)
+         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, _fp32)
++        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_SCALAR, _fp32)
+     }
+ #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+     if (device->coopmat1_fa_support) {
+@@ -3411,6 +3413,7 @@
+         CREATE_FA(GGML_TYPE_F16, f16, FA_COOPMAT1, _cm1)
+         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_COOPMAT1, _cm1)
+         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT1, _cm1)
++        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_COOPMAT1, _cm1)
+     }
+ #endif
+ #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+@@ -4274,7 +4277,8 @@
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_0], "set_rows_q5_0" #itype, set_rows_q5_0 ## itype ## rte ## _len, set_rows_q5_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_1], "set_rows_q5_1" #itype, set_rows_q5_1 ## itype ## rte ## _len, set_rows_q5_1 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q8_0], "set_rows_q8_0" #itype, set_rows_q8_0 ## itype ## rte ## _len, set_rows_q8_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## rte ## _len, set_rows_iq4_nl ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## rte ## _len, set_rows_iq4_nl ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TQ2_KV], "set_rows_tq2_kv" #itype, set_rows_tq2_kv ## itype ## rte ## _len, set_rows_tq2_kv ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+ 
+     if (device->float_controls_rte_fp16) {
+         SET_ROWS(_i32, _rte)
+@@ -15140,6 +15144,12 @@
+                 case GGML_TYPE_Q8_0:
+                     // supported in scalar and coopmat2 paths
+                     break;
++                case GGML_TYPE_TQ2_KV:
++                    // supported in scalar and coopmat1 paths (not coopmat2)
++                    if (!device->coopmat1_fa_support) {
++                        return false;
++                    }
++                    break;
+                 case GGML_TYPE_Q4_1:
+                 case GGML_TYPE_Q5_0:
+                 case GGML_TYPE_Q5_1:
+@@ -15216,6 +15226,7 @@
+                     case GGML_TYPE_Q5_1:
+                     case GGML_TYPE_Q8_0:
+                     case GGML_TYPE_IQ4_NL:
++                    case GGML_TYPE_TQ2_KV:
+                         return true;
+                     default:
+                         return false;
