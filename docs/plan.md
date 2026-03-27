@@ -41,9 +41,21 @@ Current `836d36a` gets 9.30 t/s because:
 which works but creates a different buffer type (Vulkan_Host pinned vs Vulkan device).
 The scheduler generates more splits for Vulkan_Host buffers.
 
-**Investigation needed**: Why did `998a216` get only 94 splits while `836d36a` gets 190?
-The difference may be from the MUL_MAT_ID offload code (present in 836d36a but not 998a216)
-or from the Vulkan_Host buffer type changes.
+**Root cause found**: `998a216` had `supports_buft=true` for Vulkan_Host → 94 splits.
+Our `836d36a` has `supports_buft=false` → 190 splits. Re-enabling it (image `c2f139f`)
+causes GPU page fault (SIGSEGV exit 139).
+
+The issue: `998a216` used `ggml_backend_vk_buffer_context` (virtual pointers) for
+Vulkan_Host. The dispatch used `buf_ctx->dev_buffer` which worked. Our fix changed to
+CPU buffer interface (real host pointers) for the selective copy path. The dispatch
+now uses `host_get` → finds the pinned vk_buffer → but the GPU faults reading it.
+
+**Both paths resolve to the same physical memory** but through different Vulkan objects.
+The `dev_buffer` path works; the `host_get` path doesn't. This is the same RADV
+limitation as P3.8c.
+
+**Possible fix**: dual-interface buffer that uses virtual pointers for dispatch (when
+no copy needed) and real pointers for selective copy (when copy IS needed). Complex.
 
 ---
 
