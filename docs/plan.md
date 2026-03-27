@@ -2,7 +2,7 @@
 
 ## Current State
 
-**Production image: `3fbe06f`** (deployed on shadow node)
+**Production image: `833b07c`** (deployed on shadow node, cleaned patch)
 
 **Two-backend architecture** (controller passes `spec.env` correctly):
 - `moe-flash` backend: `CPU_MOE=0` → models that fit in GPU memory
@@ -121,7 +121,7 @@ blocks all GPU expert matmul paths. Expert matmul stays on CPU (`--cpu-moe`).
 - [x] **glm-4-7-flash** on moe-flash — 50.57 t/s, 2 splits
 
 ### To test
-- [ ] **deepseek-r1-0528** on moe-flash-cpumoe — downloading (~35 min at 110 MB/s)
+- [ ] **deepseek-r1-0528** on moe-flash-cpumoe — downloading (~137 GB, controller restarts during download but resumes)
 
 ### Cleanup
 - [ ] **Strip debug/dead code from patch** — target minimal diff

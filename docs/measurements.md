@@ -1,6 +1,6 @@
 # Measurements
 
-## Final Performance (image `3fbe06f`)
+## Final Performance (image `833b07c`)
 
 Two backends on shadow node (AMD Strix Halo, 125 GB RAM, 120 GB GTT):
 
