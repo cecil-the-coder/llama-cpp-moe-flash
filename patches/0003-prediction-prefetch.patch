@@ -27,7 +27,7 @@ index 9fd3f7f..25a3a63 100644
      // Utils
      //
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df2..927d643 100644
+index 12c1ed9..81431ab 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -724,6 +724,9 @@ struct ggml_backend_sched {
@@ -52,7 +52,7 @@ index bc57df2..927d643 100644
                      }
  
                      // group consecutive experts and copy them together
-@@ -1828,6 +1836,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1839,6 +1847,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
@@ -99,31 +99,10 @@ index 5c44941..8819c96 100644
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index f531fc6..b93d195 100644
+index ed313d8..a2353c2 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
-@@ -339,6 +339,20 @@ static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
-     pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
- }
- 
-+// Non-blocking drain: reap any completed CQEs without waiting.
-+// Must be called periodically to prevent CQ overflow.
-+static int iouring_prefetcher_drain_cqes(iouring_prefetcher * pf) {
-+    int reaped = 0;
-+    struct io_uring_cqe * cqe;
-+    while (io_uring_peek_cqe(&pf->ring, &cqe) == 0) {
-+        if (cqe->res >= 0) pf->total_bytes_read += cqe->res;
-+        pf->n_pending--;
-+        io_uring_cqe_seen(&pf->ring, cqe);
-+        reaped++;
-+    }
-+    return reaped;
-+}
-+
- #endif // GGML_USE_IOURING
- 
- // ── Mode enum ─────────────────────────────────────────────────────────
-@@ -397,6 +411,15 @@ static int parse_layer_index(const char * name) {
+@@ -397,6 +397,15 @@ static int parse_layer_index(const char * name) {
      return -1;
  }
  
@@ -139,7 +118,7 @@ index f531fc6..b93d195 100644
  // ── Manifest loader ────────────────────────────────────────────────────
  
  // Minimal JSON parser for manifest.json (avoids external dependency).
-@@ -1053,6 +1076,64 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+@@ -1053,6 +1062,49 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
      return true;
  }
  
@@ -159,13 +138,6 @@ index f531fc6..b93d195 100644
 +    auto * ctx = (llama_moe_flash_context *)user_data;
 +    if (!ctx || !ctx->enabled || ctx->gguf_src.layers.empty()) return;
 +
-+    // Skip prefetch if expert weights are on GPU or buffer isn't assigned yet
-+    // (during sched_reserve, buffers are null — nothing to prefetch)
-+    if (!node->src[0] || !node->src[0]->buffer ||
-+        !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
-+        return;
-+    }
-+
 +    // Parse layer index from the weight tensor name (src[0]: "blk.N.ffn_*_exps")
 +    int layer_idx = -1;
 +    if (node->src[0]) {
@@ -173,38 +145,30 @@ index f531fc6..b93d195 100644
 +    }
 +    if (layer_idx < 0) return;
 +
-+    // Prefetch selected experts for the next few layers (lookahead).
-+    // Deeper lookahead gives more time for kernel readahead to complete.
-+    // Cost is ~K*3 fadvise syscalls per lookahead layer (K=8 experts, 3 parts each).
-+    for (int ahead = 1; ahead <= 3; ahead++) {
-+        int target_layer = layer_idx + ahead;
-+
-+        auto it = ctx->gguf_src.layer_idx_to_pos.find(target_layer);
-+        if (it == ctx->gguf_src.layer_idx_to_pos.end()) continue;
-+        int pos = it->second;
-+        if (pos < 0 || pos >= (int)ctx->gguf_src.layers.size()) continue;
-+        const gguf_layer_source & ls = ctx->gguf_src.layers[pos];
-+        if (ls.fd < 0) continue;
-+
++    // Prefetch next layer's selected experts
 +#if defined(__linux__)
++    int target_layer = layer_idx + 1;
++    if (target_layer < (int)ctx->gguf_src.layers.size()) {
++        const gguf_layer_source & ls = ctx->gguf_src.layers[target_layer];
 +        for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
 +            if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
 +            for (const auto & part : ls.experts[eid].parts) {
 +                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
 +            }
 +        }
-+#endif
++        ctx->n_prefetch_calls++;
 +    }
-+    ctx->n_prefetch_calls++;
-+
-+    GGML_UNUSED(n_expert);
++#else
 +    GGML_UNUSED(used_ids_bitset);
++    GGML_UNUSED(n_expert);
++    GGML_UNUSED(node);
++#endif
 +}
 +
  // ── Public API ─────────────────────────────────────────────────────────
  
  struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
-@@ -1293,3 +1374,34 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
+@@ -1297,3 +1349,20 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
              break;
      }
  }
@@ -223,73 +187,5 @@ index f531fc6..b93d195 100644
 +        fprintf(stderr, "moe-flash: stopped background prefetch thread (replaced by prediction callback)\n");
 +    }
 +
-+#if defined(GGML_USE_IOURING)
-+    // Initialize io_uring for the prediction callback if not already done.
-+    // The callback uses a small scratch buffer so we only need a lightweight ring
-+    // (no staging slots needed — the reads are fire-and-forget for page cache warming).
-+    if (!ctx->iouring_pf.ring_initialized) {
-+        // Use a minimal slot size since we only read into a 128KB scratch buffer
-+        if (iouring_prefetcher_init(&ctx->iouring_pf, 1, 128 * 1024)) {
-+            fprintf(stderr, "moe-flash: io_uring ring initialized for prediction callback\n");
-+        } else {
-+            fprintf(stderr, "moe-flash: io_uring init failed, using posix_fadvise fallback\n");
-+        }
-+    }
-+#endif
-+
 +    fprintf(stderr, "moe-flash: installed prediction-based expert prefetch\n");
 +}
-diff --git a/src/llama.cpp b/src/llama.cpp
-index 872e659..ea11efe 100644
---- a/src/llama.cpp
-+++ b/src/llama.cpp
-@@ -234,6 +234,38 @@ static void llama_params_fit_impl(
-     assert(sum_free >= 0 && sum_projected_used >= 0);
-     LLAMA_LOG_INFO("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
-         __func__, sum_projected_used/MiB, sum_free/MiB);
-+
-+    // Auto-detect: if tensor_buft_overrides are set (e.g. --cpu-moe), check if the
-+    // full model would fit WITHOUT them. If so, clear overrides for better GPU perf.
-+    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
-+        struct llama_model_params mparams_no_override = *mparams;
-+        mparams_no_override.tensor_buft_overrides = nullptr;
-+
-+        const dmds_t dmds_no_override = llama_get_device_memory_data(
-+            path_model, &mparams_no_override, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-+
-+        bool fits_without_override = true;
-+        int64_t total_free_no = 0, total_used_no = 0;
-+        for (size_t id = 0; id < nd; id++) {
-+            total_free_no += dmds_no_override[id].free;
-+            total_used_no += int64_t(dmds_no_override[id].mb.total()) + margins[id];
-+            if (int64_t(dmds_no_override[id].free) - int64_t(dmds_no_override[id].mb.total()) < margins[id]) {
-+                fits_without_override = false;
-+            }
-+        }
-+
-+        if (fits_without_override) {
-+            LLAMA_LOG_INFO("%s: full model fits in device memory (%" PRId64 " MiB needed vs %" PRId64 " MiB free), removing tensor overrides for better performance\n",
-+                __func__, total_used_no/MiB, total_free_no/MiB);
-+            mparams->tensor_buft_overrides = nullptr;
-+            return;
-+        } else {
-+            LLAMA_LOG_INFO("%s: full model does NOT fit in device memory (%" PRId64 " MiB needed vs %" PRId64 " MiB free), keeping tensor overrides\n",
-+                __func__, total_used_no/MiB, total_free_no/MiB);
-+            return;
-+        }
-+    }
-+
-     if (nd == 1) {
-         if (projected_free_per_device[0] >= margins[0]) {
-             LLAMA_LOG_INFO("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
-@@ -347,10 +379,6 @@ static void llama_params_fit_impl(
-     if (!tensor_buft_overrides) {
-         throw llama_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
-     }
--    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
--        throw llama_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
--    }
--
-     // step 3: iteratively fill the back to front with "dense" layers
-     //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
-     //   - for a MoE model, same as dense model but with all MoE tensors in system memory
