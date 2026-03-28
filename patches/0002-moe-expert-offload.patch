@@ -1,8 +1,55 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index bc57df2..12c1ed9 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1530,13 +1530,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+-
+-                        ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
++                        const size_t copy_size = expert_size_copy + padding_end;
++
++                        if (ggml_backend_buffer_is_host(input->buffer)) {
++                            // Host buffer: direct pointer access (fast path)
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + expert_offset, expert_offset,
++                                copy_size);
++                        } else {
++                            // Non-host buffer (e.g., Vulkan_Host with virtual pointers):
++                            // read through backend API, then write to split buffer
++                            std::vector<uint8_t> staging(copy_size);
++                            ggml_backend_tensor_get(input, staging.data(), expert_offset, copy_size);
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                staging.data(), expert_offset,
++                                copy_size);
++                        }
+                     };
+ 
+                     int id = 0;
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index e510a92..1bffcdc 100644
+index e510a92..fcc4c52 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -13416,20 +13416,14 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+@@ -13407,7 +13407,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+         ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+     } catch (vk::SystemError& e) {
+         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
+-        // fallback to cpu buffer
++        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
++    }
++    if (ptr == nullptr) {
+         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+     }
+ 
+@@ -13416,20 +13418,12 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
      size_t buf_offset = 0;
      ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
  
@@ -18,19 +65,25 @@ index e510a92..1bffcdc 100644
 -        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
 -        return buffer;
 -    }
--
--    // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
-+    // CPU buffer interface — compute shaders cannot read from ggml_vk_host_malloc
-+    // pinned memory on RADV (GPU page fault / SIGSEGV, confirmed on Mesa 25.2-25.3,
-+    // GFX1150 + GFX1151, kernel 6.18-6.19). Re-tested with supports_buft in image
-+    // 7736644 — still crashes with exit 139. This is a real RADV limitation, not
-+    // a firmware bug.
++    // Keep CPU buffer interface — Vulkan dispatch via host_get works for
++    // selective expert copy (real host pointers). supports_buft + vk_buffer_context
++    // causes GPU page fault on RADV when compute shaders read from pinned memory.
 +    GGML_UNUSED(vk_buf);
-+
-+    // Wrap as CPU buffer (real host pointers for selective expert copy)
+ 
+-    // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
++    // Fallback: wrap as CPU buffer
      ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
      buffer->buft = buft;
      buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
+@@ -13440,7 +13434,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+ }
+ 
+ static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+-    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
++    return vk_instance.devices[0]->properties.limits.minStorageBufferOffsetAlignment;
+ 
+     UNUSED(buft);
+ }
 @@ -15513,12 +15507,6 @@ static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_ba
          return buft_ctx->device->idx == ctx->device;
      }
@@ -44,3 +97,360 @@ index e510a92..1bffcdc 100644
      return false;
  }
  
+@@ -15592,6 +15580,8 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+     const size_t align = device->min_imported_host_pointer_alignment;
+     uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
+     if (uptr & (align - 1)) {
++        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: ptr %p misaligned (need %zu, off by %zu)\n",
++            ptr, align, uptr & (align - 1));
+         return {};
+     }
+     // Round up size to alignment (the mmap'd region extends to page boundary)
+@@ -15600,10 +15590,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
+ 
+     vk_buffer buf {};
++    if (size > device->max_buffer_size) {
++        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: size %.1f GiB exceeds max_buffer_size %.1f GiB\n",
++            size / (1024.0 * 1024.0 * 1024.0), device->max_buffer_size / (1024.0 * 1024.0 * 1024.0));
++        return {};
++    }
+     try {
+         buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
+     } catch (vk::SystemError& e) {
+-        GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
++        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr failed: %s (size=%.1f GiB)\n", e.what(), size / (1024.0 * 1024.0 * 1024.0));
+     }
+ 
+     return buf;
+@@ -15616,17 +15611,15 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     auto device = ggml_vk_get_device(ctx->device);
+ 
++    // Try single-buffer import first
+     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+ 
+-    if (!buf) {
+-        return {};
++    if (buf) {
++        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
++        return ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
+     }
+ 
+-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
+-
+-    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
+-
+-    return ret;
++    return {};
+ }
+ 
+ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 11c5cd2..1daa0b0 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -27,6 +27,9 @@
+ #include <regex>
+ #include <sstream>
+ #include <stdexcept>
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
+ 
+ const char * llm_type_name(llm_type type) {
+     switch (type) {
+@@ -7493,33 +7496,55 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+     // Prefetching pages in the entire model, which OOMs for models > RAM.
+     // With --cpu-moe, experts stay mmap'd and are paged in on demand.
+     bool do_prefetch = true;
+-    {
+-        size_t model_size = 0;
+-        for (const auto & file : ml.files) {
+-            model_size += file->size();
+-        }
+-        size_t mem_available = 0;
++    size_t model_size = 0;
++    size_t mem_available = 0;
++    for (const auto & file : ml.files) {
++        model_size += file->size();
++    }
+ #if defined(__linux__)
+-        // Read MemAvailable from /proc/meminfo
++    {
+         FILE * meminfo = fopen("/proc/meminfo", "r");
+         if (meminfo) {
+             char line[256];
+             while (fgets(line, sizeof(line), meminfo)) {
+                 if (strncmp(line, "MemAvailable:", 13) == 0) {
+-                    mem_available = strtoull(line + 13, nullptr, 10) * 1024; // kB to bytes
++                    mem_available = strtoull(line + 13, nullptr, 10) * 1024;
+                     break;
+                 }
+             }
+             fclose(meminfo);
+         }
++    }
+ #endif
+-        if (mem_available > 0 && model_size > mem_available) {
+-            LLAMA_LOG_INFO("%s: model size (%.1f GiB) exceeds available memory (%.1f GiB), disabling mmap prefetch\n",
+-                    __func__, model_size / (1024.0 * 1024.0 * 1024.0), mem_available / (1024.0 * 1024.0 * 1024.0));
+-            do_prefetch = false;
+-        }
++    if (mem_available > 0 && model_size > mem_available) {
++        LLAMA_LOG_INFO("%s: model size (%.1f GiB) exceeds available memory (%.1f GiB), using partial prefetch\n",
++                __func__, model_size / (1024.0 * 1024.0 * 1024.0), mem_available / (1024.0 * 1024.0 * 1024.0));
++        do_prefetch = false;
+     }
+     ml.init_mappings(do_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++
++    // Partial prefetch for models > RAM: warm page cache with as much as fits.
++    // posix_madvise(MADV_WILLNEED) triggers async kernel readahead without blocking.
++    // Leave 8 GiB headroom for KV cache, compute buffers, and OS.
++    if (!do_prefetch && mem_available > 0) {
++#if defined(__linux__)
++        const size_t headroom = 8ULL * 1024 * 1024 * 1024;
++        size_t prefetch_budget = mem_available > headroom ? mem_available - headroom : 0;
++        size_t prefetched = 0;
++        for (const auto & mapping : ml.mappings) {
++            if (!mapping || prefetch_budget == 0) continue;
++            size_t map_size = mapping->size();
++            size_t to_prefetch = std::min(map_size, prefetch_budget);
++            posix_madvise((char *)mapping->addr(), to_prefetch, POSIX_MADV_WILLNEED);
++            prefetched += to_prefetch;
++            prefetch_budget -= to_prefetch;
++        }
++        if (prefetched > 0) {
++            LLAMA_LOG_INFO("%s: partial prefetch: advising %.1f GiB of %.1f GiB model data\n",
++                __func__, prefetched / (1024.0 * 1024.0 * 1024.0), model_size / (1024.0 * 1024.0 * 1024.0));
++        }
++#endif
++    }
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+@@ -7559,11 +7584,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+         std::vector<ggml_backend_buffer_ptr> bufs;
+         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && (is_default_buft || is_host_buft)) {
+             GGML_ASSERT(!ml.no_alloc);
++            bool any_failed = false;
+             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
+-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
+-                //     then we could just use metal for all layers
+-                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
+                 void * addr = nullptr;
+                 size_t first, last; // NOLINT
+                 ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+@@ -7571,16 +7593,135 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
+                     continue;
+                 }
+                 const size_t max_size = ggml_get_max_tensor_size(ctx);
+-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
++                // Align 'first' DOWN to page boundary (4096) for VK_EXT_external_memory_host.
++                // The import requires page-aligned pointers. mmap base (addr) is page-aligned,
++                // but 'first' (offset of first tensor in shard) may not be.
++                const size_t page_align = 4096;
++                size_t aligned_first = (first / page_align) * page_align;
++                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + aligned_first, last - aligned_first, max_size);
+                 if (buf == nullptr) {
+-                    // buffer_from_host_ptr failed (e.g., exceeds device memory limit)
+-                    // Fall back to allocating a new buffer and copying data
+-                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s (size %.1f MiB), falling back to copy\n",
+-                            __func__, ggml_backend_buft_name(buft), (last - first) / (1024.0 * 1024.0));
+-                    buf_map.clear();
+-                    bufs.clear();
++                    // Per-shard fallback: mmap-wrap this shard, keep successful imports.
++                    // This is critical for models near the GTT limit — most shards import
++                    // fine, only the one exceeding remaining GTT fails.
++                    LLAMA_LOG_WARN("%s: buffer_from_host_ptr failed for %s shard %u (size %.1f MiB), using mmap\n",
++                            __func__, ggml_backend_buft_name(buft), idx, (last - first) / (1024.0 * 1024.0));
++                    if (ggml_backend_buft_is_host(buft)) {
++                        // Hybrid: use mmap-wrap only if model exceeds available memory.
++                        // Otherwise use fallback_alloc (pinned alloc+copy) which is ~3× faster
++                        // because pinned memory doesn't have page fault overhead.
++                        bool model_fits_in_ram = true;
++#if defined(__linux__)
++                        {
++                            size_t mem_available = 0;
++                            FILE * meminfo = fopen("/proc/meminfo", "r");
++                            if (meminfo) {
++                                char line[256];
++                                while (fgets(line, sizeof(line), meminfo)) {
++                                    if (strncmp(line, "MemAvailable:", 13) == 0) {
++                                        mem_available = strtoull(line + 13, nullptr, 10) * 1024;
++                                        break;
++                                    }
++                                }
++                                fclose(meminfo);
++                            }
++                            // Sum total tensor data across all shards for this buft context
++                            size_t total_tensor_size = 0;
++                            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                                total_tensor_size += ggml_nbytes(t);
++                            }
++                            model_fits_in_ram = (mem_available > 0 && total_tensor_size < mem_available * 3 / 4);
++                            LLAMA_LOG_INFO("%s: %s tensors: %.1f GiB, available RAM: %.1f GiB → %s\n",
++                                __func__, ggml_backend_buft_name(buft),
++                                total_tensor_size / (1024.0 * 1024.0 * 1024.0),
++                                mem_available / (1024.0 * 1024.0 * 1024.0),
++                                model_fits_in_ram ? "pinned alloc" : "mmap-wrap");
++                        }
++#endif
++                        if (model_fits_in_ram) {
++                            // Use fallback_alloc: pinned memory, alloc+copy, fast (~9.7 t/s)
++                            buf_map.clear();
++                            bufs.clear();
++                            goto fallback_alloc;
++                        }
++                        // mmap-wrap: demand-paged, no OOM for > RAM models
++                        const size_t align = 32;
++                        size_t aligned_first = (first / align) * align;
++                        buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + aligned_first, last - aligned_first);
++#if defined(__linux__)
++                        if (buf) {
++                            // MADV_RANDOM: expert access is random (routing-dependent),
++                            // disable sequential readahead to avoid wasting I/O bandwidth.
++                            // MADV_HUGEPAGE: enable transparent huge pages (2MB) to reduce
++                            // TLB misses for large expert tensors (~6MB each).
++                            posix_madvise((char *) addr + aligned_first, last - aligned_first, POSIX_MADV_RANDOM);
++                            madvise((char *) addr + aligned_first, last - aligned_first, MADV_HUGEPAGE);
++                        }
++#endif
++                    }
++                    if (buf == nullptr) {
++                        // Non-host buft or mmap-wrap failed — abandon all and fallback
++                        buf_map.clear();
++                        bufs.clear();
++                        goto fallback_alloc;
++                    }
++                    any_failed = true;
++                }
++                bufs.emplace_back(buf);
++                buf_map.emplace(idx, buf);
++            }
++            if (any_failed) {
++                LLAMA_LOG_INFO("%s: %s: %zu shards imported, some via mmap fallback\n",
++                    __func__, ggml_backend_buft_name(buft), bufs.size());
++            }
++        } else if (ml.use_mmap && use_mmap_buffer && (is_default_buft || is_host_buft) && ggml_backend_buft_is_host(buft)) { mmap_wrap:
++            // Host buffer with mmap: wrap mmap directly (demand-paged).
++            // Prevents malloc OOM for models > RAM with --cpu-moe.
++            // Check if model fits in RAM — if so, use pinned alloc instead (faster).
++            {
++#if defined(__linux__)
++                size_t mem_available = 0;
++                FILE * meminfo = fopen("/proc/meminfo", "r");
++                if (meminfo) {
++                    char line[256];
++                    while (fgets(line, sizeof(line), meminfo)) {
++                        if (strncmp(line, "MemAvailable:", 13) == 0) {
++                            mem_available = strtoull(line + 13, nullptr, 10) * 1024;
++                            break;
++                        }
++                    }
++                    fclose(meminfo);
++                }
++                size_t total_tensor_size = 0;
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++                    total_tensor_size += ggml_nbytes(t);
++                }
++                if (mem_available > 0 && total_tensor_size < mem_available * 3 / 4) {
++                    LLAMA_LOG_INFO("%s: %s fits in RAM (%.1f < %.1f GiB), using pinned alloc\n",
++                        __func__, ggml_backend_buft_name(buft),
++                        total_tensor_size / (1024.0 * 1024.0 * 1024.0),
++                        mem_available / (1024.0 * 1024.0 * 1024.0));
+                     goto fallback_alloc;
+                 }
++#endif
++            }
++            GGML_ASSERT(!ml.no_alloc);
++            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
++                void * addr = nullptr;
++                size_t first, last; // NOLINT
++                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
++                if (first >= last) {
++                    continue;
++                }
++                const size_t align = 32;
++                size_t aligned_first = (first / align) * align;
++                ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr((char *) addr + aligned_first, last - aligned_first);
++                if (buf == nullptr) {
++                    goto fallback_alloc;
++                }
++#if defined(__linux__)
++                posix_madvise((char *) addr + aligned_first, last - aligned_first, POSIX_MADV_RANDOM);
++                madvise((char *) addr + aligned_first, last - aligned_first, MADV_HUGEPAGE);
++#endif
+                 bufs.emplace_back(buf);
+                 buf_map.emplace(idx, buf);
+             }
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index f531fc6..ed313d8 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -1261,6 +1261,10 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+ 
+ bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx) {
+     if (!ctx) return false;
++    // Only enable callback in explicit CALLBACK mode.
++    // The eval callback requires synchronous tensor readback from Vulkan
++    // which stalls the GPU pipeline — 3× slower than no callback.
++    // The background prefetch thread (PREFETCH mode) is sufficient.
+     return ctx->mode == MOE_FLASH_MODE_CALLBACK;
+ }
+ 
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 872e659..ea11efe 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -234,6 +234,38 @@ static void llama_params_fit_impl(
+     assert(sum_free >= 0 && sum_projected_used >= 0);
+     LLAMA_LOG_INFO("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
+         __func__, sum_projected_used/MiB, sum_free/MiB);
++
++    // Auto-detect: if tensor_buft_overrides are set (e.g. --cpu-moe), check if the
++    // full model would fit WITHOUT them. If so, clear overrides for better GPU perf.
++    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
++        struct llama_model_params mparams_no_override = *mparams;
++        mparams_no_override.tensor_buft_overrides = nullptr;
++
++        const dmds_t dmds_no_override = llama_get_device_memory_data(
++            path_model, &mparams_no_override, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
++
++        bool fits_without_override = true;
++        int64_t total_free_no = 0, total_used_no = 0;
++        for (size_t id = 0; id < nd; id++) {
++            total_free_no += dmds_no_override[id].free;
++            total_used_no += int64_t(dmds_no_override[id].mb.total()) + margins[id];
++            if (int64_t(dmds_no_override[id].free) - int64_t(dmds_no_override[id].mb.total()) < margins[id]) {
++                fits_without_override = false;
++            }
++        }
++
++        if (fits_without_override) {
++            LLAMA_LOG_INFO("%s: full model fits in device memory (%" PRId64 " MiB needed vs %" PRId64 " MiB free), removing tensor overrides for better performance\n",
++                __func__, total_used_no/MiB, total_free_no/MiB);
++            mparams->tensor_buft_overrides = nullptr;
++            return;
++        } else {
++            LLAMA_LOG_INFO("%s: full model does NOT fit in device memory (%" PRId64 " MiB needed vs %" PRId64 " MiB free), keeping tensor overrides\n",
++                __func__, total_used_no/MiB, total_free_no/MiB);
++            return;
++        }
++    }
++
+     if (nd == 1) {
+         if (projected_free_per_device[0] >= margins[0]) {
+             LLAMA_LOG_INFO("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
+@@ -347,10 +379,6 @@ static void llama_params_fit_impl(
+     if (!tensor_buft_overrides) {
+         throw llama_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
+     }
+-    if (mparams->tensor_buft_overrides && (mparams->tensor_buft_overrides->pattern || mparams->tensor_buft_overrides->buft)) {
+-        throw llama_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
+-    }
+-
+     // step 3: iteratively fill the back to front with "dense" layers
+     //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
+     //   - for a MoE model, same as dense model but with all MoE tensors in system memory

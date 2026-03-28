@@ -1,0 +1,191 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 9fd3f7f..25a3a63 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -340,6 +340,23 @@ extern "C" {
+     // Set a callback to be called for each resulting node during graph compute
+     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+ 
++    // Called when the scheduler performs selective expert copy for MUL_MAT_ID.
++    // Provides the used expert IDs so the caller can prefetch next-layer experts.
++    //   node      - the MUL_MAT_ID node (name contains layer info)
++    //   used_ids  - bitset of selected expert IDs (use ggml_bitset_get to query)
++    //   n_expert  - total number of experts
++    //   user_data - opaque pointer set by the caller
++    typedef void (*ggml_backend_sched_expert_copy_callback)(
++        const struct ggml_tensor * node,
++        const uint32_t * used_ids_bitset,
++        int n_expert,
++        void * user_data);
++
++    GGML_API void ggml_backend_sched_set_expert_copy_callback(
++        ggml_backend_sched_t sched,
++        ggml_backend_sched_expert_copy_callback callback,
++        void * user_data);
++
+     //
+     // Utils
+     //
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 12c1ed9..81431ab 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -724,6 +724,9 @@ struct ggml_backend_sched {
+     ggml_backend_sched_eval_callback callback_eval;
+     void * callback_eval_user_data;
+ 
++    ggml_backend_sched_expert_copy_callback callback_expert_copy;
++    void * callback_expert_copy_user_data;
++
+     char * context_buffer;
+     size_t context_buffer_size;
+ 
+@@ -1522,6 +1525,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+ 
+                         prev_ids_tensor = ids_tensor;
++
++                        // Notify expert copy callback (e.g., for prefetching next-layer experts)
++                        if (sched->callback_expert_copy) {
++                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
++                        }
+                     }
+ 
+                     // group consecutive experts and copy them together
+@@ -1839,6 +1847,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_eval_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_expert_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_copy_callback callback, void * user_data) {
++    GGML_ASSERT(sched);
++    sched->callback_expert_copy = callback;
++    sched->callback_expert_copy_user_data = user_data;
++}
++
+ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     return sched->n_splits;
+diff --git a/include/llama-moe-flash.h b/include/llama-moe-flash.h
+index 0bfd8bb..2b04d6d 100644
+--- a/include/llama-moe-flash.h
++++ b/include/llama-moe-flash.h
+@@ -49,6 +49,12 @@ void * llama_moe_flash_get_user_data(struct llama_moe_flash_context * ctx);
+ // this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
+ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx);
+ 
++// Install prediction-based prefetch on the scheduler.
++// When the scheduler copies selected experts for MUL_MAT_ID, this callback
++// prefetches the same experts for the next layer via posix_fadvise.
++// Call after ggml_backend_sched_new, before first compute.
++void llama_moe_flash_install_sched_hook(struct llama_moe_flash_context * ctx, ggml_backend_sched_t sched);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 5c44941..8819c96 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -408,6 +408,11 @@ void llama_context::sched_reserve() {
+ 
+     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+ 
++    // Install prediction-based expert prefetch hook on the scheduler
++    if (cparams.cb_eval_user_data) {
++        llama_moe_flash_install_sched_hook((llama_moe_flash_context *)cparams.cb_eval_user_data, sched.get());
++    }
++
+     llama_memory_context_ptr mctx;
+     if (memory) {
+         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index ed313d8..a2353c2 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -397,6 +397,15 @@ static int parse_layer_index(const char * name) {
+     return -1;
+ }
+ 
++// Parse layer index from weight tensor name like "blk.5.ffn_gate_up_exps.weight" → 5
++static int parse_blk_layer_index(const char * name) {
++    const char * blk = strstr(name, "blk.");
++    if (blk) {
++        return atoi(blk + 4);
++    }
++    return -1;
++}
++
+ // ── Manifest loader ────────────────────────────────────────────────────
+ 
+ // Minimal JSON parser for manifest.json (avoids external dependency).
+@@ -1053,6 +1062,49 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+     return true;
+ }
+ 
++// ── Expert copy callback (prediction-based prefetch) ───────────────────
++//
++// Called by ggml_backend_sched when it copies selected experts for MUL_MAT_ID.
++// We use the current layer's expert selection to prefetch the NEXT layer's
++// experts from the GGUF file via posix_fadvise. This is based on the
++// observation that expert selection has temporal locality across adjacent layers.
++// Prefetches only K/N_expert of the data (e.g., 8/256 = 3%) vs blind prefetch.
++
++static void moe_flash_expert_copy_cb(
++        const struct ggml_tensor * node,
++        const uint32_t * used_ids_bitset,
++        int n_expert,
++        void * user_data) {
++    auto * ctx = (llama_moe_flash_context *)user_data;
++    if (!ctx || !ctx->enabled || ctx->gguf_src.layers.empty()) return;
++
++    // Parse layer index from the weight tensor name (src[0]: "blk.N.ffn_*_exps")
++    int layer_idx = -1;
++    if (node->src[0]) {
++        layer_idx = parse_blk_layer_index(node->src[0]->name);
++    }
++    if (layer_idx < 0) return;
++
++    // Prefetch next layer's selected experts
++#if defined(__linux__)
++    int target_layer = layer_idx + 1;
++    if (target_layer < (int)ctx->gguf_src.layers.size()) {
++        const gguf_layer_source & ls = ctx->gguf_src.layers[target_layer];
++        for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
++            if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
++            for (const auto & part : ls.experts[eid].parts) {
++                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++            }
++        }
++        ctx->n_prefetch_calls++;
++    }
++#else
++    GGML_UNUSED(used_ids_bitset);
++    GGML_UNUSED(n_expert);
++    GGML_UNUSED(node);
++#endif
++}
++
+ // ── Public API ─────────────────────────────────────────────────────────
+ 
+ struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
+@@ -1297,3 +1349,20 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
+             break;
+     }
+ }
++
++void llama_moe_flash_install_sched_hook(struct llama_moe_flash_context * ctx, ggml_backend_sched_t sched) {
++    if (!ctx || !ctx->enabled || ctx->gguf_src.layers.empty()) return;
++    ggml_backend_sched_set_expert_copy_callback(sched, moe_flash_expert_copy_cb, ctx);
++
++    // Stop the blind background prefetch thread — prediction callback replaces it.
++    // Running both causes I/O contention (kernel readahead fighting targeted fadvise).
++    if (ctx->prefetch_running.load()) {
++        ctx->prefetch_running.store(false);
++        if (ctx->prefetch_thread.joinable()) {
++            ctx->prefetch_thread.join();
++        }
++        fprintf(stderr, "moe-flash: stopped background prefetch thread (replaced by prediction callback)\n");
++    }
++
++    fprintf(stderr, "moe-flash: installed prediction-based expert prefetch\n");
++}

@@ -1,122 +1,8 @@
-diff --git a/common/arg.cpp b/common/arg.cpp
-index 41da856..0f02c30 100644
---- a/common/arg.cpp
-+++ b/common/arg.cpp
-@@ -398,6 +398,7 @@ const std::vector<ggml_type> kv_cache_types = {
-     GGML_TYPE_IQ4_NL,
-     GGML_TYPE_Q5_0,
-     GGML_TYPE_Q5_1,
-+    GGML_TYPE_TQ2_KV,
- };
- 
- static ggml_type kv_cache_type_from_str(const std::string & s) {
-diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 3323f8e..f03c56f 100644
---- a/ggml/include/ggml.h
-+++ b/ggml/include/ggml.h
-@@ -428,7 +428,8 @@ extern "C" {
-         // GGML_TYPE_IQ4_NL_8_8 = 38,
-         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
-         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
--        GGML_TYPE_COUNT   = 41,
-+        GGML_TYPE_TQ2_KV  = 41, // 2-bit KV cache quantization (QK=128, 2.125 bpw)
-+        GGML_TYPE_COUNT   = 42,
-     };
- 
-     // precision
-diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
-index 92cf739..17666f2 100644
---- a/ggml/src/ggml-common.h
-+++ b/ggml/src/ggml-common.h
-@@ -266,6 +266,14 @@ typedef struct {
- } block_tq2_0;
- static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
- 
-+// 2.125 bpw  (KV cache only — QK=128 for head-dim alignment)
-+#define QK_TQ2_KV 128
-+typedef struct {
-+    uint8_t qs[QK_TQ2_KV/4]; // 2 bits per element  (32 bytes)
-+    ggml_half d;              // delta               ( 2 bytes)
-+} block_tq2_kv;
-+static_assert(sizeof(block_tq2_kv) == sizeof(ggml_half) + QK_TQ2_KV / 4, "wrong tq2_kv block size/padding");
-+
- //
- // Super-block quantization structures
- //
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index cdaded8..d5737e2 100644
+index 2281fe0..5ba6cd0 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -2278,6 +2278,68 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
-     return nrow * row_size;
- }
- 
-+// ====================== TQ2_KV (2-bit KV cache quantization, QK=128)
-+
-+void quantize_row_tq2_kv_ref(const float * GGML_RESTRICT x, block_tq2_kv * GGML_RESTRICT y, int64_t k) {
-+    assert(k % QK_TQ2_KV == 0);
-+    const int64_t nb = k / QK_TQ2_KV;
-+
-+    for (int64_t i = 0; i < nb; i++) {
-+        float amax = 0.0f;
-+
-+        for (int j = 0; j < QK_TQ2_KV; j++) {
-+            const float v = x[j];
-+            // NaN/Inf guard
-+            if (v == v && fabsf(v) != INFINITY) {
-+                amax = MAX(amax, fabsf(v));
-+            }
-+        }
-+
-+        const float d = amax;
-+        const float id = d ? 1.0f/d : 0.0f;
-+
-+        y[i].d = GGML_FP32_TO_FP16(d);
-+
-+        for (int j = 0; j < QK_TQ2_KV/4; j++) {
-+            uint8_t q = 0;
-+            for (int n = 0; n < 4; ++n) {
-+                float v = x[j*4 + n];
-+                // NaN/Inf -> 0 (maps to trit 1, i.e. zero)
-+                if (v != v || fabsf(v) == INFINITY) { v = 0.0f; }
-+                int xi = lroundf(v * id) + 1;
-+                if (xi < 0) xi = 0;
-+                if (xi > 2) xi = 2;
-+                q |= (xi & 3) << (2*n);
-+            }
-+            y[i].qs[j] = q;
-+        }
-+        x += QK_TQ2_KV;
-+    }
-+}
-+
-+size_t quantize_tq2_kv(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-+    (void)quant_weights;
-+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_KV, n_per_row);
-+    quantize_row_tq2_kv_ref(src, dst, (int64_t)nrow*n_per_row);
-+    return nrow * row_size;
-+}
-+
-+void dequantize_row_tq2_kv(const block_tq2_kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-+    assert(k % QK_TQ2_KV == 0);
-+    const int64_t nb = k / QK_TQ2_KV;
-+
-+    for (int64_t i = 0; i < nb; ++i) {
-+        const float d = GGML_FP16_TO_FP32(x[i].d);
-+
-+        for (int j = 0; j < QK_TQ2_KV/4; j++) {
-+            for (int n = 0; n < 4; ++n) {
-+                int8_t q = (x[i].qs[j] >> (n*2)) & 3;
-+                *y++ = (float)(q - 1) * d;
-+            }
-+        }
-+    }
-+}
-+
- void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-     assert(k % QK_K == 0);
-     const int64_t nb = k / QK_K;
-@@ -5353,6 +5415,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+@@ -5409,6 +5409,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
              {
                  VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
              } break;
@@ -127,36 +13,8 @@ index cdaded8..d5737e2 100644
          case GGML_TYPE_IQ1_S:
              {
                  VALIDATE_ROW_DATA_D_F16_IMPL(block_iq1_s, data, nb);
-diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
-index 00604f7..f966c23 100644
---- a/ggml/src/ggml-quants.h
-+++ b/ggml/src/ggml-quants.h
-@@ -33,6 +33,7 @@ GGML_API void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K *
- 
- GGML_API void quantize_row_tq1_0_ref(const float * GGML_RESTRICT x, block_tq1_0 * GGML_RESTRICT y, int64_t k);
- GGML_API void quantize_row_tq2_0_ref(const float * GGML_RESTRICT x, block_tq2_0 * GGML_RESTRICT y, int64_t k);
-+GGML_API void quantize_row_tq2_kv_ref(const float * GGML_RESTRICT x, block_tq2_kv * GGML_RESTRICT y, int64_t k);
- 
- GGML_API void quantize_row_iq3_xxs_ref(const float * GGML_RESTRICT x, block_iq3_xxs * GGML_RESTRICT y, int64_t k);
- GGML_API void quantize_row_iq4_nl_ref (const float * GGML_RESTRICT x, block_iq4_nl  * GGML_RESTRICT y, int64_t k);
-@@ -60,6 +61,7 @@ GGML_API void dequantize_row_q8_K(const block_q8_K * GGML_RESTRICT x, float * GG
- 
- GGML_API void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
- GGML_API void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
-+GGML_API void dequantize_row_tq2_kv(const block_tq2_kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
- 
- GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
- GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
-@@ -84,6 +86,7 @@ GGML_API size_t quantize_iq3_s  (const float * GGML_RESTRICT src, void * GGML_RE
- 
- GGML_API size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
- GGML_API size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
-+GGML_API size_t quantize_tq2_kv(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
- 
- GGML_API size_t quantize_q2_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
- GGML_API size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 1bffcdc..9c850cd 100644
+index fcc4c52..39e7c7e 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -3399,11 +3399,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
@@ -376,25 +234,10 @@ index fb89412..ae2ec77 100644
          string_to_spv("set_rows_" + t + "_i32_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
          string_to_spv("set_rows_" + t + "_i64",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index e5b83e1..d89c5e8 100644
+index ae2d5b8..be02a45 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -904,6 +904,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
-         .type_size                = 0,
-         .is_quantized             = false,
-     },
-+    [GGML_TYPE_TQ2_KV] = {
-+        .type_name                = "tq2_kv",
-+        .blck_size                = QK_TQ2_KV,
-+        .type_size                = sizeof(block_tq2_kv),
-+        .is_quantized             = true,
-+        .to_float                 = (ggml_to_float_t) dequantize_row_tq2_kv,
-+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq2_kv_ref,
-+    },
- };
- 
- const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
-@@ -7658,6 +7666,7 @@ size_t ggml_quantize_chunk(
+@@ -7666,6 +7666,7 @@ size_t ggml_quantize_chunk(
          case GGML_TYPE_Q6_K:    result = quantize_q6_K(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
          case GGML_TYPE_TQ1_0:   result = quantize_tq1_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
          case GGML_TYPE_TQ2_0:   result = quantize_tq2_0(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
