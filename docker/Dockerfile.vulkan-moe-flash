@@ -79,3 +79,4 @@ RUN llama-server --version 2>&1 | head -1 && \
 ENV LLAMA_ARG_CPU_MOE=1
 ENV LLAMA_FLASH_MOE_ENABLED=1
 ENV LLAMA_FLASH_MOE_IOURING=1
+# Force rebuild: Sat Mar 28 06:33:51 PM UTC 2026
