@@ -72,88 +72,135 @@ Single-backend architecture with auto-detect `--cpu-moe`:
 
 ---
 
-## Future Directions
+## Completed Investigations
 
-### F1. AMX/AVX512 Expert Kernels (highest impact)
+### F1. AVX512 Expert Kernels — DONE (+134% cold start)
 
-**The bottleneck for >RAM models is CPU expert matmul, not I/O.**
+Enabled AVX512F + VNNI + BF16 in Dockerfile (`GGML_NATIVE=OFF` required for
+cross-compilation). VNNI accelerates the quantized dot product inner loop
+(`_mm256_dpbusd_epi32` replaces 2-step `maddubs + madd`).
 
-Our deepseek runs at 1.8 t/s. KTransformers achieves 28 t/s on the same model by
-replacing ggml-cpu matmul with custom AMX (Advanced Matrix Extensions) kernels for
-the expert FFN layers. AMX provides 8× throughput over AVX512 for BF16/INT8 matmul.
+**Result**: q4km cold start 2.72 → 6.36 t/s (+134%). Warm unchanged (I/O bound).
 
-**Strix Halo has AVX512 but not AMX.** However, AVX512-BF16 + VNNI are available
-and could significantly accelerate expert matmul. Fiddler (ICLR 2025) demonstrates
-AVX512_BF16 CPU kernels achieving competitive expert throughput.
+### F2. Prediction-Based Expert Prefetch — DONE (+12% deepseek warm)
 
-**Approach**: Profile where time is spent in the `--cpu-moe` path. If expert matmul
-dominates (likely), investigate:
-- ggml-cpu AVX512 codegen for MoE expert shapes
-- Custom BLAS dispatch for expert-sized matrices (~6 MB each)
-- Batching multiple expert matmuls to amortize overhead
+Scheduler callback (`ggml_backend_sched_expert_copy_callback`) fires when expert
+IDs are read during MUL_MAT_ID selective copy. Prefetches next-layer experts via
+`posix_fadvise(WILLNEED)` — 8/256 = 3% of data for deepseek vs 100% with blind
+thread. Stops background thread to avoid I/O contention.
 
-**Expected impact**: 3-10× improvement on >RAM models (6-18 t/s for deepseek).
+**Result**: deepseek warm 1.8 → 2.01 t/s (+12%). q4km warm unchanged (~6.2 t/s).
 
-### F2. Prediction-Based Expert Prefetch
+### F3. 1 GB Hugepages — NOT VIABLE
 
-Current approach: background thread blindly cycles through all experts with
-`posix_fadvise(WILLNEED)`. This warms the page cache uniformly but doesn't
-prioritize experts that will actually be selected by the router.
+Hugepages cannot be paged to disk. Our >RAM models (q4km 133 GB, deepseek 228 GB
+on 125 GB RAM) rely on demand paging from NVMe. `MAP_HUGETLB` only works with
+anonymous/hugetlbfs mmap, not file-backed. `MADV_HUGEPAGE` has no effect on
+file-backed mmap (THP only works for anonymous memory). The 10× claim from
+llama.cpp #12444 was startup time only, not inference speed.
 
-**Academic state of the art**:
-- **Fate** (2025): cross-layer gate inputs predict next-layer experts with 97.15%
-  accuracy. Shallow-favoring cache achieves 99.08% hit rate.
-- **PreScope** (2025): learnable layer-aware predictor, async I/O optimizer.
-  141% throughput, 74.6% latency improvement.
-- **DuoServe-MoE** (2025): MLP predictor for next-layer experts, GPU cache sized
-  to exactly K experts.
+### F4. RADV GPU Page Fault — CONFIRMED, NOT FIXABLE
 
-**Approach for our system**: After routing selects K experts for layer N, use the
-gate logits to predict likely experts for layer N+1. Issue targeted `posix_fadvise`
-for only those experts' GGUF regions. This replaces blind prefetch with informed
-prefetch at near-zero cost (gate logits are already computed).
+Re-tested with image `7736644` on Mesa 25.3.6 / kernel 6.18.15 / GFX1151.
+Exit code 139 (SIGSEGV) when compute shaders read from pinned host memory
+(`ggml_vk_host_malloc`). This is NOT the firmware bug (GCVM_L2_PROTECTION_FAULT,
+fixed in linux-firmware 20260110) — it's a fundamental RADV limitation.
+`supports_buft` for Vulkan_Host must remain disabled.
 
-**Challenge**: Requires reading gate logits back from Vulkan, which is the same
-sync stall that made the callback mode 3× slower. Could work if the prediction
-runs on CPU from the routing tensor copy that the scheduler already performs.
+---
 
-**Expected impact**: Better page cache utilization for >RAM models, reducing cold
-expert faults. Most impactful for deepseek (228 GB, only 55% in cache).
+## Investigation Queue
 
-### F3. 1 GB Hugepages
+### I1. Thread Count Tuning
 
-llama.cpp issue #12444 reports **10× speedup** for DeepSeek-R1 using hugetlbfs
-with 1 GB pages. Our patch uses `MADV_HUGEPAGE` for transparent 2 MB hugepages,
-but 1 GB pages eliminate far more TLB pressure: 228 GB model = 228 entries
-(1 GB pages) vs 116,736 entries (2 MB) vs 59,768,832 entries (4 KB).
+Currently `--threads 12` on a 16-core/32-thread Zen 5 CPU. Expert matmul is
+embarrassingly parallel across rows. Testing 16, 24, or 32 threads could improve
+CPU expert throughput.
 
-**Approach**: Pre-allocate 1 GB hugepages at boot (`hugepagesz=1G hugepages=100`),
-mmap expert data from hugetlbfs. Requires kernel configuration and may conflict
-with other memory users.
+**Test**: Change `LLAMA_ARG_THREADS` in backend env and compare q4km/deepseek TPS.
 
-**Expected impact**: Significant for >RAM models where TLB misses compound with
-page faults. Less impactful for ≤RAM models (already fast).
+**Status**: not started
 
-### F4. RADV Driver Fix
+### I2. NVMe Direct I/O with io_uring
 
-Compute shaders can't read from `VK_EXT_external_memory_host` imported or pinned
-host memory on RADV (Mesa 25.2-25.3). If fixed, all expert data could stay in
-Vulkan-accessible host buffers and MUL_MAT_ID could run on GPU with 2 graph splits
-— potentially 20+ t/s for all model sizes regardless of RAM.
+The io_uring infrastructure exists in patch 0001 (SQPOLL + registered buffers)
+but the callback mode was disabled (3× slower from GPU sync). With the scheduler
+callback (0003), we could submit io_uring reads for predicted experts instead of
+posix_fadvise. Direct I/O bypasses the page cache, avoiding kernel overhead.
 
-**Status**: Confirmed on both Strix Halo (GFX1151) and Strix Point (GFX1150).
-Not yet reported upstream. Would require Mesa/RADV investigation.
+**Test**: Modify `moe_flash_expert_copy_cb` to submit io_uring reads instead of
+fadvise. Measure throughput and latency vs fadvise path.
 
-### F5. Upstream the Patch
+**Status**: not started
 
-The mmap-wrap + partial prefetch + auto-detect changes are generic enough to
-benefit any UMA system (AMD APUs, future Intel with Battlemage iGPU, Apple Silicon
-in theory). The patch is clean (456 lines) and non-invasive.
+### I3. Prefetch Lookahead Depth
 
-**Blockers**: The patch modifies `llama_params_fit` behavior (auto-clearing
-user-set overrides), which may be controversial upstream. The mmap-wrap in
-`llama-model.cpp` adds a new code path with `goto` labels. Would need cleanup
-and testing on CUDA/Metal backends.
+Currently prefetch layer N+1 from layer N's routing. Could prefetch N+2 or N+3
+as well. Marginal cost of extra fadvise calls is near-zero. Deeper lookahead
+gives more time for kernel readahead to complete before the data is needed.
+
+**Test**: Add `lookahead` parameter to `moe_flash_expert_copy_cb`, test 1/2/3.
+
+**Status**: not started
+
+### I4. AMDVLK vs RADV
+
+Community benchmarks show AMDVLK is 16% faster than RADV for token generation
+on Strix Halo. Our Docker image uses RADV. Switching could give a free boost.
+AMDVLK might also not have the pinned memory GPU page fault.
+
+**Test**: Build image with AMDVLK driver, run full benchmark suite.
+
+**Status**: not started
+
+### I5. Expert Frequency Caching
+
+For deepseek (256 experts, 8 selected per token), some experts are "hot"
+(selected frequently). Track expert selection frequency per layer and pin hot
+experts in RAM via `mlock()`. Cold experts page-fault from NVMe.
+
+**Test**: Log expert frequencies during inference, identify hot/cold distribution.
+If skewed, implement frequency-based pinning.
+
+**Status**: not started
+
+### I6. TQ2_KV Testing
+
+Patches 0004+0005 add TQ2_KV 2-bit KV cache quantization. Not yet tested on
+real inference. Should reduce KV cache 7.5× (3 GB → 0.4 GB at 8K context).
+
+**Test**: Run Q2K with `-ctk tq2_kv -ctv tq2_kv`, verify quality and memory.
+
+**Status**: not started
+
+### I7. Context Size Scaling
+
+With TQ2_KV freeing memory, push Q2K to 32K or 64K context. Measure quality
+impact of 2-bit KV at long context lengths.
+
+**Test**: Benchmark at 8K/16K/32K with TQ2_KV vs F16 KV cache.
+
+**Status**: not started
+
+### I8. Batch Size Tuning
+
+Current config: batch=4096, ubatch=1024. For single-user, smaller batch may
+reduce latency. For throughput, larger ubatch may help GPU utilization.
+
+**Test**: Sweep batch sizes on Q2K and q4km.
+
+**Status**: not started
+
+### I9. GGUF Tensor Reordering
+
+Expert tensors for the same layer are interleaved with attention tensors in GGUF
+files. If they were contiguous, sequential readahead would be more effective for
+the mmap-wrap path.
+
+**Test**: Analyze GGUF layout, estimate potential readahead improvement. Would
+require a custom GGUF repacker tool.
+
+**Status**: not started
 
 ---
 
