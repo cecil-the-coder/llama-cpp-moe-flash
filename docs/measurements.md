@@ -1,33 +1,42 @@
 # Measurements
 
-## Final Performance (image `662f798`, AVX512+VNNI+BF16, prediction prefetch)
+## Final Performance (image `1cb6d44`, AVX512+VNNI+BF16, 16 threads)
 
 Single backend (cpumoe, CPU_MOE=1) with auto-detect on shadow node (AMD Strix Halo, 125 GB RAM, 120 GB GTT):
 
 | Model | Size | TPS | Loading |
 |---|---|---|---|
 | glm-4-7-flash | 17 GB | **50.57** | standard (full GPU offload) |
-| qwen3-235b Q2_K | 80 GB | **20.47** | standard (full GPU offload) |
-| qwen3-235b Q4_K_M | 133 GB | 5.95→**6.35** | patched: mmap experts + prediction prefetch |
-| deepseek-r1-0528 | 228 GB | 1.67→**2.01** | patched: mmap experts + prediction prefetch |
+| qwen3-235b Q2_K | 80 GB | **20.35-20.96** | standard (full GPU offload) |
+| qwen3-235b Q4_K_M | 133 GB | 6.26→**6.73** | patched: mmap experts + bg prefetch |
+| deepseek-r1-0528 | 228 GB | 1.63→**~2.0** | patched: mmap experts + bg prefetch |
 
-### Optimization Impact (CPU expert matmul path)
+### Optimization Impact (CPU expert matmul path, q4km)
 
-| Optimization | q4km cold | q4km warm | deepseek warm |
-|---|---|---|---|
-| Baseline (AVX2, blind prefetch) | 2.72 | 5.89-6.3 | 1.78-1.88 |
-| + AVX512 VNNI + BF16 | **6.36** (+134%) | 6.2 | ~1.8 |
-| + Prediction prefetch (no bg thread) | 5.95 | **6.35** | **2.01** (+12%) |
+| Optimization | Cold | Warm |
+|---|---|---|
+| Baseline (AVX2, 12 threads) | 2.72 | 5.89-6.3 |
+| + AVX512 VNNI + BF16 | **6.36** (+134%) | 6.2 |
+| + 16 threads (was 12) | 6.70 | **6.93** (+7%) |
 
 **AVX512 VNNI**: Accelerates quantized dot product inner loop (`_mm256_dpbusd_epi32`
 replaces 2-step `maddubs + madd`). 2.3× cold start improvement. Warm unchanged (I/O bound).
 
-**Prediction prefetch**: Scheduler callback prefetches next-layer experts based on current
-layer's routing selection (8/256 = 3% of data for deepseek, vs 100% with blind thread).
-10-12% warm improvement on deepseek (228 GB, 55% cached) where cache misses dominate.
-Replaces blind background thread to avoid I/O contention.
+**Thread tuning**: 16 threads optimal on 16-core Zen 5. 24 threads regresses from
+UMA memory bandwidth contention (CPU and GPU share memory controller).
 
-GPU-path models (Q2K, glm) unaffected — both optimizations only help CPU expert matmul.
+### Investigations with No Benefit
+
+| Investigation | Result |
+|---|---|
+| Prediction prefetch (F2) | No-op: scheduler callback never fires with --cpu-moe |
+| io_uring bg prefetch (I2) | No benefit over posix_fadvise |
+| Lookahead depth (I3) | No benefit, extra syscall overhead |
+| AMDVLK (I4) | 8-10× slower tg, discontinued |
+| 1 GB hugepages (F3) | Not viable for >RAM models (can't page to disk) |
+| RADV supports_buft (F4) | GPU page fault confirmed (exit 139) |
+
+GPU-path models (Q2K, glm) unaffected by CPU optimizations — already at full Vulkan speed.
 
 ### RADV Driver Findings
 - `maxBufferSize` = 2-4 GiB (can't import large shard ranges)
