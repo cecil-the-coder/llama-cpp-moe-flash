@@ -99,7 +99,7 @@ index 5c44941..8819c96 100644
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index f531fc6..c0783ff 100644
+index f531fc6..b93d195 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
 @@ -339,6 +339,20 @@ static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
@@ -139,7 +139,7 @@ index f531fc6..c0783ff 100644
  // ── Manifest loader ────────────────────────────────────────────────────
  
  // Minimal JSON parser for manifest.json (avoids external dependency).
-@@ -1053,6 +1076,100 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+@@ -1053,6 +1076,64 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
      return true;
  }
  
@@ -173,74 +173,38 @@ index f531fc6..c0783ff 100644
 +    }
 +    if (layer_idx < 0) return;
 +
-+    // Prefetch next layer's selected experts
-+    int target_layer = layer_idx + 1;
++    // Prefetch selected experts for the next few layers (lookahead).
++    // Deeper lookahead gives more time for kernel readahead to complete.
++    // Cost is ~K*3 fadvise syscalls per lookahead layer (K=8 experts, 3 parts each).
++    for (int ahead = 1; ahead <= 3; ahead++) {
++        int target_layer = layer_idx + ahead;
 +
-+    // Look up target layer via the index map
-+    auto it = ctx->gguf_src.layer_idx_to_pos.find(target_layer);
-+    if (it == ctx->gguf_src.layer_idx_to_pos.end()) return;
-+    int pos = it->second;
-+    if (pos < 0 || pos >= (int)ctx->gguf_src.layers.size()) return;
-+    const gguf_layer_source & ls = ctx->gguf_src.layers[pos];
++        auto it = ctx->gguf_src.layer_idx_to_pos.find(target_layer);
++        if (it == ctx->gguf_src.layer_idx_to_pos.end()) continue;
++        int pos = it->second;
++        if (pos < 0 || pos >= (int)ctx->gguf_src.layers.size()) continue;
++        const gguf_layer_source & ls = ctx->gguf_src.layers[pos];
++        if (ls.fd < 0) continue;
 +
-+    // Validate the file descriptor before any I/O
-+    if (ls.fd < 0) return;
-+
-+#if defined(GGML_USE_IOURING)
-+    if (ctx->iouring_pf.ring_initialized) {
-+        // io_uring async read path — fire-and-forget page cache warming
-+        iouring_prefetcher * pf = &ctx->iouring_pf;
-+
-+        // Drain completed CQEs from previous calls to prevent overflow
-+        iouring_prefetcher_drain_cqes(pf);
-+
-+        // Thread-local scratch buffer for read sink (only page cache side effect matters)
-+        static thread_local char scratch[128 * 1024];
-+
-+        int submitted = 0;
++#if defined(__linux__)
 +        for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
 +            if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
 +            for (const auto & part : ls.experts[eid].parts) {
-+                struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
-+                if (!sqe) goto submit;
-+
-+                size_t read_size = std::min(part.size, sizeof(scratch));
-+                io_uring_prep_read(sqe, ls.fd, scratch, read_size, part.offset);
-+                io_uring_sqe_set_data(sqe, nullptr);
-+                pf->n_pending++;
-+                submitted++;
++                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
 +            }
 +        }
-+
-+submit:
-+        if (submitted > 0) {
-+            io_uring_submit(&pf->ring);
-+            pf->n_submits++;
-+        }
-+        ctx->n_prefetch_calls++;
-+        return;
-+    }
 +#endif
-+
-+#if defined(__linux__)
-+    // Fallback: posix_fadvise
-+    for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
-+        if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
-+        for (const auto & part : ls.experts[eid].parts) {
-+            posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
-+        }
 +    }
 +    ctx->n_prefetch_calls++;
-+#else
-+    GGML_UNUSED(used_ids_bitset);
++
 +    GGML_UNUSED(n_expert);
-+#endif
++    GGML_UNUSED(used_ids_bitset);
 +}
 +
  // ── Public API ─────────────────────────────────────────────────────────
  
  struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
-@@ -1293,3 +1410,34 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
+@@ -1293,3 +1374,34 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
              break;
      }
  }
