@@ -1,24 +1,23 @@
 # Patches
 
-Patches against llama.cpp main branch for io_uring expert streaming.
-
-## Status
-
-Patch 0001 is complete and tested. See `docs/plan.md` for full status.
+Patches against llama.cpp `b8298` for MoE flash expert streaming + Vulkan UMA offload + TQ2_KV.
 
 ## Patches
 
-| File | Description | Phase | Status |
-|---|---|---|---|
-| `0001-moe-flash-complete.patch` | Eval callback + fadvise + io_uring staging + GGUF warmcache | P2–P3 | Done |
-| `0003-vulkan-expert-copy-staging.patch` | vkCmdCopyBuffer staging → Vulkan buffer | P3.1 | Planned |
-| `0004-vulkan-shader-indirection.patch` | Shader indirection table (skip copy) | P3.3 | If needed |
+| File | Description |
+|---|---|
+| `0001-moe-flash-complete.patch` | Core moe-flash feature: eval callback, fadvise, io_uring staging, GGUF warmcache, auto-detect --cpu-moe |
+| `0002-moe-expert-offload.patch` | Vulkan_Host CPU buffer interface (not vk_buffer_context), supports_buft removal |
+| `0003-tq2-kv.patch` | TQ2_KV 2-bit KV cache type: type system, encode/decode with NaN guard, GLSL shaders, Vulkan backend, tests |
 
 ## Applying
 
 ```bash
-cd /workspace/llama-cpp-moe-flash/llama.cpp  # cloned in P2.1
-git am ../patches/0001-*.patch
+git clone --depth 1 --branch b8298 https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+git apply ../patches/0001-moe-flash-complete.patch
+git apply ../patches/0002-moe-expert-offload.patch
+git apply ../patches/0003-tq2-kv.patch
 ```
 
 ## Base commit
@@ -26,12 +25,5 @@ git am ../patches/0001-*.patch
 ```
 Tag:    b8298
 Commit: f90bd1dd (llama : whitespace cleanup (#20422))
-Date:   2026-03-23 (confirmed in running container)
-```
-
-To checkout:
-```bash
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-git checkout b8298
+Date:   2026-03-23
 ```
