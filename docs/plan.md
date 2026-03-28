@@ -184,14 +184,22 @@ bitset is built (line 1510 of ggml-cpu.c).
 
 **Status**: blocked — needs a CPU-side hook, not scheduler-side
 
-### I6. TQ2_KV Testing
+### I6. TQ2_KV Testing — PARTIALLY BLOCKED
 
-Patches 0004+0005 add TQ2_KV 2-bit KV cache quantization. Not yet tested on
-real inference. Should reduce KV cache 7.5× (3 GB → 0.4 GB at 8K context).
+TQ2_KV type system is in the binary (`tq2_kv` string present, type_traits
+registered, encode/decode compiled). However:
+- `LLAMA_ARG_CACHE_TYPE_K=tq2_kv` env var: silently falls back to q4_0
+- `--cache-type-k tq2_kv` CLI arg: breaks pod creation (controller error)
+- KV cache always shows `K (q4_0)` regardless of config
 
-**Test**: Run Q2K with `-ctk tq2_kv -ctv tq2_kv`, verify quality and memory.
+The silent fallback suggests `kv_cache_type_from_str("tq2_kv")` isn't matching,
+possibly because the kv_cache_types entry (patch 0004) didn't compile in
+correctly, or Docker cache served a stale binary.
 
-**Status**: not started
+**Next step**: Test locally with a fresh build (`cmake && ./bin/llama-server -ctk tq2_kv`)
+to isolate whether the issue is type recognition or backend support.
+
+**Status**: blocked — needs local debugging
 
 ### I7. Context Size Scaling
 
