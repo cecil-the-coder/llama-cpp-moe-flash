@@ -1,0 +1,75 @@
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index ed313d8..7e9944b 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -874,6 +874,18 @@ static void prefetch_thread_fn(llama_moe_flash_context * ctx) {
+             ctx->gguf_src.layers.size(),
+             ctx->gguf_src.layers.empty() ? 0 : ctx->gguf_src.layers[0].n_experts);
+ 
++#if defined(GGML_USE_IOURING)
++    // io_uring path: submit reads in batches, drain completions, repeat.
++    // Reads go into a small scratch buffer — only the page cache side effect matters.
++    const bool use_iouring = ctx->iouring_pf.ring_initialized;
++    static thread_local char scratch[128 * 1024]; // 128 KB sink
++    if (use_iouring) {
++        fprintf(stderr, "moe-flash: prefetch thread using io_uring (fire-and-forget)\n");
++    }
++#else
++    const bool use_iouring = false;
++#endif
++
+     int last_signal = 0;
+ 
+     while (ctx->prefetch_running.load(std::memory_order_relaxed)) {
+@@ -885,7 +897,7 @@ static void prefetch_thread_fn(llama_moe_flash_context * ctx) {
+         }
+         last_signal = sig;
+ 
+-        // Cycle through all MoE layers, advising 2-3 layers at a time
++        // Cycle through all MoE layers
+         for (size_t li = 0; li < ctx->gguf_src.layers.size(); li++) {
+             if (!ctx->prefetch_running.load(std::memory_order_relaxed)) break;
+ 
+@@ -893,6 +905,30 @@ static void prefetch_thread_fn(llama_moe_flash_context * ctx) {
+             for (int e = 0; e < ls.n_experts; e++) {
+                 const gguf_expert_region & region = ls.experts[e];
+                 for (const auto & part : region.parts) {
++#if defined(GGML_USE_IOURING)
++                    if (use_iouring) {
++                        iouring_prefetcher * pf = &ctx->iouring_pf;
++                        // Drain completed CQEs to prevent overflow
++                        struct io_uring_cqe * cqe;
++                        while (io_uring_peek_cqe(&pf->ring, &cqe) == 0) {
++                            if (cqe->res >= 0) pf->total_bytes_read += cqe->res;
++                            io_uring_cqe_seen(&pf->ring, cqe);
++                            pf->n_pending--;
++                        }
++
++                        struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
++                        if (sqe) {
++                            size_t read_size = std::min(part.size, sizeof(scratch));
++                            io_uring_prep_read(sqe, ls.fd, scratch, read_size, part.offset);
++                            io_uring_sqe_set_data(sqe, nullptr);
++                            pf->n_pending++;
++                            io_uring_submit(&pf->ring);
++                            pf->n_submits++;
++                        }
++                        ctx->prefetch_madvise_calls++;
++                        continue;
++                    }
++#endif
+                     posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
+                     ctx->prefetch_madvise_calls++;
+                 }
+@@ -900,8 +936,9 @@ static void prefetch_thread_fn(llama_moe_flash_context * ctx) {
+         }
+     }
+ 
+-    fprintf(stderr, "moe-flash: prefetch thread stopped (%lld advise calls)\n",
+-            (long long)ctx->prefetch_madvise_calls);
++    fprintf(stderr, "moe-flash: prefetch thread stopped (%lld calls, %s)\n",
++            (long long)ctx->prefetch_madvise_calls,
++            use_iouring ? "io_uring" : "fadvise");
+ }
+ #endif
+ 
