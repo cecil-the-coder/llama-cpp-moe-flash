@@ -17,13 +17,11 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
 
 COPY patches/0001-moe-flash-complete.patch /build/
 COPY patches/0002-moe-gpu-expert-offload.patch /build/
-COPY patches/0003-tq2-kv-type-system.patch /build/
 COPY patches/0004-tq2-kv-glsl-shaders.patch /build/
 COPY patches/0005-tq2-kv-vulkan-backend.patch /build/
 COPY patches/0006-tq2-kv-tests.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
     && git apply /build/0002-moe-gpu-expert-offload.patch \
-    && git apply /build/0003-tq2-kv-type-system.patch \
     && git apply /build/0004-tq2-kv-glsl-shaders.patch \
     && git apply /build/0005-tq2-kv-vulkan-backend.patch \
     && git apply /build/0006-tq2-kv-tests.patch
