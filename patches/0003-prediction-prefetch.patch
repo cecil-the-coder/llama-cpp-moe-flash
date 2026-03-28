@@ -27,7 +27,7 @@ index 9fd3f7f..25a3a63 100644
      // Utils
      //
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 12c1ed9..81431ab 100644
+index bc57df2..927d643 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -724,6 +724,9 @@ struct ggml_backend_sched {
@@ -52,7 +52,7 @@ index 12c1ed9..81431ab 100644
                      }
  
                      // group consecutive experts and copy them together
-@@ -1839,6 +1847,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1828,6 +1836,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
@@ -99,10 +99,31 @@ index 5c44941..8819c96 100644
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index ed313d8..a2353c2 100644
+index f531fc6..4d17a6e 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
-@@ -397,6 +397,15 @@ static int parse_layer_index(const char * name) {
+@@ -339,6 +339,20 @@ static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
+     pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
+ }
+ 
++// Non-blocking drain: reap any completed CQEs without waiting.
++// Must be called periodically to prevent CQ overflow.
++static int iouring_prefetcher_drain_cqes(iouring_prefetcher * pf) {
++    int reaped = 0;
++    struct io_uring_cqe * cqe;
++    while (io_uring_peek_cqe(&pf->ring, &cqe) == 0) {
++        if (cqe->res >= 0) pf->total_bytes_read += cqe->res;
++        pf->n_pending--;
++        io_uring_cqe_seen(&pf->ring, cqe);
++        reaped++;
++    }
++    return reaped;
++}
++
+ #endif // GGML_USE_IOURING
+ 
+ // ── Mode enum ─────────────────────────────────────────────────────────
+@@ -397,6 +411,15 @@ static int parse_layer_index(const char * name) {
      return -1;
  }
  
@@ -118,7 +139,7 @@ index ed313d8..a2353c2 100644
  // ── Manifest loader ────────────────────────────────────────────────────
  
  // Minimal JSON parser for manifest.json (avoids external dependency).
-@@ -1053,6 +1062,49 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+@@ -1053,6 +1076,88 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
      return true;
  }
  
@@ -146,29 +167,68 @@ index ed313d8..a2353c2 100644
 +    if (layer_idx < 0) return;
 +
 +    // Prefetch next layer's selected experts
-+#if defined(__linux__)
 +    int target_layer = layer_idx + 1;
-+    if (target_layer < (int)ctx->gguf_src.layers.size()) {
-+        const gguf_layer_source & ls = ctx->gguf_src.layers[target_layer];
++
++    // Look up target layer via the index map
++    auto it = ctx->gguf_src.layer_idx_to_pos.find(target_layer);
++    if (it == ctx->gguf_src.layer_idx_to_pos.end()) return;
++    const gguf_layer_source & ls = ctx->gguf_src.layers[it->second];
++
++#if defined(GGML_USE_IOURING)
++    if (ctx->iouring_pf.ring_initialized) {
++        // io_uring async read path — fire-and-forget page cache warming
++        iouring_prefetcher * pf = &ctx->iouring_pf;
++
++        // Drain completed CQEs from previous calls to prevent overflow
++        iouring_prefetcher_drain_cqes(pf);
++
++        // Thread-local scratch buffer for read sink (only page cache side effect matters)
++        static thread_local char scratch[128 * 1024];
++
++        int submitted = 0;
 +        for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
 +            if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
 +            for (const auto & part : ls.experts[eid].parts) {
-+                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++                struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
++                if (!sqe) goto submit;
++
++                size_t read_size = std::min(part.size, sizeof(scratch));
++                io_uring_prep_read(sqe, ls.fd, scratch, read_size, part.offset);
++                io_uring_sqe_set_data(sqe, nullptr);
++                pf->n_pending++;
++                submitted++;
 +            }
 +        }
++
++submit:
++        if (submitted > 0) {
++            io_uring_submit(&pf->ring);
++            pf->n_submits++;
++        }
 +        ctx->n_prefetch_calls++;
++        return;
 +    }
++#endif
++
++#if defined(__linux__)
++    // Fallback: posix_fadvise
++    for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
++        if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
++        for (const auto & part : ls.experts[eid].parts) {
++            posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++        }
++    }
++    ctx->n_prefetch_calls++;
 +#else
 +    GGML_UNUSED(used_ids_bitset);
 +    GGML_UNUSED(n_expert);
-+    GGML_UNUSED(node);
 +#endif
 +}
 +
  // ── Public API ─────────────────────────────────────────────────────────
  
  struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
-@@ -1297,3 +1349,20 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
+@@ -1293,3 +1398,34 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
              break;
      }
  }
@@ -186,6 +246,20 @@ index ed313d8..a2353c2 100644
 +        }
 +        fprintf(stderr, "moe-flash: stopped background prefetch thread (replaced by prediction callback)\n");
 +    }
++
++#if defined(GGML_USE_IOURING)
++    // Initialize io_uring for the prediction callback if not already done.
++    // The callback uses a small scratch buffer so we only need a lightweight ring
++    // (no staging slots needed — the reads are fire-and-forget for page cache warming).
++    if (!ctx->iouring_pf.ring_initialized) {
++        // Use a minimal slot size since we only read into a 128KB scratch buffer
++        if (iouring_prefetcher_init(&ctx->iouring_pf, 1, 128 * 1024)) {
++            fprintf(stderr, "moe-flash: io_uring ring initialized for prediction callback\n");
++        } else {
++            fprintf(stderr, "moe-flash: io_uring init failed, using posix_fadvise fallback\n");
++        }
++    }
++#endif
 +
 +    fprintf(stderr, "moe-flash: installed prediction-based expert prefetch\n");
 +}
