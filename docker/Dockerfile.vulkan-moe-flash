@@ -16,12 +16,10 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 COPY patches/0001-moe-flash-complete.patch /build/
-COPY patches/0002-moe-expert-offload.patch /build/
 COPY patches/0003-prediction-prefetch.patch /build/
 COPY patches/0004-tq2-kv.patch /build/
 COPY patches/0005-tq2-kv-vulkan.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
-    && git apply /build/0002-moe-expert-offload.patch \
     && git apply /build/0003-prediction-prefetch.patch \
     && git apply /build/0004-tq2-kv.patch \
     && git apply /build/0005-tq2-kv-vulkan.patch
