@@ -99,7 +99,7 @@ index 5c44941..8819c96 100644
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index f531fc6..1b5b1d6 100644
+index f531fc6..c0783ff 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
 @@ -339,6 +339,20 @@ static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
@@ -159,9 +159,9 @@ index f531fc6..1b5b1d6 100644
 +    auto * ctx = (llama_moe_flash_context *)user_data;
 +    if (!ctx || !ctx->enabled || ctx->gguf_src.layers.empty()) return;
 +
-+    // If the expert weight tensor lives on a non-host (GPU) buffer, there is
-+    // nothing to prefetch from disk — the data is already in device memory.
-+    if (node->src[0] && node->src[0]->buffer &&
++    // Skip prefetch if expert weights are on GPU or buffer isn't assigned yet
++    // (during sched_reserve, buffers are null — nothing to prefetch)
++    if (!node->src[0] || !node->src[0]->buffer ||
 +        !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
 +        return;
 +    }
