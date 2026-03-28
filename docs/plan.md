@@ -128,22 +128,23 @@ Tested 12, 16, 24 threads on 16-core/32-thread Zen 5.
 **16 threads is optimal**. 24 regresses from memory bandwidth contention (CPU and
 GPU share the same memory controller on UMA). Set permanently in backend config.
 
-### I2. NVMe Direct I/O with io_uring — BLOCKED (SIGSEGV)
+### I2. NVMe Direct I/O with io_uring — NO BENEFIT
 
-Implemented io_uring async reads in `moe_flash_expert_copy_cb` (fire-and-forget
-page cache warming with 128KB scratch buffer). Build succeeds and io_uring ring
-initializes correctly. However, Q2K (GPU-only path) crashes with SIGSEGV (exit 139)
-during inference despite guards for null buffers and GPU-only tensors.
+**First attempt** (scheduler callback): SIGSEGV because the callback never fires
+with --cpu-moe (discovered in I5). The crash was from other code in the callback.
 
-The crash occurs after model loading succeeds (graph splits=1) — during the first
-inference request. Root cause not yet identified. Possibly the callback fires during
-`sched_reserve` with invalid tensor state, or the io_uring ring conflicts with the
-existing moe-flash ring from patch 0001.
+**Second attempt** (background prefetch thread): Modified the blind prefetch thread
+to use io_uring fire-and-forget reads (128KB scratch buffer) instead of posix_fadvise.
+Works correctly but shows **no measurable improvement**:
 
-**Attempted fixes**: is_host guard, null buffer check — both insufficient.
-**Rollback**: Production on `f58e4c6` (posix_fadvise only, no io_uring in callback).
+| Path | q4km warm |
+|---|---|
+| posix_fadvise | 6.70-6.73 t/s |
+| io_uring reads | 6.72-6.78 t/s |
 
-**Status**: blocked — needs debugging with GDB or Vulkan validation layer
+Both just hint the kernel to readahead pages. The mechanism (fadvise syscall vs
+io_uring read into scratch) doesn't matter when the bottleneck is NVMe bandwidth
+and page fault latency, not syscall overhead.
 
 ### I3. Prefetch Lookahead Depth — NO BENEFIT
 
