@@ -154,15 +154,14 @@ The extra fadvise syscalls (72 per layer vs 24) cost more than the prefetch
 benefit. Expert selection locality across 3 layers isn't high enough to justify
 3× the I/O hints. Reverted to lookahead=1.
 
-### I4. AMDVLK vs RADV
+### I4. AMDVLK vs RADV — NOT VIABLE
 
-Community benchmarks show AMDVLK is 16% faster than RADV for token generation
-on Strix Halo. Our Docker image uses RADV. Switching could give a free boost.
-AMDVLK might also not have the pinned memory GPU page fault.
+AMDVLK was discontinued Sep 2025 (last release v-2025.Q2.1). Benchmarks from
+kyuz0/amd-strix-halo-toolboxes show AMDVLK is **8-10× slower on token generation
+for large models** (Qwen3-235B: 2.1 vs 18.1 t/s). Only wins prompt processing.
+Reports half the shared memory (32 KB vs 64 KB). GPU page fault issue is worse.
 
-**Test**: Build image with AMDVLK driver, run full benchmark suite.
-
-**Status**: not started
+RADV remains the correct choice for MoE inference on Strix Halo.
 
 ### I5. Expert Frequency Caching
 
