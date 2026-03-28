@@ -25,7 +25,7 @@ index 3323f8e..fede27d 100644
  
      // precision
 diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
-index 92cf739..903933b 100644
+index 92cf739..73fc813 100644
 --- a/ggml/src/ggml-common.h
 +++ b/ggml/src/ggml-common.h
 @@ -266,6 +266,15 @@ typedef struct {
@@ -37,7 +37,7 @@ index 92cf739..903933b 100644
 +// 2.125 bpw KV cache quantization
 +typedef struct {
 +    ggml_half d;        // scale: max_abs / 1.5
-+    uint8_t   qs[32];   // 128 × 2-bit packed, 4 per byte; q∈{0,1,2,3} → {-1.5d,-0.5d,+0.5d,+1.5d}
++    uint8_t   qs[32];   // 128 x 2-bit packed, 4 per byte
 +} block_tq2_kv;
 +static_assert(sizeof(block_tq2_kv) == 34, "wrong block_tq2_kv size");
 +
@@ -45,13 +45,14 @@ index 92cf739..903933b 100644
  // Super-block quantization structures
  //
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index cdaded8..2281fe0 100644
+index cdaded8..e455793 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -2336,6 +2336,62 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
+@@ -2336,6 +2336,69 @@ void dequantize_row_tq2_0(const block_tq2_0 * GGML_RESTRICT x, float * GGML_REST
      }
  }
  
++
 +// TQ2_KV: 2.125 bpw KV cache quantization (128-element block, symmetric 4-level)
 +
 +void quantize_row_tq2_kv_ref(const float * GGML_RESTRICT x, block_tq2_kv * GGML_RESTRICT y, int64_t k) {
@@ -108,11 +109,17 @@ index cdaded8..2281fe0 100644
 +    }
 +}
 +
++size_t quantize_tq2_kv(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix) {
++    (void)imatrix;
++    const size_t row_size = ggml_row_size(GGML_TYPE_TQ2_KV, n_per_row);
++    quantize_row_tq2_kv_ref(src, dst, (int64_t)nrows * n_per_row);
++    return nrows * row_size;
++}
  // ====================== "True" 2-bit (de)-quantization
  
  void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
 diff --git a/ggml/src/ggml-quants.h b/ggml/src/ggml-quants.h
-index 00604f7..455099e 100644
+index 00604f7..f966c23 100644
 --- a/ggml/src/ggml-quants.h
 +++ b/ggml/src/ggml-quants.h
 @@ -33,6 +33,7 @@ GGML_API void quantize_row_q8_K_ref(const float * GGML_RESTRICT x, block_q8_K *
@@ -131,6 +138,14 @@ index 00604f7..455099e 100644
  
  GGML_API void dequantize_row_iq2_xxs(const block_iq2_xxs * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
  GGML_API void dequantize_row_iq2_xs (const block_iq2_xs  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+@@ -84,6 +86,7 @@ GGML_API size_t quantize_iq3_s  (const float * GGML_RESTRICT src, void * GGML_RE
+ 
+ GGML_API size_t quantize_tq1_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
++GGML_API size_t quantize_tq2_kv(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ 
+ GGML_API size_t quantize_q2_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
+ GGML_API size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
 index e5b83e1..ae2d5b8 100644
 --- a/ggml/src/ggml.c

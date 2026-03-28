@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-quants.c b/ggml/src/ggml-quants.c
-index 2281fe0..5ba6cd0 100644
+index e455793..c0a6b6e 100644
 --- a/ggml/src/ggml-quants.c
 +++ b/ggml/src/ggml-quants.c
-@@ -5409,6 +5409,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
+@@ -5416,6 +5416,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
              {
                  VALIDATE_ROW_DATA_D_F16_IMPL(block_tq2_0, data, nb);
              } break;
