@@ -82,14 +82,18 @@ cross-compilation). VNNI accelerates the quantized dot product inner loop
 
 **Result**: q4km cold start 2.72 → 6.36 t/s (+134%). Warm unchanged (I/O bound).
 
-### F2. Prediction-Based Expert Prefetch — DONE (+12% deepseek warm)
+### F2. Prediction-Based Expert Prefetch — NO-OP WITH --cpu-moe
 
 Scheduler callback (`ggml_backend_sched_expert_copy_callback`) fires when expert
-IDs are read during MUL_MAT_ID selective copy. Prefetches next-layer experts via
-`posix_fadvise(WILLNEED)` — 8/256 = 3% of data for deepseek vs 100% with blind
-thread. Stops background thread to avoid I/O contention.
+IDs are copied between backends for MUL_MAT_ID. However, with `--cpu-moe`, all
+expert data stays on CPU — no cross-backend copy — **callback never fires**.
+Confirmed via I5 instrumentation: 0 callbacks, 0 prefetch calls.
 
-**Result**: deepseek warm 1.8 → 2.01 t/s (+12%). q4km warm unchanged (~6.2 t/s).
+The earlier "12% improvement" on deepseek was measurement noise. The callback
+architecture only works when experts are split across GPU/CPU backends (the
+`supports_buft` path blocked by RADV GPU page fault).
+
+The blind background prefetch thread is still the effective prefetch mechanism.
 
 ### F3. 1 GB Hugepages — NOT VIABLE
 
@@ -163,16 +167,21 @@ Reports half the shared memory (32 KB vs 64 KB). GPU page fault issue is worse.
 
 RADV remains the correct choice for MoE inference on Strix Halo.
 
-### I5. Expert Frequency Caching
+### I5. Expert Frequency Caching — BLOCKED (callback doesn't fire)
 
-For deepseek (256 experts, 8 selected per token), some experts are "hot"
-(selected frequently). Track expert selection frequency per layer and pin hot
-experts in RAM via `mlock()`. Cold experts page-fault from NVMe.
+Added frequency tracking to prediction callback. Discovered that with `--cpu-moe`,
+the scheduler's expert copy callback **never fires** (0 callbacks in 501 pre_graph
+calls). All expert data stays on CPU → no cross-backend copy → no callback.
 
-**Test**: Log expert frequencies during inference, identify hot/cold distribution.
-If skewed, implement frequency-based pinning.
+This also invalidates F2 (prediction prefetch) and I3 (lookahead) — both were
+no-ops. The "improvements" measured earlier were noise.
 
-**Status**: not started
+**Key finding**: The prediction prefetch architecture requires a different hook
+point — not the scheduler's selective copy, but the CPU MUL_MAT_ID dispatch
+itself. Need to hook into `ggml_compute_forward_mul_mat_id` where the `used_ids`
+bitset is built (line 1510 of ggml-cpu.c).
+
+**Status**: blocked — needs a CPU-side hook, not scheduler-side
 
 ### I6. TQ2_KV Testing
 
