@@ -111,15 +111,18 @@ fixed in linux-firmware 20260110) — it's a fundamental RADV limitation.
 
 ## Investigation Queue
 
-### I1. Thread Count Tuning
+### I1. Thread Count Tuning — DONE (+7% warm)
 
-Currently `--threads 12` on a 16-core/32-thread Zen 5 CPU. Expert matmul is
-embarrassingly parallel across rows. Testing 16, 24, or 32 threads could improve
-CPU expert throughput.
+Tested 12, 16, 24 threads on 16-core/32-thread Zen 5.
 
-**Test**: Change `LLAMA_ARG_THREADS` in backend env and compare q4km/deepseek TPS.
+| Threads | q4km cold | q4km warm (avg) |
+|---|---|---|
+| 12 | 4.43 | 6.51 |
+| **16** | **6.70** | **6.93** |
+| 24 | 6.43 | 6.56 |
 
-**Status**: not started
+**16 threads is optimal**. 24 regresses from memory bandwidth contention (CPU and
+GPU share the same memory controller on UMA). Set permanently in backend config.
 
 ### I2. NVMe Direct I/O with io_uring
 
