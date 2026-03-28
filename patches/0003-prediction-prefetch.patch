@@ -99,7 +99,7 @@ index 5c44941..8819c96 100644
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index ed313d8..dc98225 100644
+index ed313d8..a2353c2 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
 @@ -397,6 +397,15 @@ static int parse_layer_index(const char * name) {
@@ -118,7 +118,7 @@ index ed313d8..dc98225 100644
  // ── Manifest loader ────────────────────────────────────────────────────
  
  // Minimal JSON parser for manifest.json (avoids external dependency).
-@@ -1053,6 +1062,55 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+@@ -1053,6 +1062,49 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
      return true;
  }
  
@@ -145,26 +145,20 @@ index ed313d8..dc98225 100644
 +    }
 +    if (layer_idx < 0) return;
 +
-+    // Prefetch selected experts for the next few layers (lookahead).
-+    // Deeper lookahead gives more time for kernel readahead to complete.
-+    for (int ahead = 1; ahead <= 3; ahead++) {
-+        int target_layer = layer_idx + ahead;
-+        if (target_layer >= (int)ctx->gguf_src.layers.size()) continue;
-+        const gguf_layer_source & ls = ctx->gguf_src.layers[target_layer];
-+        if (ls.fd < 0) continue;
-+
++    // Prefetch next layer's selected experts
 +#if defined(__linux__)
++    int target_layer = layer_idx + 1;
++    if (target_layer < (int)ctx->gguf_src.layers.size()) {
++        const gguf_layer_source & ls = ctx->gguf_src.layers[target_layer];
 +        for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
 +            if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
 +            for (const auto & part : ls.experts[eid].parts) {
 +                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
 +            }
 +        }
-+#endif
++        ctx->n_prefetch_calls++;
 +    }
-+    ctx->n_prefetch_calls++;
-+
-+#if !defined(__linux__)
++#else
 +    GGML_UNUSED(used_ids_bitset);
 +    GGML_UNUSED(n_expert);
 +    GGML_UNUSED(node);
@@ -174,7 +168,7 @@ index ed313d8..dc98225 100644
  // ── Public API ─────────────────────────────────────────────────────────
  
  struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
-@@ -1297,3 +1355,20 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
+@@ -1297,3 +1349,20 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
              break;
      }
  }
