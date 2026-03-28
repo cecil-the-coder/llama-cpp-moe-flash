@@ -184,22 +184,27 @@ bitset is built (line 1510 of ggml-cpu.c).
 
 **Status**: blocked — needs a CPU-side hook, not scheduler-side
 
-### I6. TQ2_KV Testing — PARTIALLY BLOCKED
+### I6. TQ2_KV Testing — WORKS BUT QUALITY UNUSABLE
 
-TQ2_KV type system is in the binary (`tq2_kv` string present, type_traits
-registered, encode/decode compiled). However:
-- `LLAMA_ARG_CACHE_TYPE_K=tq2_kv` env var: silently falls back to q4_0
-- `--cache-type-k tq2_kv` CLI arg: breaks pod creation (controller error)
-- KV cache always shows `K (q4_0)` regardless of config
+TQ2_KV type system works correctly. Local debugging confirmed:
+- `ggml_type_name(TQ2_KV) = "tq2_kv"` ✓
+- `kv_cache_type_from_str("tq2_kv")` matches ✓
+- `blck_size=128`, `type_size=34` ✓
 
-The silent fallback suggests `kv_cache_type_from_str("tq2_kv")` isn't matching,
-possibly because the kv_cache_types entry (patch 0004) didn't compile in
-correctly, or Docker cache served a stale binary.
+**Deployed result** (image `1cb6d44`, env `LLAMA_ARG_CACHE_TYPE_K=tq2_kv`):
+- KV cache: **3196 MiB** (tq2_kv) vs 6768 MiB (q4_0) — **2.1× reduction**
+- TPS: **20.23 t/s** — no regression
+- Output quality: **GARBAGE** — gibberish text, complete attention pattern destruction
 
-**Next step**: Test locally with a fresh build (`cmake && ./bin/llama-server -ctk tq2_kv`)
-to isolate whether the issue is type recognition or backend support.
+The 2.125 bpw quantization is too aggressive for MoE models with HSK=128.
+The 4-level symmetric encoding {-1.5d, -0.5d, +0.5d, +1.5d} doesn't preserve
+enough precision for the attention score distribution.
 
-**Status**: blocked — needs local debugging
+Previous debugging confusion was from Docker cache (old binary) and Flux timing
+(env var not propagated when pod started).
+
+**Reverted to q4_0.** TQ2_KV needs a higher-precision variant (3-bit or 4-bit
+symmetric) to be usable.
 
 ### I7. Context Size Scaling
 
