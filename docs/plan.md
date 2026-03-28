@@ -141,15 +141,18 @@ existing moe-flash ring from patch 0001.
 
 **Status**: blocked — needs debugging with GDB or Vulkan validation layer
 
-### I3. Prefetch Lookahead Depth
+### I3. Prefetch Lookahead Depth — NO BENEFIT
 
-Currently prefetch layer N+1 from layer N's routing. Could prefetch N+2 or N+3
-as well. Marginal cost of extra fadvise calls is near-zero. Deeper lookahead
-gives more time for kernel readahead to complete before the data is needed.
+Tested lookahead=3 (prefetch layers N+1, N+2, N+3 from layer N's routing).
 
-**Test**: Add `lookahead` parameter to `moe_flash_expert_copy_cb`, test 1/2/3.
+| Model | Lookahead=1 | Lookahead=3 | Change |
+|---|---|---|---|
+| q4km warm | 6.93 | 6.76 | **-2%** (fadvise overhead) |
+| deepseek warm | 2.01 | 2.06 | +3% (marginal) |
 
-**Status**: not started
+The extra fadvise syscalls (72 per layer vs 24) cost more than the prefetch
+benefit. Expert selection locality across 3 layers isn't high enough to justify
+3× the I/O hints. Reverted to lookahead=1.
 
 ### I4. AMDVLK vs RADV
 
