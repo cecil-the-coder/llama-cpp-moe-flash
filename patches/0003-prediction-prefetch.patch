@@ -99,10 +99,20 @@ index 5c44941..8819c96 100644
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
-index ed313d8..a2353c2 100644
+index ed313d8..56ed0b6 100644
 --- a/src/llama-moe-flash.cpp
 +++ b/src/llama-moe-flash.cpp
-@@ -397,6 +397,15 @@ static int parse_layer_index(const char * name) {
+@@ -383,6 +383,9 @@ struct llama_moe_flash_context {
+     int64_t n_callbacks;
+     int64_t n_prefetch_calls;
+     int64_t n_pre_graph_calls;
++
++    // Expert frequency tracking (I5): expert_freq[layer_pos][expert_id] = selection count
++    std::vector<std::vector<int64_t>> expert_freq;
+ };
+ 
+ // ── Helpers ────────────────────────────────────────────────────────────
+@@ -397,6 +400,15 @@ static int parse_layer_index(const char * name) {
      return -1;
  }
  
@@ -118,7 +128,7 @@ index ed313d8..a2353c2 100644
  // ── Manifest loader ────────────────────────────────────────────────────
  
  // Minimal JSON parser for manifest.json (avoids external dependency).
-@@ -1053,6 +1062,49 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
+@@ -1053,6 +1065,59 @@ static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data
      return true;
  }
  
@@ -145,6 +155,16 @@ index ed313d8..a2353c2 100644
 +    }
 +    if (layer_idx < 0) return;
 +
++    // Track expert selection frequency (I5 investigation)
++    if (layer_idx < (int)ctx->expert_freq.size()) {
++        auto & freq = ctx->expert_freq[layer_idx];
++        for (int eid = 0; eid < n_expert && eid < (int)freq.size(); eid++) {
++            if (used_ids_bitset[eid >> 5] & (1u << (eid & 31))) {
++                freq[eid]++;
++            }
++        }
++    }
++
 +    // Prefetch next layer's selected experts
 +#if defined(__linux__)
 +    int target_layer = layer_idx + 1;
@@ -168,7 +188,61 @@ index ed313d8..a2353c2 100644
  // ── Public API ─────────────────────────────────────────────────────────
  
  struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
-@@ -1297,3 +1349,20 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
+@@ -1211,6 +1276,53 @@ void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
+             (long long)ctx->n_callbacks, (long long)ctx->n_prefetch_calls,
+             (long long)ctx->n_pre_graph_calls);
+ 
++    // Log expert frequency distribution (I5)
++    if (!ctx->expert_freq.empty()) {
++        int64_t total_selections = 0;
++        std::vector<std::pair<int64_t, int>> global_freq; // (count, expert_id)
++        int n_experts = ctx->expert_freq[0].size();
++        std::vector<int64_t> expert_totals(n_experts, 0);
++
++        for (size_t l = 0; l < ctx->expert_freq.size(); l++) {
++            for (int e = 0; e < (int)ctx->expert_freq[l].size(); e++) {
++                expert_totals[e] += ctx->expert_freq[l][e];
++                total_selections += ctx->expert_freq[l][e];
++            }
++        }
++
++        if (total_selections > 0) {
++            for (int e = 0; e < n_experts; e++) {
++                global_freq.push_back({expert_totals[e], e});
++            }
++            std::sort(global_freq.rbegin(), global_freq.rend());
++
++            fprintf(stderr, "moe-flash: expert frequency (total %lld selections across %zu layers):\n",
++                    (long long)total_selections, ctx->expert_freq.size());
++            // Top 10 and bottom 10
++            int show = std::min(10, n_experts);
++            fprintf(stderr, "  top %d:", show);
++            for (int i = 0; i < show; i++) {
++                fprintf(stderr, " e%d=%.1f%%", global_freq[i].second,
++                        100.0 * global_freq[i].first / total_selections);
++            }
++            fprintf(stderr, "\n  bottom %d:", show);
++            for (int i = n_experts - show; i < n_experts; i++) {
++                fprintf(stderr, " e%d=%.1f%%", global_freq[i].second,
++                        100.0 * global_freq[i].first / total_selections);
++            }
++            // Gini coefficient for skewness
++            double sum_diff = 0, sum_total = 0;
++            for (int i = 0; i < n_experts; i++) {
++                for (int j = 0; j < n_experts; j++) {
++                    sum_diff += std::abs(expert_totals[i] - expert_totals[j]);
++                }
++                sum_total += expert_totals[i];
++            }
++            double gini = sum_total > 0 ? sum_diff / (2.0 * n_experts * sum_total) : 0;
++            fprintf(stderr, "\n  gini=%.3f (0=uniform, 1=one expert)\n", gini);
++        }
++    }
++
+ #if defined(GGML_USE_IOURING)
+     if (ctx->prefetch_iouring) {
+         // Wait for any remaining pending reads
+@@ -1297,3 +1409,31 @@ void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
              break;
      }
  }
@@ -176,6 +250,17 @@ index ed313d8..a2353c2 100644
 +void llama_moe_flash_install_sched_hook(struct llama_moe_flash_context * ctx, ggml_backend_sched_t sched) {
 +    if (!ctx || !ctx->enabled || ctx->gguf_src.layers.empty()) return;
 +    ggml_backend_sched_set_expert_copy_callback(sched, moe_flash_expert_copy_cb, ctx);
++
++    // Initialize expert frequency tracking
++    if (ctx->expert_freq.empty() && !ctx->gguf_src.layers.empty()) {
++        int n_layers = (int)ctx->gguf_src.layers.size();
++        int max_experts = 0;
++        for (const auto & l : ctx->gguf_src.layers) {
++            max_experts = std::max(max_experts, l.n_experts);
++        }
++        ctx->expert_freq.resize(n_layers, std::vector<int64_t>(max_experts, 0));
++        fprintf(stderr, "moe-flash: expert frequency tracking initialized (%d layers, %d experts)\n", n_layers, max_experts);
++    }
 +
 +    // Stop the blind background prefetch thread — prediction callback replaces it.
 +    // Running both causes I/O contention (kernel readahead fighting targeted fadvise).
