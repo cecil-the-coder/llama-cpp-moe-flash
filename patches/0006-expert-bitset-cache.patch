@@ -1,4 +1,4 @@
---- ggml/include/ggml-backend.h	2026-03-29 14:06:53.791493663 +0000
+--- ggml/include/ggml-backend.h	2026-03-29 14:23:36.759737913 +0000
 +++ b/ggml/include/ggml-backend.h	2026-03-28 11:47:25.362672625 +0000
 @@ -340,6 +340,23 @@
      // Set a callback to be called for each resulting node during graph compute
@@ -24,8 +24,8 @@
      //
      // Utils
      //
---- ggml/src/ggml-backend.cpp	2026-03-29 14:06:59.441004048 +0000
-+++ b/ggml/src/ggml-backend.cpp	2026-03-29 14:06:45.425221463 +0000
+--- ggml/src/ggml-backend.cpp	2026-03-29 14:23:44.347958584 +0000
++++ b/ggml/src/ggml-backend.cpp	2026-03-29 14:23:28.915684469 +0000
 @@ -20,6 +20,7 @@
  #include <stdlib.h>
  #include <string.h>
@@ -44,26 +44,21 @@
      char * context_buffer;
      size_t context_buffer_size;
  
-@@ -834,6 +838,18 @@
+@@ -834,6 +838,13 @@
                          return b;
                      }
                  }
-+                // Force-offload MUL_MAT_ID to GPU regardless of supports_op and offload_op.
-+                // supports_op fails because expert tensor exceeds maxStorageBufferRange,
-+                // offload_op fails because ne[2]=1 at bs=1 < min_batch_size=32.
-+                // The selective expert copy + bitset cache handles the actual data transfer.
-+                if (tensor->op == GGML_OP_MUL_MAT_ID) {
-+                    for (int b = 0; b < src_backend_id; b++) {
-+                        if (ggml_backend_supports_buft(sched->backends[b], sched->bufts[b])) {
-+                            SET_CAUSE(tensor, "1.moe");
-+                            return b;
-+                        }
-+                    }
-+                }
++                // NOTE: Force-offloading MUL_MAT_ID was tried (images 7ad0e22, 5ae96d2)
++                // but produces GARBAGE output. The expert tensor copy (input_cpy) is
++                // allocated at full expert tensor size (5-10 GB per projection), which
++                // exceeds maxStorageBufferRange (4 GiB on RADV). The compute shader
++                // descriptor binding can't address the full tensor → reads garbage.
++                // FIX NEEDED: fixed-size slot buffer (N slots, not all experts) with
++                // expert ID remapping. See I10 in docs/plan.md.
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1450,6 +1466,9 @@
+@@ -1450,6 +1461,9 @@
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -73,7 +68,7 @@
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1522,57 +1541,36 @@
+@@ -1522,57 +1536,36 @@
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -114,12 +109,12 @@
                      }
 -                    int32_t first_id = id;
 -                    int32_t last_id = first_id;
- 
+-
 -                    for (++id; id < n_expert; ++id) {
 -                        if (!ggml_bitset_get(used_ids.data(), id)) {
 -                            continue;
 -                        }
--
+ 
 -                        if (id == last_id + 1) {
 -                            last_id = id;
 -                            continue;
@@ -154,7 +149,7 @@
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1839,6 +1837,12 @@
+@@ -1839,6 +1832,12 @@
      sched->callback_eval_user_data = user_data;
  }
  
@@ -167,7 +162,7 @@
  int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      return sched->n_splits;
---- include/llama-moe-flash.h	2026-03-29 14:06:59.432211310 +0000
+--- include/llama-moe-flash.h	2026-03-29 14:23:44.339198940 +0000
 +++ b/include/llama-moe-flash.h	2026-03-28 11:47:25.362672625 +0000
 @@ -49,6 +49,12 @@
  // this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
@@ -182,7 +177,7 @@
  #ifdef __cplusplus
  }
  #endif
---- src/llama-context.cpp	2026-03-29 14:06:59.432231277 +0000
+--- src/llama-context.cpp	2026-03-29 14:23:44.339234296 +0000
 +++ b/src/llama-context.cpp	2026-03-28 11:47:25.362672625 +0000
 @@ -408,6 +408,11 @@
  
@@ -196,7 +191,7 @@
      llama_memory_context_ptr mctx;
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
---- src/llama-moe-flash.cpp	2026-03-29 14:06:59.443104014 +0000
+--- src/llama-moe-flash.cpp	2026-03-29 14:23:44.350789480 +0000
 +++ b/src/llama-moe-flash.cpp	2026-03-28 14:16:34.811230692 +0000
 @@ -339,6 +339,20 @@
      pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
