@@ -321,7 +321,20 @@ projection, each slot = 1 expert. Total buffer = N × expert_size, fitting withi
 - Multiple descriptor bindings (split tensor): Would need per-expert or
   per-chunk bindings, exceeds descriptor set limits
 
-**Status**: not started
+**First attempt** (images `86825d2`, `cc81e1d`): Implemented shrunk input_cpy
+(ne[2]=32), LRU slot assignment, IDS rewrite, force-offload. Build succeeds,
+graph split and allocation correct (283 splits, 1142 MiB compute buffer vs
+3099 MiB with full tensor). But **SIGSEGV** (exit 139) during first inference.
+
+Likely cause: IDS tensor rewrite via `ggml_backend_tensor_set_async` to a
+GPU compute tensor may trigger a page fault, OR the shrunk tensor's layout
+is incompatible with the Vulkan MUL_MAT_ID dispatch. Needs GDB debugging.
+
+Also fixed: shared IDS tensor bug — gate/up/down projections share one IDS
+tensor, rewriting it for the first projection corrupted later projections.
+Fixed via `original_ids_cache` that preserves original expert IDs.
+
+**Status**: SIGSEGV — needs on-device debugging with GDB/validation layers
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 
