@@ -2,20 +2,20 @@
 
 ## Current State
 
-**Production image: `5ae96d2`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `6a5b5ff`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
 
 Single-backend architecture with auto-detect `--cpu-moe`:
 - All models use `moe-flash-cpumoe` backend (`CPU_MOE=1` default)
 - `llama_params_fit` checks if full model fits in device memory without the override
 - If it fits → clears override → full GPU (20-50 t/s)
-- If not → keeps override → GPU expert matmul with bitset cache (6-18 t/s)
+- If not → keeps override → mmap-wrap with partial prefetch (1.8-6.3 t/s)
 
 | Model | Size | TPS | Loading |
 |---|---|---|---|
 | glm-4-7-flash | 17 GB | **50.57** | standard (full GPU offload) |
 | qwen3-235b Q2_K | 80 GB | **20.21-20.77** | standard (full GPU offload) |
-| qwen3-235b Q4_K_M | 133 GB | 6.3→**17.8-18.1** | I10: GPU MUL_MAT_ID + bitset expert cache |
-| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | patched: mmap experts + partial prefetch (testing I10) |
+| qwen3-235b Q4_K_M | 133 GB | 2.72→**6.0-6.3** | patched: mmap experts + partial prefetch |
+| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | patched: mmap experts + partial prefetch |
 
 ---
 
@@ -262,21 +262,28 @@ Key design:
 table remap, not a data copy. The slot population cost is effectively zero.
 This is the single highest-leverage optimization available.
 
-**Result** (image `5ae96d2`): Force-offload MUL_MAT_ID to GPU + bitset cache.
-Two bugs found and fixed:
-1. `supports_op` rejects expert tensors > `maxStorageBufferRange` (4 GiB)
+**Result** (images `7ad0e22`, `5ae96d2`): Force-offloaded MUL_MAT_ID to GPU.
+GPU compute runs fast (18 t/s for q4km, vs 6.93 CPU) but **output is GARBAGE**.
+
+Root cause: `input_cpy` tensor is allocated at full expert tensor size (5-10 GB
+per projection). On RADV, `maxStorageBufferRange` = 4 GiB. The compute shader
+descriptor binding can't address beyond 4 GiB → reads uninitialized memory.
+
+Two additional bugs found during investigation:
+1. `supports_op` rejects expert tensors > `maxStorageBufferRange` (correctly!)
 2. `offload_op` rejects MUL_MAT_ID at bs=1 (`ne[2]=1 < min_batch_size=32`)
 
-Fix: bypass both checks for MUL_MAT_ID with `supports_buft` instead.
+**Conclusion**: The full-size copy tensor approach cannot work on RADV. The fix
+requires a **fixed-size GPU slot buffer** (N slots per layer, not all experts)
+with expert ID remapping — the actual "two-tier cache" from #20757. This changes
+the MUL_MAT_ID op semantics: expert weights are at slot indices, not original
+expert IDs. Requires modifying `ggml_vk_mul_mat_id` to use a slot indirection
+table.
 
-| Model | Splits | Cold t/s | Warm t/s | vs Baseline |
-|---|---|---|---|---|
-| qwen3-235b Q4_K_M | 284 | 11.58 | **17.8-18.1** | **+161%** (was 6.93) |
+Bitset cache code retained in patch 0006 (harmless when offload inactive, ready
+for the slot buffer implementation).
 
-Graph splits increased from 190 → 284 (MoE layers now create GPU splits).
-Warm performance approaches full-GPU Q2_K speed (20.4 t/s).
-
-**Status**: DONE — deployed, measuring DeepSeek next
+**Status**: BLOCKED on slot buffer implementation (I10b)
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 
