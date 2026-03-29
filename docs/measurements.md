@@ -38,8 +38,31 @@ UMA memory bandwidth contention (CPU and GPU share memory controller).
 
 GPU-path models (Q2K, glm) unaffected by CPU optimizations — already at full Vulkan speed.
 
+### I10: GPU Expert Matmul with Bitset Cache (images `7ad0e22`, `5ae96d2`)
+
+Force-offloaded MUL_MAT_ID to GPU by bypassing `supports_op` and `offload_op`:
+
+| Model | Splits | Warm t/s | Output Quality |
+|---|---|---|---|
+| qwen3-235b Q4_K_M | 284 (was 190) | **18.1** (was 6.93) | **GARBAGE** |
+| deepseek-r1-0528 | 176 (was 118) | **1.84** (was 1.8) | **GARBAGE** |
+
+**GPU compute is 2.6× faster** but output is gibberish. Root cause:
+`input_cpy` tensor allocated at full expert size (5-10 GB per projection).
+RADV `maxStorageBufferRange` = 4 GiB → descriptor binding can't address
+full tensor → compute shader reads uninitialized memory.
+
+Bugs found: (1) `offload_op` uses `ne[2]` for MUL_MAT_ID batch size, which
+is 1 at bs=1 — always below `min_batch_size=32`. (2) `supports_op` tensor
+size check was correctly blocking this (protecting against the real issue).
+
+**Reverted to `6a5b5ff`** (force-offload disabled). Needs fixed-size slot
+buffer with expert ID remapping (I10b).
+
 ### RADV Driver Findings
 - `maxBufferSize` = 2-4 GiB (can't import large shard ranges)
+- `maxStorageBufferRange` = 4 GiB (descriptor binding limit, causes I10 garbage)
+- `VK_EXT_shader_64bit_indexing`: **NOT supported** on RADV/GFX1151 (would bypass range limit)
 - `VK_EXT_external_memory_host`: only works for `MAP_PRIVATE|MAP_ANONYMOUS`, NOT file-backed mmap
 - Compute shader GPU page fault on pinned/imported host memory
 - Regular `create_buffer_device` (suballocated) works perfectly for ≤ RAM models

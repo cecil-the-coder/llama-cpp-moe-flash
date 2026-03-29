@@ -273,17 +273,55 @@ Two additional bugs found during investigation:
 1. `supports_op` rejects expert tensors > `maxStorageBufferRange` (correctly!)
 2. `offload_op` rejects MUL_MAT_ID at bs=1 (`ne[2]=1 < min_batch_size=32`)
 
-**Conclusion**: The full-size copy tensor approach cannot work on RADV. The fix
-requires a **fixed-size GPU slot buffer** (N slots per layer, not all experts)
-with expert ID remapping — the actual "two-tier cache" from #20757. This changes
-the MUL_MAT_ID op semantics: expert weights are at slot indices, not original
-expert IDs. Requires modifying `ggml_vk_mul_mat_id` to use a slot indirection
-table.
+**Conclusion**: The full-size copy tensor approach cannot work on RADV.
+`VK_EXT_shader_64bit_indexing` is NOT supported on GFX1151 — confirmed via
+`vulkaninfo`. The Vulkan backend already has 64-bit indexing support (line 8191
+in ggml-vulkan.cpp switches to 64b pipeline when tensor > maxStorageBufferRange),
+but the extension is missing from the driver.
+
+The fix requires a **fixed-size GPU slot buffer** (N slots per layer) with expert
+ID remapping — the actual "two-tier cache" from #20757 (I10b below).
 
 Bitset cache code retained in patch 0006 (harmless when offload inactive, ready
-for the slot buffer implementation).
+for slot buffer).
 
-**Status**: BLOCKED on slot buffer implementation (I10b)
+**Status**: BLOCKED — needs I10b (slot buffer) or VK_EXT_shader_64bit_indexing
+
+### I10b. Fixed-Size Slot Buffer for GPU Expert Matmul — TIER 1
+
+**Problem**: Full expert tensor (5-10 GB) exceeds `maxStorageBufferRange` (4 GiB).
+
+**Design**: Pre-allocate a GPU buffer with N slots (e.g., 32 or 64) per MoE
+projection, each slot = 1 expert. Total buffer = N × expert_size, fitting within
+4 GiB. Before each MUL_MAT_ID dispatch:
+
+1. Read routing IDs (which experts are needed for this token)
+2. For each needed expert: check slot table → if miss, copy expert into an
+   available slot (LRU eviction). On UMA this is effectively a page remap.
+3. Build a `slot_map[expert_id] → slot_idx` mapping
+4. Pass slot_map to the MUL_MAT_ID shader
+5. Shader indexes `pos_a = slot_map[expert_idx] * stride` instead of `expert_idx * stride`
+
+**Implementation points**:
+- **Shader**: Add 1 indirection in `pos_a` calculation (mul_mm.comp line 241).
+  Pass slot_map as push constant (fits in 256 bytes for 64 slots) or binding.
+- **Scheduler**: In `ggml_backend_sched_compute_splits`, after reading routing
+  IDs, populate slots and build the map. Replace full `input_cpy` with smaller
+  slot buffer allocated via gallocr.
+- **Allocation**: `input_cpy` tensor resized to `[ne0, ne1, N_SLOTS]` instead
+  of `[ne0, ne1, n_expert]`. N_SLOTS=32 → ~1.3 GB for Q4_K_M, ~0.9 GB for Q2_K.
+  Well within 4 GiB limit.
+- **GTT budget**: 32 slots × 3 projections × 94 layers = ~360 GB for Q4_K_M,
+  but gallocr reuses buffers across layers, so actual peak = ~4 GB.
+
+**Alternatives considered**:
+- `VK_EXT_shader_64bit_indexing`: Not supported on RADV/GFX1151
+- Buffer device addresses (BDA): RADV supports BDA but llama.cpp MUL_MAT_ID
+  shaders don't use BDA pointers — would need significant shader rewrite
+- Multiple descriptor bindings (split tensor): Would need per-expert or
+  per-chunk bindings, exceeds descriptor set limits
+
+**Status**: not started
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 
