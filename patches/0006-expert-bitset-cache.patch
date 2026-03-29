@@ -1,4 +1,4 @@
---- ggml/include/ggml-backend.h	2026-03-29 14:23:36.759737913 +0000
+--- ggml/include/ggml-backend.h	2026-03-29 16:08:10.678725581 +0000
 +++ b/ggml/include/ggml-backend.h	2026-03-28 11:47:25.362672625 +0000
 @@ -340,6 +340,23 @@
      // Set a callback to be called for each resulting node during graph compute
@@ -24,8 +24,8 @@
      //
      // Utils
      //
---- ggml/src/ggml-backend.cpp	2026-03-29 14:23:44.347958584 +0000
-+++ b/ggml/src/ggml-backend.cpp	2026-03-29 14:23:28.915684469 +0000
+--- ggml/src/ggml-backend.cpp	2026-03-29 16:08:20.185645595 +0000
++++ b/ggml/src/ggml-backend.cpp	2026-03-29 16:07:45.751647109 +0000
 @@ -20,6 +20,7 @@
  #include <stdlib.h>
  #include <string.h>
@@ -44,35 +44,79 @@
      char * context_buffer;
      size_t context_buffer_size;
  
-@@ -834,6 +838,13 @@
+@@ -834,6 +838,19 @@
                          return b;
                      }
                  }
-+                // NOTE: Force-offloading MUL_MAT_ID was tried (images 7ad0e22, 5ae96d2)
-+                // but produces GARBAGE output. The expert tensor copy (input_cpy) is
-+                // allocated at full expert tensor size (5-10 GB per projection), which
-+                // exceeds maxStorageBufferRange (4 GiB on RADV). The compute shader
-+                // descriptor binding can't address the full tensor → reads garbage.
-+                // FIX NEEDED: fixed-size slot buffer (N slots, not all experts) with
-+                // expert ID remapping. See I10 in docs/plan.md.
++                // I10b: Force-offload MUL_MAT_ID to GPU for oversized expert tensors.
++                // The slot buffer (shrunk input_cpy with N_SLOTS << n_expert) keeps the
++                // GPU buffer within maxStorageBufferRange. Expert IDs are remapped to slot
++                // indices at compute time. Bypasses supports_op (tensor size check) and
++                // offload_op (batch size check: ne[2]=1 at bs=1 < min_batch_size=32).
++                if (tensor->op == GGML_OP_MUL_MAT_ID) {
++                    for (int b = 0; b < src_backend_id; b++) {
++                        if (ggml_backend_supports_buft(sched->backends[b], sched->bufts[b])) {
++                            SET_CAUSE(tensor, "1.moe");
++                            return b;
++                        }
++                    }
++                }
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1450,6 +1461,9 @@
+@@ -1265,6 +1282,21 @@
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++
++                            // I10b: Shrink MoE expert weight copy to fixed slot count.
++                            // Expert tensors (src[0] of MUL_MAT_ID) can be 5-10 GB, exceeding
++                            // maxStorageBufferRange (4 GiB on RADV). Shrink ne[2] from n_expert
++                            // to N_SLOTS so the GPU buffer fits within the descriptor binding limit.
++                            // The scheduler will remap expert IDs to slot indices at compute time.
++                            #define GGML_MOE_SLOT_BUFFER_SLOTS 32
++                            if (j == 0 && node->op == GGML_OP_MUL_MAT_ID &&
++                                ggml_nbytes(src) > (size_t)4 * 1024 * 1024 * 1024 &&
++                                src->ne[2] > GGML_MOE_SLOT_BUFFER_SLOTS) {
++                                tensor_copy->ne[2] = GGML_MOE_SLOT_BUFFER_SLOTS;
++                                tensor_copy->nb[2] = src->nb[2]; // preserve expert stride
++                                tensor_copy->nb[3] = tensor_copy->ne[2] * tensor_copy->nb[2];
++                            }
++
+                             if (sched->n_copies > 1) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+@@ -1450,6 +1482,20 @@
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
 +    // Expert cache: track which experts are already in GPU copy tensor
 +    static std::unordered_map<const ggml_tensor *, std::vector<ggml_bitset_t>> expert_cache;
 +
++    // I10b: Slot buffer cache for oversized MoE expert tensors.
++    // Maps expert IDs to fixed slots in a shrunk GPU buffer.
++    struct moe_slot_cache {
++        int n_slots = 0;
++        std::vector<int32_t> expert_to_slot;  // [n_expert] → slot or -1
++        std::vector<int32_t> slot_to_expert;  // [n_slots] → expert or -1
++        std::vector<int64_t> slot_lru;        // [n_slots] → timestamp
++        int64_t clock = 0;
++    };
++    static std::unordered_map<const ggml_tensor *, moe_slot_cache> slot_caches;
++
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1522,57 +1536,36 @@
+@@ -1522,57 +1568,109 @@
                          }
  
                          prev_ids_tensor = ids_tensor;
--                    }
++
++                        // Notify expert copy callback (e.g., for prefetching next-layer experts)
++                        if (sched->callback_expert_copy) {
++                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
++                        }
+                     }
  
 -                    // group consecutive experts and copy them together
 -                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -81,7 +125,58 @@
 -                        const size_t padding = std::min<size_t>(expert_size, 512);
 -                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 -                        const size_t copy_size = expert_size_copy + padding_end;
--
++                    // I10b: Slot buffer mode — input_cpy has fewer slots than experts.
++                    // Assign experts to slots, copy misses, rewrite IDS with slot indices.
++                    const bool slot_buffer_mode = input_cpy->ne[2] < n_expert;
++
++                    if (slot_buffer_mode) {
++                        const int n_slots = (int)input_cpy->ne[2];
++
++                        // Initialize slot cache for this input_cpy tensor
++                        auto & sc = slot_caches[input_cpy];
++                        if (sc.n_slots == 0) {
++                            sc.n_slots = n_slots;
++                            sc.expert_to_slot.assign(n_expert, -1);
++                            sc.slot_to_expert.assign(n_slots, -1);
++                            sc.slot_lru.assign(n_slots, 0);
++                        }
++                        sc.clock++;
++
++                        // Assign slots for used experts
++                        for (int id = 0; id < n_expert; ++id) {
++                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
++
++                            if (sc.expert_to_slot[id] >= 0) {
++                                // Cache hit — touch LRU
++                                sc.slot_lru[sc.expert_to_slot[id]] = sc.clock;
++                                continue;
++                            }
++
++                            // Cache miss — find free slot or evict LRU
++                            int slot = -1;
++                            for (int s = 0; s < n_slots; s++) {
++                                if (sc.slot_to_expert[s] == -1) { slot = s; break; }
++                            }
++                            if (slot == -1) {
++                                // Evict least recently used slot
++                                int64_t min_lru = INT64_MAX;
++                                for (int s = 0; s < n_slots; s++) {
++                                    if (sc.slot_lru[s] < min_lru) { min_lru = sc.slot_lru[s]; slot = s; }
++                                }
++                                // Clear evicted expert's mapping
++                                int old_expert = sc.slot_to_expert[slot];
++                                if (old_expert >= 0) sc.expert_to_slot[old_expert] = -1;
++                            }
++
++                            // Assign and copy
++                            sc.expert_to_slot[id] = slot;
++                            sc.slot_to_expert[slot] = id;
++                            sc.slot_lru[slot] = sc.clock;
++
++                            const size_t src_offset = (size_t)id * expert_size;
++                            const size_t dst_offset = (size_t)slot * expert_size;
++                            const size_t padding = (slot < n_slots - 1) ? std::min<size_t>(expert_size, 512) : 0;
+ 
 -                        if (ggml_backend_buffer_is_host(input->buffer)) {
 -                            // Host buffer: direct pointer access (fast path)
 -                            ggml_backend_tensor_set_async(split_backend,
@@ -93,63 +188,74 @@
 -                            // read through backend API, then write to split buffer
 -                            std::vector<uint8_t> staging(copy_size);
 -                            ggml_backend_tensor_get(input, staging.data(), expert_offset, copy_size);
--                            ggml_backend_tensor_set_async(split_backend,
--                                input_cpy,
+                             ggml_backend_tensor_set_async(split_backend,
+                                 input_cpy,
 -                                staging.data(), expert_offset,
 -                                copy_size);
-+                        // Notify expert copy callback (e.g., for prefetching next-layer experts)
-+                        if (sched->callback_expert_copy) {
-+                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
++                                (const uint8_t *)input->data + src_offset, dst_offset,
++                                expert_size + padding);
                          }
 -                    };
--
+ 
 -                    int id = 0;
 -                    while (!ggml_bitset_get(used_ids.data(), id)) {
 -                        id++;
-                     }
+-                    }
 -                    int32_t first_id = id;
 -                    int32_t last_id = first_id;
 -
 -                    for (++id; id < n_expert; ++id) {
 -                        if (!ggml_bitset_get(used_ids.data(), id)) {
 -                            continue;
--                        }
++                        // Rewrite IDS tensor: replace expert IDs with slot indices
++                        for (size_t i = 0; i < ids.size(); i++) {
++                            int32_t eid = ids[i];
++                            GGML_ASSERT(eid >= 0 && eid < n_expert && sc.expert_to_slot[eid] >= 0);
++                            ids[i] = sc.expert_to_slot[eid];
+                         }
  
 -                        if (id == last_id + 1) {
 -                            last_id = id;
 -                            continue;
--                        }
-+                    // Initialize expert cache for this input_cpy tensor if needed
-+                    auto & cached_ids = expert_cache[input_cpy];
-+                    if (cached_ids.empty()) {
-+                        cached_ids.resize(ggml_bitset_size(n_expert));
-+                    }
++                        // Write rewritten IDS to the GPU-side ids tensor.
++                        // node->src[2] points to the GPU copy (set during split_graph).
++                        ggml_tensor * ids_gpu = node->src[2];
++                        ggml_backend_tensor_set_async(split_backend,
++                            ids_gpu, ids.data(), 0, ids.size() * sizeof(int32_t));
++
++                        // Force re-read of IDS next iteration (we modified it)
++                        prev_ids_tensor = nullptr;
++                    } else {
++                        // Normal mode: full-size copy tensor, use bitset cache
++                        auto & cached_ids = expert_cache[input_cpy];
++                        if (cached_ids.empty()) {
++                            cached_ids.resize(ggml_bitset_size(n_expert));
+                         }
  
 -                        copy_experts(first_id, last_id);
-+                    // Copy only uncached used experts
-+                    for (int id = 0; id < n_expert; ++id) {
-+                        if (!ggml_bitset_get(used_ids.data(), id)) continue;
-+                        if (ggml_bitset_get(cached_ids.data(), id)) continue; // already cached
-+
-+                        const size_t expert_offset = (size_t)id * expert_size;
-+                        const size_t padding = (id < n_expert - 1) ? std::min<size_t>(expert_size, 512) : 0;
-+
-+                        ggml_backend_tensor_set_async(split_backend,
-+                            input_cpy,
-+                            (const uint8_t *)input->data + expert_offset, expert_offset,
-+                            // copy a bit extra to ensure there are no NaNs in the padding of the last expert
-+                            // this is necessary for MMQ in the CUDA backend
-+                            expert_size + padding);
++                        // Copy only uncached used experts
++                        for (int id = 0; id < n_expert; ++id) {
++                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
++                            if (ggml_bitset_get(cached_ids.data(), id)) continue; // already cached
  
 -                        first_id = id;
 -                        last_id = id;
-+                        ggml_bitset_set(cached_ids.data(), id);
++                            const size_t expert_offset = (size_t)id * expert_size;
++                            const size_t padding = (id < n_expert - 1) ? std::min<size_t>(expert_size, 512) : 0;
++
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + expert_offset, expert_offset,
++                                expert_size + padding);
++
++                            ggml_bitset_set(cached_ids.data(), id);
++                        }
                      }
 -                    copy_experts(first_id, last_id);
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1839,6 +1832,12 @@
+@@ -1839,6 +1937,12 @@
      sched->callback_eval_user_data = user_data;
  }
  
@@ -162,7 +268,184 @@
  int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      return sched->n_splits;
---- include/llama-moe-flash.h	2026-03-29 14:23:44.339198940 +0000
+--- ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 16:08:20.192696159 +0000
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 16:08:00.173534615 +0000
+@@ -3399,13 +3399,11 @@
+         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
+         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
+         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
+-        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_SCALAR, )
+     } else {
+         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
+         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
+         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, _fp32)
+         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, _fp32)
+-        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_SCALAR, _fp32)
+     }
+ #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
+     if (device->coopmat1_fa_support) {
+@@ -3413,7 +3411,6 @@
+         CREATE_FA(GGML_TYPE_F16, f16, FA_COOPMAT1, _cm1)
+         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_COOPMAT1, _cm1)
+         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT1, _cm1)
+-        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_COOPMAT1, _cm1)
+     }
+ #endif
+ #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+@@ -4277,8 +4274,7 @@
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_0], "set_rows_q5_0" #itype, set_rows_q5_0 ## itype ## rte ## _len, set_rows_q5_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_1], "set_rows_q5_1" #itype, set_rows_q5_1 ## itype ## rte ## _len, set_rows_q5_1 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q8_0], "set_rows_q8_0" #itype, set_rows_q8_0 ## itype ## rte ## _len, set_rows_q8_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## rte ## _len, set_rows_iq4_nl ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
+-        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TQ2_KV], "set_rows_tq2_kv" #itype, set_rows_tq2_kv ## itype ## rte ## _len, set_rows_tq2_kv ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
++        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## rte ## _len, set_rows_iq4_nl ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+ 
+     if (device->float_controls_rte_fp16) {
+         SET_ROWS(_i32, _rte)
+@@ -13411,9 +13407,7 @@
+         ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
+     } catch (vk::SystemError& e) {
+         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
+-        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+-    }
+-    if (ptr == nullptr) {
++        // fallback to cpu buffer
+         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+     }
+ 
+@@ -13422,12 +13416,20 @@
+     size_t buf_offset = 0;
+     ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
+ 
+-    // Keep CPU buffer interface — Vulkan dispatch via host_get works for
+-    // selective expert copy (real host pointers). supports_buft + vk_buffer_context
+-    // causes GPU page fault on RADV when compute shaders read from pinned memory.
+-    GGML_UNUSED(vk_buf);
++    if (vk_buf) {
++        // Create a proper Vulkan buffer context so that the dispatch code
++        // can cast buffer->context to ggml_backend_vk_buffer_context.
++        // This is critical for supports_buft to work without SIGSEGV.
++        // Copy (not move) the shared_ptr — pinned_memory also holds a reference
++        vk_buffer vk_buf_copy = vk_buf;
++        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(
++            vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
++
++        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
++        return buffer;
++    }
+ 
+-    // Fallback: wrap as CPU buffer
++    // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
+     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+     buffer->buft = buft;
+     buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
+@@ -13438,7 +13440,7 @@
+ }
+ 
+ static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
+-    return vk_instance.devices[0]->properties.limits.minStorageBufferOffsetAlignment;
++    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
+ 
+     UNUSED(buft);
+ }
+@@ -13815,6 +13817,13 @@
+         const ggml_tensor *add = cgraph->nodes[node_idx + 1];
+         const ggml_tensor *bias = add->src[1];
+ 
++        // I10b: Disable ADD_ID fusion when using slot buffer (shrunk expert tensor).
++        // The bias tensor is indexed by expert_id, but with slot buffer the IDS contain
++        // slot indices, not expert IDs. Fusing would index bias by slot instead of expert.
++        if (mul->src[0] && bias && mul->src[0]->ne[2] != bias->ne[1]) {
++            return false;
++        }
++
+         if (mul != add->src[0]) {
+             return false;
+         }
+@@ -15144,12 +15153,6 @@
+                 case GGML_TYPE_Q8_0:
+                     // supported in scalar and coopmat2 paths
+                     break;
+-                case GGML_TYPE_TQ2_KV:
+-                    // supported in scalar and coopmat1 paths (not coopmat2)
+-                    if (!device->coopmat1_fa_support) {
+-                        return false;
+-                    }
+-                    break;
+                 case GGML_TYPE_Q4_1:
+                 case GGML_TYPE_Q5_0:
+                 case GGML_TYPE_Q5_1:
+@@ -15226,7 +15229,6 @@
+                     case GGML_TYPE_Q5_1:
+                     case GGML_TYPE_Q8_0:
+                     case GGML_TYPE_IQ4_NL:
+-                    case GGML_TYPE_TQ2_KV:
+                         return true;
+                     default:
+                         return false;
+@@ -15518,6 +15520,12 @@
+         return buft_ctx->device->idx == ctx->device;
+     }
+ 
++    // Vulkan_Host buffers now use ggml_backend_vk_buffer_context (with dev_buffer),
++    // so they can be safely used in Vulkan dispatch without graph splits.
++    if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
++        return true;
++    }
++
+     return false;
+ }
+ 
+@@ -15591,8 +15599,6 @@
+     const size_t align = device->min_imported_host_pointer_alignment;
+     uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
+     if (uptr & (align - 1)) {
+-        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: ptr %p misaligned (need %zu, off by %zu)\n",
+-            ptr, align, uptr & (align - 1));
+         return {};
+     }
+     // Round up size to alignment (the mmap'd region extends to page boundary)
+@@ -15601,15 +15607,10 @@
+     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
+ 
+     vk_buffer buf {};
+-    if (size > device->max_buffer_size) {
+-        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: size %.1f GiB exceeds max_buffer_size %.1f GiB\n",
+-            size / (1024.0 * 1024.0 * 1024.0), device->max_buffer_size / (1024.0 * 1024.0 * 1024.0));
+-        return {};
+-    }
+     try {
+         buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
+     } catch (vk::SystemError& e) {
+-        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr failed: %s (size=%.1f GiB)\n", e.what(), size / (1024.0 * 1024.0 * 1024.0));
++        GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
+     }
+ 
+     return buf;
+@@ -15622,15 +15623,17 @@
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     auto device = ggml_vk_get_device(ctx->device);
+ 
+-    // Try single-buffer import first
+     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+ 
+-    if (buf) {
+-        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
+-        return ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
++    if (!buf) {
++        return {};
+     }
+ 
+-    return {};
++    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
++
++    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
++
++    return ret;
+ }
+ 
+ static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
+--- include/llama-moe-flash.h	2026-03-29 16:08:20.180246821 +0000
 +++ b/include/llama-moe-flash.h	2026-03-28 11:47:25.362672625 +0000
 @@ -49,6 +49,12 @@
  // this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
@@ -177,7 +460,7 @@
  #ifdef __cplusplus
  }
  #endif
---- src/llama-context.cpp	2026-03-29 14:23:44.339234296 +0000
+--- src/llama-context.cpp	2026-03-29 16:08:20.180266598 +0000
 +++ b/src/llama-context.cpp	2026-03-28 11:47:25.362672625 +0000
 @@ -408,6 +408,11 @@
  
@@ -191,7 +474,7 @@
      llama_memory_context_ptr mctx;
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
---- src/llama-moe-flash.cpp	2026-03-29 14:23:44.350789480 +0000
+--- src/llama-moe-flash.cpp	2026-03-29 16:08:20.186254110 +0000
 +++ b/src/llama-moe-flash.cpp	2026-03-28 14:16:34.811230692 +0000
 @@ -339,6 +339,20 @@
      pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
