@@ -348,7 +348,24 @@ buffer but dispatch with the original n_as — the shader early-exits for
 experts with zero token count (via `data_expert_count`), so only the 8
 active experts (mapped to slots 0-7) need valid data.
 
-**Status**: approach 1 failed, pivoting to keep-shape-shrink-buffer
+**Second attempt** (image `ef1268e`): Keep tensor shape (`ne[2]=n_expert`),
+remap active experts to low slots (0-31) within 4 GiB, rewrite IDS.
+Still SIGSEGV — GDB shows same crash in `set_input_k_idxs`, called from
+`common_speculative_is_compat` → `llama_decode` during model loading.
+This is NOT in slot buffer code — it's a pre-existing b8298 bug triggered
+by the force-offload graph structure (283 splits vs 190). The
+`common_speculative_is_compat` test decode fails when the graph has MoE
+expert weight cross-backend splits.
+
+**Root cause of both crashes**: The force-offload changes the graph split
+pattern (190→283 splits). `common_speculative_is_compat` does a trial
+`llama_decode` during `load_model` that hits an uninitialized KV cache
+state. Previous test with 5ae96d2 succeeded because it was tested
+interactively (curl after server was ready) — the server survived the
+speculative compat check by luck (different memory layout without GDB).
+
+**Status**: blocked on `common_speculative_is_compat` crash. Need to either
+disable speculative compat check, or investigate the KV cache init bug.
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 
