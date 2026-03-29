@@ -366,27 +366,42 @@ speculative compat check by luck (different memory layout without GDB).
 
 **Speculative compat fix** (image `54ac14c`): Skipped `common_speculative_is_compat`
 trial decode that crashed in `set_input_k_idxs` with out-of-bounds slot_info.
-Server now loads successfully and processes prompts. But **GPU SIGSEGV** on
-first token generation — the GPU shader crashes reading from the expert weight
-buffer, likely because the Vulkan suballocator places the expert copy tensor
-at a non-zero offset within a larger buffer, so `offset + 432 MB` may exceed
-`maxStorageBufferRange` in the descriptor binding.
+Server now loads successfully and processes prompts. But **GPU SIGSEGV** (exit 139)
+on first token generation (bs=1).
+
+**Static analysis of crash** (image `54ac14c`):
+
+- `slot_remap_mode = FALSE` for Qwen3-235B Q4_K_M: 128 experts × ~3.4 MB =
+  ~435 MB < 4 GiB limit. Normal bitset cache mode runs (copies 8 active experts
+  to `input_cpy` at their `id * expert_size` offsets).
+- Suballocator offset hypothesis INCORRECT: Vulkan spec says `maxStorageBufferRange`
+  limits RANGE only, not `offset + range`. Expert tensor range = 435 MB < 4 GiB, fine.
+- The crash occurs specifically during generation (bs=1) → vec path
+  (`ggml_vk_use_mul_mat_vec_id` returns TRUE when `src2->ne[1] <= 8`).
+- For generation, `ggml_nrows(MUL_MAT_ID output) = top_k = 8 < 32` →
+  subsequent ops scheduled to CPU. For prefill (bs=20), `ggml_nrows = 160 >= 32`
+  → subsequent ops stay on GPU. Explains why prefill works but generation crashes.
+- Actual crash cause unknown from static analysis alone.
+
+Added `[MOE-DBG]` logging before each GPU MUL_MAT_ID split compute and
+`[VEC-DBG]` logging at vec path entry (patch 0007). Need runtime log to identify
+which specific split/tensor triggers the fault.
 
 **Findings across all I10/I10b attempts**:
 1. GPU MUL_MAT_ID compute works (18 t/s when data is valid)
-2. Expert tensors that fit in 4 GiB by raw size can still exceed the
-   descriptor binding range when suballocated at a non-zero offset
+2. Expert tensor range (435 MB) fits within 4 GiB — suballocator offset does NOT
+   cause a range violation (Vulkan spec: maxStorageBufferRange limits range only)
 3. The `common_speculative_is_compat` trial decode triggers a b8298 KV
    cache bug with changed graph splits (fixed by skipping the check)
 4. Changing `ne[2]` on copy tensors breaks graph shape inference (SIGSEGV)
 5. `VK_EXT_shader_64bit_indexing` not available on RADV/GFX1151
+6. Crash only occurs in vec path (bs=1 generation), not batch path (bs=20 prefill)
 
-**Next step**: Investigate suballocator offset. The expert copy tensor needs
-offset=0 in its VkDescriptorBufferInfo to ensure the full range is accessible.
-May need `GGML_VK_FORCE_SUBALLOC_OFF` for the expert buffer, or a dedicated
-allocation outside the suballocator pool.
+**Next step**: Deploy image with patch 0007 debug logging to shadow node,
+trigger a generation request, collect last `[MOE-DBG]`/`[VEC-DBG]` lines before
+crash, identify bad tensor/buffer pointer, fix root cause.
 
-**Status**: GPU SIGSEGV during inference — suballocator offset issue
+**Status**: GPU SIGSEGV during generation — root cause unknown, debug logging deployed
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 
