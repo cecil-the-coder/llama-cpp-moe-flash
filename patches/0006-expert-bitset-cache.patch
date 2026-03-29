@@ -1,4 +1,4 @@
---- ggml/include/ggml-backend.h	2026-03-29 19:02:59.508821398 +0000
+--- ggml/include/ggml-backend.h	2026-03-29 19:09:43.019064911 +0000
 +++ b/ggml/include/ggml-backend.h	2026-03-28 11:47:25.362672625 +0000
 @@ -340,6 +340,23 @@
      // Set a callback to be called for each resulting node during graph compute
@@ -24,7 +24,7 @@
      //
      // Utils
      //
---- ggml/src/ggml-backend.cpp	2026-03-29 19:02:59.808003715 +0000
+--- ggml/src/ggml-backend.cpp	2026-03-29 19:09:43.457845191 +0000
 +++ b/ggml/src/ggml-backend.cpp	2026-03-29 18:45:29.632413699 +0000
 @@ -20,6 +20,7 @@
  #include <stdlib.h>
@@ -277,7 +277,7 @@
  int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      return sched->n_splits;
---- ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 19:02:59.817775208 +0000
+--- ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 19:09:43.465647581 +0000
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 16:08:00.173534615 +0000
 @@ -3399,13 +3399,11 @@
          CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
@@ -454,7 +454,7 @@
  }
  
  static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
---- include/llama-moe-flash.h	2026-03-29 19:02:59.800530910 +0000
+--- include/llama-moe-flash.h	2026-03-29 19:09:43.452746413 +0000
 +++ b/include/llama-moe-flash.h	2026-03-28 11:47:25.362672625 +0000
 @@ -49,6 +49,12 @@
  // this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
@@ -469,7 +469,7 @@
  #ifdef __cplusplus
  }
  #endif
---- src/llama-context.cpp	2026-03-29 19:02:59.800544705 +0000
+--- src/llama-context.cpp	2026-03-29 19:09:43.452762784 +0000
 +++ b/src/llama-context.cpp	2026-03-28 11:47:25.362672625 +0000
 @@ -408,6 +408,11 @@
  
@@ -483,8 +483,8 @@
      llama_memory_context_ptr mctx;
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
---- src/llama-kv-cache.cpp	2026-03-29 19:02:59.712238052 +0000
-+++ b/src/llama-kv-cache.cpp	2026-03-29 19:02:44.376010694 +0000
+--- src/llama-kv-cache.cpp	2026-03-29 19:09:43.344372842 +0000
++++ b/src/llama-kv-cache.cpp	2026-03-29 19:09:28.299433942 +0000
 @@ -1193,7 +1193,12 @@
      const uint32_t n_tokens = ubatch->n_tokens;
      GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
@@ -493,7 +493,7 @@
 +    // Defensive: if buffer is not host-accessible, skip writing (prevents SIGSEGV
 +    // when graph splits cause this tensor to be allocated on a non-host backend).
 +    if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
-+        GGML_LOG_WARN("%s: k_idxs buffer is not host-accessible, skipping\n", __func__);
++        LLAMA_LOG_WARN("%s: k_idxs buffer is not host-accessible, skipping\n", __func__);
 +        return;
 +    }
      int64_t * data = (int64_t *) dst->data;
@@ -505,13 +505,13 @@
  
 -    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 +    if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
-+        GGML_LOG_WARN("%s: v_idxs buffer is not host-accessible, skipping\n", __func__);
++        LLAMA_LOG_WARN("%s: v_idxs buffer is not host-accessible, skipping\n", __func__);
 +        return;
 +    }
      int64_t * data = (int64_t *) dst->data;
  
      if (!v_trans) {
---- src/llama-moe-flash.cpp	2026-03-29 19:02:59.808590960 +0000
+--- src/llama-moe-flash.cpp	2026-03-29 19:09:43.458443407 +0000
 +++ b/src/llama-moe-flash.cpp	2026-03-28 14:16:34.811230692 +0000
 @@ -339,6 +339,20 @@
      pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
