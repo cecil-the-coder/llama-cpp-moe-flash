@@ -326,15 +326,29 @@ projection, each slot = 1 expert. Total buffer = N × expert_size, fitting withi
 graph split and allocation correct (283 splits, 1142 MiB compute buffer vs
 3099 MiB with full tensor). But **SIGSEGV** (exit 139) during first inference.
 
-Likely cause: IDS tensor rewrite via `ggml_backend_tensor_set_async` to a
-GPU compute tensor may trigger a page fault, OR the shrunk tensor's layout
-is incompatible with the Vulkan MUL_MAT_ID dispatch. Needs GDB debugging.
+GDB backtrace revealed crash in `llama_kv_cache::set_input_k_idxs` — NOT in
+the slot buffer or MUL_MAT_ID code. The `ne[2]` shrink on the expert weight
+tensor propagates through the graph: the MUL_MAT_ID output tensor dimensions
+depend on `src[0]->ne[2]`, which corrupts KV cache setup when ne[2]=32
+instead of 128.
 
-Also fixed: shared IDS tensor bug — gate/up/down projections share one IDS
-tensor, rewriting it for the first projection corrupted later projections.
+**Conclusion**: Cannot shrink `ne[2]` on the copy tensor — tensor dimensions
+are used throughout the graph for shape inference, not just descriptor binding.
+Need a different approach: keep `ne[2]=n_expert` on the tensor but allocate
+a smaller buffer underneath, with slot mapping only for data access.
+
+Also found: shared IDS tensor bug — gate/up/down projections share one IDS
+tensor, rewriting it for first projection corrupted later projections.
 Fixed via `original_ids_cache` that preserves original expert IDs.
 
-**Status**: SIGSEGV — needs on-device debugging with GDB/validation layers
+**Next approach**: Keep tensor shape intact (`ne[2]=n_expert`), but use a
+custom smaller Vulkan buffer allocation (32 slots worth) and map expert IDs
+to slot offsets in the copy loop. The Vulkan backend would bind the smaller
+buffer but dispatch with the original n_as — the shader early-exits for
+experts with zero token count (via `data_expert_count`), so only the 8
+active experts (mapped to slots 0-7) need valid data.
+
+**Status**: approach 1 failed, pivoting to keep-shape-shrink-buffer
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 

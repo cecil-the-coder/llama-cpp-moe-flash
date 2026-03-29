@@ -59,6 +59,26 @@ size check was correctly blocking this (protecting against the real issue).
 **Reverted to `6a5b5ff`** (force-offload disabled). Needs fixed-size slot
 buffer with expert ID remapping (I10b).
 
+### I10b: Slot Buffer Attempt (images `86825d2`, `cc81e1d`)
+
+Shrunk `input_cpy->ne[2]` from 128 to 32 slots, LRU assignment, IDS rewrite.
+Graph allocation worked (283 splits, 1142 MiB compute buffer). SIGSEGV on
+first inference.
+
+GDB backtrace:
+```
+#0  llama_kv_cache::set_input_k_idxs  ← CRASH HERE
+#1  llm_graph_input_attn_kv::set_input
+#2  llm_graph_result::set_inputs
+#3  llama_context::process_ubatch
+#4  llama_context::decode
+```
+
+Root cause: changing `ne[2]` on the expert weight tensor breaks graph shape
+inference — MUL_MAT_ID output dimensions depend on `src[0]->ne[2]`, which
+propagates to KV cache tensor setup. Cannot change tensor dimensions;
+need to shrink only the buffer allocation while keeping tensor shape intact.
+
 ### RADV Driver Findings
 - `maxBufferSize` = 2-4 GiB (can't import large shard ranges)
 - `maxStorageBufferRange` = 4 GiB (descriptor binding limit, causes I10 garbage)
