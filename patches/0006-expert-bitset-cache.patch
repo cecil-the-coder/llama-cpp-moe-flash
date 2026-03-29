@@ -1,4 +1,4 @@
---- ggml/include/ggml-backend.h	2026-03-29 16:32:37.895559922 +0000
+--- ggml/include/ggml-backend.h	2026-03-29 18:01:19.984242163 +0000
 +++ b/ggml/include/ggml-backend.h	2026-03-28 11:47:25.362672625 +0000
 @@ -340,6 +340,23 @@
      // Set a callback to be called for each resulting node during graph compute
@@ -24,8 +24,8 @@
      //
      // Utils
      //
---- ggml/src/ggml-backend.cpp	2026-03-29 16:32:48.554876116 +0000
-+++ b/ggml/src/ggml-backend.cpp	2026-03-29 16:32:18.489622247 +0000
+--- ggml/src/ggml-backend.cpp	2026-03-29 18:01:20.303529059 +0000
++++ b/ggml/src/ggml-backend.cpp	2026-03-29 18:01:05.094785162 +0000
 @@ -20,6 +20,7 @@
  #include <stdlib.h>
  #include <string.h>
@@ -64,29 +64,15 @@
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1265,6 +1282,21 @@
+@@ -1265,6 +1282,7 @@
                          for (int c = 0; c < sched->n_copies; c++) {
                              struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                              ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
 +
-+                            // I10b: Shrink MoE expert weight copy to fixed slot count.
-+                            // Expert tensors (src[0] of MUL_MAT_ID) can be 5-10 GB, exceeding
-+                            // maxStorageBufferRange (4 GiB on RADV). Shrink ne[2] from n_expert
-+                            // to N_SLOTS so the GPU buffer fits within the descriptor binding limit.
-+                            // The scheduler will remap expert IDs to slot indices at compute time.
-+                            #define GGML_MOE_SLOT_BUFFER_SLOTS 32
-+                            if (j == 0 && node->op == GGML_OP_MUL_MAT_ID &&
-+                                ggml_nbytes(src) > (size_t)4 * 1024 * 1024 * 1024 &&
-+                                src->ne[2] > GGML_MOE_SLOT_BUFFER_SLOTS) {
-+                                tensor_copy->ne[2] = GGML_MOE_SLOT_BUFFER_SLOTS;
-+                                tensor_copy->nb[2] = src->nb[2]; // preserve expert stride
-+                                tensor_copy->nb[3] = tensor_copy->ne[2] * tensor_copy->nb[2];
-+                            }
-+
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-@@ -1450,6 +1482,25 @@
+@@ -1450,6 +1468,25 @@
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -112,21 +98,26 @@
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1505,11 +1556,30 @@
+@@ -1505,11 +1542,34 @@
                          }
                      }
  
-+                    // I10b: Slot buffer mode — input_cpy has fewer slots than experts.
-+                    const bool slot_buffer_mode = input_cpy->ne[2] < n_expert;
++                    // I10b: Slot remap mode — when expert tensor exceeds maxStorageBufferRange
++                    // (4 GiB), copy active experts into low slots (0..K-1) and rewrite IDS
++                    // with slot indices. Tensor shape stays ne[2]=n_expert (graph correctness)
++                    // but only the first K*expert_size bytes of the GPU buffer are accessed.
++                    // The descriptor binding is clamped to maxStorageBufferRange by the Vulkan
++                    // backend; the shader early-exits for experts with 0 token count.
++                    #define GGML_MOE_SLOT_BUFFER_SLOTS 32
++                    const bool slot_remap_mode = (size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024;
 +
-+                    // I10b: In slot buffer mode, the IDS tensor on GPU may have been
-+                    // rewritten with slot indices by a previous projection (gate/up/down
-+                    // share the same IDS). Use cached original expert IDs instead.
-+                    if (slot_buffer_mode && ids_tensor == prev_ids_tensor) {
++                    // In slot remap mode, the IDS tensor on GPU may have been rewritten
++                    // by a previous projection (gate/up/down share the same IDS tensor).
++                    // Use cached original expert IDs instead.
++                    if (slot_remap_mode && ids_tensor == prev_ids_tensor) {
 +                        auto it = original_ids_cache.find(ids_tensor);
 +                        if (it != original_ids_cache.end()) {
 +                            ids = it->second;
-+                            // used_ids already built from originals, still valid
 +                        }
 +                    }
 +
@@ -135,20 +126,18 @@
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                          ggml_backend_synchronize(ids_backend);
  
-+                        // I10b: Save original expert IDs before any rewrite
-+                        if (slot_buffer_mode) {
++                        if (slot_remap_mode) {
 +                            original_ids_cache[ids_tensor] = ids;
 +                        }
 +
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,57 +1592,105 @@
+@@ -1522,57 +1582,93 @@
                          }
  
                          prev_ids_tensor = ids_tensor;
 +
-+                        // Notify expert copy callback (e.g., for prefetching next-layer experts)
 +                        if (sched->callback_expert_copy) {
 +                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
 +                        }
@@ -161,10 +150,9 @@
 -                        const size_t padding = std::min<size_t>(expert_size, 512);
 -                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 -                        const size_t copy_size = expert_size_copy + padding_end;
-+                    if (slot_buffer_mode) {
-+                        const int n_slots = (int)input_cpy->ne[2];
++                    if (slot_remap_mode) {
++                        const int n_slots = GGML_MOE_SLOT_BUFFER_SLOTS;
 +
-+                        // Initialize slot cache for this input_cpy tensor
 +                        auto & sc = slot_caches[input_cpy];
 +                        if (sc.n_slots == 0) {
 +                            sc.n_slots = n_slots;
@@ -174,37 +162,32 @@
 +                        }
 +                        sc.clock++;
 +
-+                        // Assign slots for used experts
 +                        for (int id = 0; id < n_expert; ++id) {
 +                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
 +
 +                            if (sc.expert_to_slot[id] >= 0) {
-+                                // Cache hit — touch LRU
 +                                sc.slot_lru[sc.expert_to_slot[id]] = sc.clock;
 +                                continue;
 +                            }
 +
-+                            // Cache miss — find free slot or evict LRU
 +                            int slot = -1;
 +                            for (int s = 0; s < n_slots; s++) {
 +                                if (sc.slot_to_expert[s] == -1) { slot = s; break; }
 +                            }
 +                            if (slot == -1) {
-+                                // Evict least recently used slot
 +                                int64_t min_lru = INT64_MAX;
 +                                for (int s = 0; s < n_slots; s++) {
 +                                    if (sc.slot_lru[s] < min_lru) { min_lru = sc.slot_lru[s]; slot = s; }
 +                                }
-+                                // Clear evicted expert's mapping
 +                                int old_expert = sc.slot_to_expert[slot];
 +                                if (old_expert >= 0) sc.expert_to_slot[old_expert] = -1;
 +                            }
 +
-+                            // Assign and copy
 +                            sc.expert_to_slot[id] = slot;
 +                            sc.slot_to_expert[slot] = id;
 +                            sc.slot_lru[slot] = sc.clock;
 +
++                            // Copy expert data to LOW slot index (within 4 GiB range)
 +                            const size_t src_offset = (size_t)id * expert_size;
 +                            const size_t dst_offset = (size_t)slot * expert_size;
 +                            const size_t padding = (slot < n_slots - 1) ? std::min<size_t>(expert_size, 512) : 0;
@@ -228,18 +211,18 @@
 +                                expert_size + padding);
                          }
 -                    };
--
+ 
 -                    int id = 0;
 -                    while (!ggml_bitset_get(used_ids.data(), id)) {
 -                        id++;
 -                    }
 -                    int32_t first_id = id;
 -                    int32_t last_id = first_id;
- 
+-
 -                    for (++id; id < n_expert; ++id) {
 -                        if (!ggml_bitset_get(used_ids.data(), id)) {
 -                            continue;
-+                        // Rewrite IDS tensor: replace expert IDs with slot indices
++                        // Rewrite IDS: replace expert IDs with slot indices
 +                        for (size_t i = 0; i < ids.size(); i++) {
 +                            int32_t eid = ids[i];
 +                            GGML_ASSERT(eid >= 0 && eid < n_expert && sc.expert_to_slot[eid] >= 0);
@@ -249,14 +232,10 @@
 -                        if (id == last_id + 1) {
 -                            last_id = id;
 -                            continue;
-+                        // Write rewritten IDS to the GPU-side ids tensor.
-+                        // node->src[2] points to the GPU copy (set during split_graph).
++                        // Write rewritten IDS to GPU
 +                        ggml_tensor * ids_gpu = node->src[2];
 +                        ggml_backend_tensor_set_async(split_backend,
 +                            ids_gpu, ids.data(), 0, ids.size() * sizeof(int32_t));
-+
-+                        // Don't clear prev_ids_tensor — original IDs are cached in
-+                        // original_ids_cache for reuse by other projections in this layer.
 +                    } else {
 +                        // Normal mode: full-size copy tensor, use bitset cache
 +                        auto & cached_ids = expert_cache[input_cpy];
@@ -265,21 +244,20 @@
                          }
  
 -                        copy_experts(first_id, last_id);
-+                        // Copy only uncached used experts
 +                        for (int id = 0; id < n_expert; ++id) {
 +                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
-+                            if (ggml_bitset_get(cached_ids.data(), id)) continue; // already cached
++                            if (ggml_bitset_get(cached_ids.data(), id)) continue;
 +
 +                            const size_t expert_offset = (size_t)id * expert_size;
 +                            const size_t padding = (id < n_expert - 1) ? std::min<size_t>(expert_size, 512) : 0;
- 
--                        first_id = id;
--                        last_id = id;
++
 +                            ggml_backend_tensor_set_async(split_backend,
 +                                input_cpy,
 +                                (const uint8_t *)input->data + expert_offset, expert_offset,
 +                                expert_size + padding);
-+
+ 
+-                        first_id = id;
+-                        last_id = id;
 +                            ggml_bitset_set(cached_ids.data(), id);
 +                        }
                      }
@@ -287,7 +265,7 @@
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1839,6 +1957,12 @@
+@@ -1839,6 +1935,12 @@
      sched->callback_eval_user_data = user_data;
  }
  
@@ -300,7 +278,7 @@
  int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      return sched->n_splits;
---- ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 16:32:48.564509116 +0000
+--- ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 18:01:20.308480383 +0000
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp	2026-03-29 16:08:00.173534615 +0000
 @@ -3399,13 +3399,11 @@
          CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
@@ -477,7 +455,7 @@
  }
  
  static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
---- include/llama-moe-flash.h	2026-03-29 16:32:48.548412701 +0000
+--- include/llama-moe-flash.h	2026-03-29 18:01:20.299831913 +0000
 +++ b/include/llama-moe-flash.h	2026-03-28 11:47:25.362672625 +0000
 @@ -49,6 +49,12 @@
  // this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
@@ -492,7 +470,7 @@
  #ifdef __cplusplus
  }
  #endif
---- src/llama-context.cpp	2026-03-29 16:32:48.548441295 +0000
+--- src/llama-context.cpp	2026-03-29 18:01:20.299845248 +0000
 +++ b/src/llama-context.cpp	2026-03-28 11:47:25.362672625 +0000
 @@ -408,6 +408,11 @@
  
@@ -506,7 +484,7 @@
      llama_memory_context_ptr mctx;
      if (memory) {
          LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
---- src/llama-moe-flash.cpp	2026-03-29 16:32:48.555695275 +0000
+--- src/llama-moe-flash.cpp	2026-03-29 18:01:20.303849015 +0000
 +++ b/src/llama-moe-flash.cpp	2026-03-28 14:16:34.811230692 +0000
 @@ -339,6 +339,20 @@
      pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
