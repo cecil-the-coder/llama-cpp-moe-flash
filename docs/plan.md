@@ -2,20 +2,20 @@
 
 ## Current State
 
-**Production image: `6c04589`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `5ae96d2`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
 
 Single-backend architecture with auto-detect `--cpu-moe`:
 - All models use `moe-flash-cpumoe` backend (`CPU_MOE=1` default)
 - `llama_params_fit` checks if full model fits in device memory without the override
 - If it fits → clears override → full GPU (20-50 t/s)
-- If not → keeps override → mmap-wrap with partial prefetch (1.8-6.3 t/s)
+- If not → keeps override → GPU expert matmul with bitset cache (6-18 t/s)
 
 | Model | Size | TPS | Loading |
 |---|---|---|---|
 | glm-4-7-flash | 17 GB | **50.57** | standard (full GPU offload) |
 | qwen3-235b Q2_K | 80 GB | **20.21-20.77** | standard (full GPU offload) |
-| qwen3-235b Q4_K_M | 133 GB | 2.72→**6.0-6.3** | patched: mmap experts + partial prefetch |
-| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | patched: mmap experts + partial prefetch |
+| qwen3-235b Q4_K_M | 133 GB | 6.3→**17.8-18.1** | I10: GPU MUL_MAT_ID + bitset expert cache |
+| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | patched: mmap experts + partial prefetch (testing I10) |
 
 ---
 
@@ -262,7 +262,21 @@ Key design:
 table remap, not a data copy. The slot population cost is effectively zero.
 This is the single highest-leverage optimization available.
 
-**Status**: not started
+**Result** (image `5ae96d2`): Force-offload MUL_MAT_ID to GPU + bitset cache.
+Two bugs found and fixed:
+1. `supports_op` rejects expert tensors > `maxStorageBufferRange` (4 GiB)
+2. `offload_op` rejects MUL_MAT_ID at bs=1 (`ne[2]=1 < min_batch_size=32`)
+
+Fix: bypass both checks for MUL_MAT_ID with `supports_buft` instead.
+
+| Model | Splits | Cold t/s | Warm t/s | vs Baseline |
+|---|---|---|---|---|
+| qwen3-235b Q4_K_M | 284 | 11.58 | **17.8-18.1** | **+161%** (was 6.93) |
+
+Graph splits increased from 190 → 284 (MoE layers now create GPU splits).
+Warm performance approaches full-GPU Q2_K speed (20.4 t/s).
+
+**Status**: DONE — deployed, measuring DeepSeek next
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 
