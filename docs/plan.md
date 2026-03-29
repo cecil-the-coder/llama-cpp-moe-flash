@@ -364,8 +364,29 @@ state. Previous test with 5ae96d2 succeeded because it was tested
 interactively (curl after server was ready) — the server survived the
 speculative compat check by luck (different memory layout without GDB).
 
-**Status**: blocked on `common_speculative_is_compat` crash. Need to either
-disable speculative compat check, or investigate the KV cache init bug.
+**Speculative compat fix** (image `54ac14c`): Skipped `common_speculative_is_compat`
+trial decode that crashed in `set_input_k_idxs` with out-of-bounds slot_info.
+Server now loads successfully and processes prompts. But **GPU SIGSEGV** on
+first token generation — the GPU shader crashes reading from the expert weight
+buffer, likely because the Vulkan suballocator places the expert copy tensor
+at a non-zero offset within a larger buffer, so `offset + 432 MB` may exceed
+`maxStorageBufferRange` in the descriptor binding.
+
+**Findings across all I10/I10b attempts**:
+1. GPU MUL_MAT_ID compute works (18 t/s when data is valid)
+2. Expert tensors that fit in 4 GiB by raw size can still exceed the
+   descriptor binding range when suballocated at a non-zero offset
+3. The `common_speculative_is_compat` trial decode triggers a b8298 KV
+   cache bug with changed graph splits (fixed by skipping the check)
+4. Changing `ne[2]` on copy tensors breaks graph shape inference (SIGSEGV)
+5. `VK_EXT_shader_64bit_indexing` not available on RADV/GFX1151
+
+**Next step**: Investigate suballocator offset. The expert copy tensor needs
+offset=0 in its VkDescriptorBufferInfo to ensure the full range is accessible.
+May need `GGML_VK_FORCE_SUBALLOC_OFF` for the expert buffer, or a dedicated
+allocation outside the suballocator pool.
+
+**Status**: GPU SIGSEGV during inference — suballocator offset issue
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 
