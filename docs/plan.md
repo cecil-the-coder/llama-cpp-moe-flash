@@ -69,6 +69,8 @@ Single-backend architecture with auto-detect `--cpu-moe`:
 | **flash-moe** | pread() + GCD on Apple Silicon | 4.4 t/s on 397B/48GB MacBook |
 | **Fiddler** | Per-expert CPU-vs-GPU profiling | Optimal placement, not all-or-nothing |
 | **PreScope** | Async I/O decoupled from compute | 141% throughput improvement |
+| **ik_llama.cpp** | FlashMLA, fused MoE FFN, IQ Trellis quants | Better CPU perf, no Vulkan — see I12 |
+| **llama.cpp #20757** | Two-tier GPU+RAM expert cache (SLRU) | 14 t/s PoC, seeking C++ implementer — see I10 |
 
 ---
 
@@ -237,6 +239,120 @@ require a custom GGUF repacker tool.
 
 ---
 
+## Optimization Research (2026-03-28)
+
+Literature review of MoE inference optimization techniques. Sources: llama.cpp
+issues, flash-moe experiments, ik_llama.cpp, academic papers, AMD documentation.
+See `docs/findings.md` for full synthesis.
+
+### I10. Two-Tier Expert Cache — TIER 1
+
+**Source**: [llama.cpp #20757](https://github.com/ggml-org/llama.cpp/issues/20757)
+
+Persistent GPU slot buffer with SLRU eviction for MoE experts. Python PoC
+achieved **14 tok/s** (from 0.5-1 baseline) on 8 GB VRAM with 98-100% hit rate.
+
+Key design:
+- Fixed-address slot buffer on GPU (N slots per layer)
+- Segmented LRU eviction: probationary (20%) + protected (80%)
+- Frequency-gated admission: only cache expert on second miss
+- Hook point: `ggml_backend_sched_compute_splits()` at line 1529
+
+**Why it matters here**: On UMA, "copying" an expert into a GPU slot is a page
+table remap, not a data copy. The slot population cost is effectively zero.
+This is the single highest-leverage optimization available.
+
+**Status**: not started
+
+### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
+
+**Source**: Vulkan spec, local codebase analysis
+
+Current `buffer_from_host_ptr` imports the entire model at once. For models
+exceeding GTT, import all experts at once → OOM. Instead: pre-allocate N Vulkan
+buffer slots, dynamically import active experts per token.
+
+**Prerequisite**: Requires pinned (`ggml_vk_host_malloc`) memory, not mmap'd
+file pages. RADV cannot import mmap'd pages without GPU page fault (confirmed
+in F4). So this needs the staging pool approach from `docs/design.md`:
+`io_uring` reads expert into pinned staging buffer → import staging buffer as
+Vulkan buffer → GPU matmul.
+
+**On UMA**: The import is a page-table remap only. No data movement. The
+overhead is `vkAllocateMemory` + `vkBindBufferMemory` per expert swap.
+
+**Blocker**: Each import creates a new VkDeviceMemory. Frequent alloc/free
+may fragment or stall. Need to benchmark import latency on gfx1151.
+
+**Status**: not started (depends on staging pool from I14)
+
+### I12. ik_llama.cpp Benchmark — TIER 1
+
+**Source**: [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)
+
+Major llama.cpp fork with CPU-optimized MoE inference:
+- **FlashMLA** (PR 273): fastest known CPU-only DeepSeek inference
+- **Smart Expert Reduction** (PR 239): reduces computation for rarely-activated experts
+- **Fused MoE FFN** (PR 229): batched expert processing
+- **Tensor overrides** (PR 232): per-tensor GPU/CPU placement
+- **IQ Trellis quantization**: better quality than Q2_K at similar size
+
+**No Vulkan support** — CPU + CUDA only. But with 125 GB RAM and Zen 5,
+CPU-only with FlashMLA + fused MoE might match or beat our current 1.37 tok/s
+hybrid Vulkan/CPU setup. Worth benchmarking as a baseline.
+
+**Test**: Build ik_llama.cpp with Zen 5 flags (`-march=znver5`), benchmark
+DeepSeek-R1-0528 Q2_K CPU-only.
+
+**Status**: not started
+
+### I13. BF16 Expert Weights for CPU Matmul — TIER 2
+
+**Source**: Local codebase analysis (`ggml-cpu/`)
+
+Current Q4_0 dot product (`ggml_vec_dot_q4_0_q8_0` in `quants.c`) only has
+AVX2 optimization — no AVX-512 path. But BF16 vec_dot uses `_mm512_dpbf16_ps`
+(AVX-512 BF16) which IS optimized on Zen 5.
+
+Even at half-width AVX-512 (256-bit FPU on Strix Halo, 2 cycles per 512-bit op),
+BF16 outperforms Q4_0 because `_mm512_dpbf16_ps` does 2× the work per cycle
+vs the AVX2 quantized path. The dequantization overhead in Q4_0 is eliminated.
+
+**Trade-off**: BF16 weights are ~2× larger than Q4_0 (~4.5 bpw vs ~4.5 bpw for
+Q4_0, but BF16 is 16-bit = no quantization). Expert file size doubles. For
+models already near the RAM limit (228 GB on 125 GB), this may not fit.
+
+**Alternative**: Try Q8_0 quant — has the same AVX2-only limitation but higher
+accuracy. Or evaluate ik_llama.cpp's IQ4_KSS_R4 which repacks for optimal
+AVX-512 access.
+
+**Status**: not started
+
+### I14. io_uring Polish (Registered Buffers + Single Issuer + THP) — TIER 2
+
+**Source**: io_uring man pages, flash-moe experiments, Linux kernel docs
+
+Three low-effort improvements to the existing io_uring background prefetch:
+
+1. **`IORING_REGISTER_BUFFERS`**: Pin staging pool in kernel, skip
+   `pin_user_pages()` per read. Eliminates ~752 page-pin operations per token
+   (94 layers × 8 experts). Expected 5-15% reduction in read jitter.
+
+2. **`IORING_SETUP_SINGLE_ISSUER`** (6.0+): Single submitter enables kernel
+   optimizations. Our prefetch thread is the sole submitter — trivially
+   applicable. Expected 2-5% from reduced kernel overhead.
+
+3. **`MADV_HUGEPAGE`** + `MADV_COLLAPSE` on staging pool: 512× TLB pressure
+   reduction for expert-sized allocations (2 MB pages vs 4 KB). One `madvise`
+   call. Expected 3-8% for GTT access path.
+
+**Avoid**: SQPOLL (wastes a P-core for bursty workload), O_DIRECT (loses 90%+
+page cache hit rate), expert prediction heuristics (25-53% accuracy, net negative).
+
+**Status**: not started
+
+---
+
 ## RADV Driver Limitations
 
 Confirmed on both Strix Halo (shadow) and Strix Point (local):
@@ -282,3 +398,15 @@ llama_params_fit auto-detect:
 - Workflow: `.github/workflows/build-image.yml` (triggers on `patches/` or `docker/`)
 - eh-ops-private: `github.com/themicknugget/eh-ops-private` (Flux-managed)
 - Backend: `llamacpp-vulkan-moe-flash-cpumoe` in `backends/kustomization.yaml`
+
+### How to ship a change
+
+1. **Edit patches or Dockerfile** in this repo (never build Docker images locally)
+2. **Commit and push to `main`** — CI triggers on changes to `patches/`, `docker/`,
+   or `.github/workflows/build-image.yml`
+3. **CI builds and pushes** the image to `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:<short-sha>`
+4. **Update the Flux deployment** in eh-ops-private to reference the new image SHA
+5. **Test on shadow node** — Flux reconciles, pod restarts with the new image
+
+Do NOT run `docker build` or `docker push` locally. The `docker/build.sh` script
+is a legacy convenience script and pushes to the wrong registry.

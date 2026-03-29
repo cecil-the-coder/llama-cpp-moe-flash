@@ -135,3 +135,98 @@ the GPU buffer.
 
 Flash streaming is only useful when model > 120 GB GTT limit or when multiple large
 models need to coexist in the budget simultaneously.
+
+---
+
+## MoE Inference Optimization Landscape (2026-03-28)
+
+Broad research survey of MoE inference optimization techniques, focused on
+what's applicable to our setup (AMD Strix Halo UMA, Vulkan, 125 GB RAM).
+
+### Key Finding: UMA is a Unique Advantage
+
+On our hardware, GTT memory IS system RAM. CPU and GPU share the same physical
+DRAM. The 0.45x penalty from `--cpu-moe` is NOT a bandwidth problem — it's a
+compute throughput problem (12 CPU cores vs 40 GPU CUs for matmul). Both have
+~120-180 GB/s memory bandwidth from the same DDR5X controller.
+
+This means:
+- "Copying" experts to GPU is page table remap, not data movement
+- `buffer_from_host_ptr` zero-copy works for models ≤ GTT
+- The path to GPU expert matmul for oversized models is through dynamic
+  expert import, not faster copies
+
+### CPU-Side: Zen 5 Strix Halo Characteristics
+
+Critical discovery: the Ryzen AI MAX 385+ has a **half-width AVX-512 FPU**
+(256-bit data path, 2 cycles per 512-bit operation). This is fundamentally
+different from desktop Zen 5 (full 512-bit).
+
+| Feature | Status | Impact |
+|---|---|---|
+| AVX-512 BF16 | Yes (half-width) | `_mm512_dpbf16_ps` — best CPU matmul path |
+| AVX-512 VNNI | Yes (half-width) | INT8 dot product, already enabled |
+| AVX-512 FP16 | No | — |
+| AVX2 (256-bit) | Full throughput | Competitive with half-width AVX-512 |
+
+The Q4_0 dot product path (`ggml_vec_dot_q4_0_q8_0`) has **no AVX-512
+optimization** — AVX2 only. BF16 vec_dot IS AVX-512 BF16 optimized. BF16
+experts would be faster on CPU despite larger size (see I13).
+
+### Vulkan-Side: RDNA 3.5 on RADV
+
+- **Cooperative matrix**: Enabled on RADV for all AMD archs. Already active
+  in our build for all matmul and flash attention shaders.
+- **Single queue**: iGPU exposes 1 queue family with 1 queue (compute+graphics).
+  No async compute/transfer overlap possible. `single_queue = true`.
+- **Architecture detection gap**: Code detects gfx1151 as `AMD_RDNA3` (not 3.5).
+  Gets RDNA3-tuned parameters. May be suboptimal.
+- **IQ3 VGPR pressure** (#20848): IQ3 dequant uses 64 VGPRs on AMD, 40%
+  occupancy loss. Prefer Q4_K_M or Q8_0 for expert matmul on AMD.
+
+Useful RADV env vars for debugging:
+- `RADV_DEBUG=vm,syncshaders` — VA gap + shader sync for GPU fault debugging
+- `ACO_DEBUG=force-waitdeps` — force wait dependencies on gfx1151
+- `GGML_VK_DISABLE_COOPMAT=1` — A/B test cooperative matrix contribution
+
+### io_uring: What to Avoid
+
+| Technique | Verdict | Why |
+|---|---|---|
+| O_DIRECT | **AVOID** | Loses 90%+ page cache hit rate |
+| SQPOLL | **AVOID** | Wastes a P-core for bursty workload |
+| Expert prediction | **AVOID** | 25-53% accuracy, net negative (flash-moe confirmed) |
+| mmap for cold experts | **AVOID** | 5× slower than pread (240 page faults per expert) |
+| LZ4 compression | **AVOID** | Decompress overhead > cache savings (-13%) |
+
+What works (see I14 for implementation):
+- `IORING_REGISTER_BUFFERS` — skip pin_user_pages per read
+- `IORING_SETUP_SINGLE_ISSUER` — kernel optimization for single submitter
+- `MADV_HUGEPAGE` on staging pool — 512× TLB pressure reduction
+- Trust OS page cache — +38% in flash-moe (71% natural hit rate)
+
+### Related Projects
+
+**llama.cpp #20757** (Two-tier expert cache):
+- RFC with Python PoC: 0.5-1 tok/s → 14 tok/s on 8 GB VRAM
+- SLRU eviction with frequency-gated admission
+- Author seeking C++ implementer
+- Most directly applicable optimization for our setup
+
+**ik_llama.cpp** (ikawrakow fork):
+- FlashMLA: fastest known CPU DeepSeek inference
+- Fused MoE FFN, Smart Expert Reduction
+- IQ Trellis quantization (IQ1_KT through IQ4_KT)
+- No Vulkan support — CPU + CUDA only
+- Worth benchmarking as CPU-only baseline
+
+**Flash-MoE** (danveloper):
+- 4.4 tok/s on 397B/48GB MacBook
+- Key insight: "trust the OS" — custom caches all worse than page cache
+- F_RDADVISE failure was Apple-specific (shared memory controller)
+- Our hardware advantage: separate NVMe and GPU memory paths
+
+**"LLM in a Flash"** (Apple, ACL 2024):
+- Windowing + row-column bundling for flash-resident models
+- Run models up to 2× DRAM size, 20-25× faster than naive
+- Foundation for flash-moe and this project's approach
