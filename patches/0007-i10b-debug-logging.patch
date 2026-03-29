@@ -1,0 +1,52 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1687,7 +1687,27 @@ static void ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+         if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
+             ggml_backend_synchronize(split_backend);
+         }
+ 
++        // I10b debug: log MoE GPU splits before compute to identify crash location
++        if (split->graph.n_nodes > 0) {
++            struct ggml_tensor * n0 = split->graph.nodes[0];
++            if (n0 && n0->op == GGML_OP_MUL_MAT_ID &&
++                strcmp(ggml_backend_name(split_backend), "Vulkan0") == 0) {
++                struct ggml_tensor * s0 = n0->src[0];
++                struct ggml_tensor * s2 = n0->src[2];
++                fprintf(stderr, "[MOE-DBG] split=%d GPU MUL_MAT_ID node=%s"
++                    " src0=%s(buf=%p ne=%lldx%lldx%lld)"
++                    " src2=%s(buf=%p ne=%lldx%lld)\n",
++                    split_id, n0->name,
++                    s0 ? s0->name : "null", (void*)(s0 ? s0->buffer : nullptr),
++                    (long long)(s0 ? s0->ne[0] : 0), (long long)(s0 ? s0->ne[1] : 0),
++                    (long long)(s0 ? s0->ne[2] : 0),
++                    s2 ? s2->name : "null", (void*)(s2 ? s2->buffer : nullptr),
++                    (long long)(s2 ? s2->ne[0] : 0), (long long)(s2 ? s2->ne[1] : 0));
++                fflush(stderr);
++            }
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8588,6 +8588,19 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+         fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
+     }
+ 
++    // I10b debug: log vec path entry to identify crash location
++    fprintf(stderr, "[VEC-DBG] mul_mat_vec_id src0=%s(buf=%p nbytes=%zu)"
++        " src1=%s(buf=%p) ids=%s(buf=%p nei0=%llu nei1=%llu)"
++        " dst=%s(buf=%p)\n",
++        src0->name, (void*)src0->buffer, ggml_nbytes(src0),
++        src1->name, (void*)src1->buffer,
++        ids->name, (void*)ids->buffer,
++        (unsigned long long)nei0, (unsigned long long)nei1,
++        dst->name, (void*)dst->buffer);
++    fprintf(stderr, "[VEC-DBG] d_Qx.buf=%p d_ids.buf=%p d_D.buf=%p\n",
++        (void*)d_Qx.buffer.get(), (void*)d_ids.buffer.get(), (void*)d_D.buffer.get());
++    fflush(stderr);
++
+     // Loop over the batch dimension
+     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
+         const vk_mat_vec_id_push_constants pc = {
