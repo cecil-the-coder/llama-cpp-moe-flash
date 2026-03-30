@@ -37,7 +37,7 @@ With cpu_ptr as get_base():
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -13412,5 +13412,20 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffe
+@@ -13418,5 +13418,20 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffe
      ggml_vk_host_free(vk_instance.devices[0], ggml_backend_buffer_get_base(buffer));
  }
 
@@ -58,7 +58,7 @@ diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vu
 +
  static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
      void * ptr = nullptr;
-@@ -13441,5 +13456,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml
+@@ -13447,5 +13462,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml
          ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
 -        return buffer;
 +        // Fix I10b: override get_base to return real CPU address, not GPU sentinel 0x1000.
