@@ -96,6 +96,38 @@
          if (!sched->callback_eval) {
              enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
              if (ec != GGML_STATUS_SUCCESS) {
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1193,10 +1193,28 @@
+     const uint32_t n_tokens = ubatch->n_tokens;
+     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+
++    // I10b debug: log every call to pinpoint what dst->data contains
++    fprintf(stderr, "[K_IDXS] dst=%p buf=%p data=%p ne0=%lld n_tokens=%u sinfo.size=%zu sinfo.n_stream=%zu\n",
++        (void*)dst,
++        dst ? (void*)dst->buffer : nullptr,
++        dst ? dst->data : nullptr,
++        dst ? (long long)dst->ne[0] : -1LL,
++        n_tokens,
++        sinfo.size(),
++        sinfo.n_stream());
++    fflush(stderr);
++
+     // Defensive: if buffer is not host-accessible, skip writing (prevents SIGSEGV
+     // when graph splits cause this tensor to be allocated on a non-host backend).
+     if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
+-        LLAMA_LOG_WARN("%s: k_idxs buffer is not host-accessible, skipping\n", __func__);
++        LLAMA_LOG_WARN("%s: k_idxs buffer is not host-accessible (buf=%p), skipping\n", __func__, (void*)dst->buffer);
+         return;
+     }
++    // I10b debug: guard null data pointer (gallocr allocation bug)
++    if (!dst->data) {
++        fprintf(stderr, "[K_IDXS] ERROR: dst->data is NULL after alloc (ne0=%lld, n_tokens=%u) -- skipping write\n",
++            (long long)dst->ne[0], n_tokens);
++        fflush(stderr);
++        return;
++    }
+     int64_t * data = (int64_t *) dst->data;
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 @@ -8588,6 +8588,19 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
