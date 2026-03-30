@@ -98,7 +98,7 @@
              if (ec != GGML_STATUS_SUCCESS) {
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1193,10 +1193,28 @@
+@@ -1193,10 +1193,30 @@
      const uint32_t n_tokens = ubatch->n_tokens;
      GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
