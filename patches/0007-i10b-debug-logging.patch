@@ -106,7 +106,7 @@
 +    fprintf(stderr, "[K_IDXS] dst=%p buf=%p buft=%s base=%p data=%p ne0=%lld n_tokens=%u sinfo.size=%zu sinfo.n_stream=%zu\n",
 +        (void*)dst,
 +        dst ? (void*)dst->buffer : nullptr,
-+        (dst && dst->buffer) ? ggml_backend_buft_name(dst->buffer->buft) : "null",
++        (dst && dst->buffer) ? ggml_backend_buft_name(ggml_backend_buffer_get_type(dst->buffer)) : "null",
 +        (dst && dst->buffer) ? ggml_backend_buffer_get_base(dst->buffer) : nullptr,
 +        dst ? dst->data : nullptr,
 +        dst ? (long long)dst->ne[0] : -1LL,
