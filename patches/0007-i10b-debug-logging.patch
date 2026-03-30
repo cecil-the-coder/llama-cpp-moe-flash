@@ -1,11 +1,52 @@
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1489,12 +1489,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+@@ -28,6 +28,33 @@
+ #include <sys/sysctl.h>
+ #endif
+
++// I10b debug: SIGSEGV backtrace handler - installed at library load time.
++// Prints a stack trace to stderr (fd 2) so crash location is visible in
++// kubectl logs even if the process dies before compute_splits fires.
++#if defined(__linux__)
++#include <signal.h>
++#include <execinfo.h>
++#include <unistd.h>
++namespace {
++__attribute__((constructor))
++static void install_sigsegv_handler() {
++    struct sigaction sa;
++    sa.sa_flags = SA_RESETHAND;
++    sigemptyset(&sa.sa_mask);
++    sa.sa_handler = [](int) {
++        const char msg[] = "\n[CRASH] SIGSEGV in ggml-base -- backtrace:\n";
++        write(2, msg, sizeof(msg) - 1);
++        void * bt[64];
++        int n = backtrace(bt, 64);
++        backtrace_symbols_fd(bt, n, 2);
++        fsync(2);
++        _exit(139);
++    };
++    sigaction(SIGSEGV, &sa, nullptr);
++}
++} // namespace
++#endif
++
+
+ // backend buffer type
+
+@@ -1486,15 +1513,29 @@
+     // sharing the same IDS tensor must use the original expert IDs for slot assignment.
+     static std::unordered_map<const ggml_tensor *, std::vector<int32_t>> original_ids_cache;
+
++    // I10b debug: log entry point and split count before the loop
++    fprintf(stderr, "[SCHED-COMPUTE] n_splits=%d\n", sched->n_splits);
++    fflush(stderr);
++
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
- 
+
 +        // I10b debug: log every split entry to find crash location
 +        fprintf(stderr, "[SPLIT] id=%d backend=%s n_nodes=%d n_inputs=%d\n",
 +            split_id, ggml_backend_name(split_backend),
@@ -15,7 +56,7 @@
          if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
              ggml_backend_synchronize(split_backend);
          }
- 
+
 +        // I10b debug: survived event sync
 +        fprintf(stderr, "[SPLIT-POST-SYNC] id=%d\n", split_id);
 +        fflush(stderr);
@@ -23,11 +64,10 @@
          // copy the input tensors to the split backend
          for (int input_id = 0; input_id < split->n_inputs; input_id++) {
              ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
-@@ -1687,7 +1698,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
-         if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
+@@ -1688,6 +1729,31 @@
              ggml_backend_synchronize(split_backend);
          }
- 
+
 +        // I10b debug: survived post-copy sync, about to dispatch
 +        fprintf(stderr, "[SPLIT-PRE-DISPATCH] id=%d backend=%s\n",
 +            split_id, ggml_backend_name(split_backend));
@@ -61,7 +101,7 @@
 @@ -8588,6 +8588,19 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
          fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
      }
- 
+
 +    // I10b debug: log vec path entry to identify crash location
 +    fprintf(stderr, "[VEC-DBG] mul_mat_vec_id src0=%s(buf=%p nbytes=%zu)"
 +        " src1=%s(buf=%p) ids=%s(buf=%p nei0=%llu nei1=%llu)"
