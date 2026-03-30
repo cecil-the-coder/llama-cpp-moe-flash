@@ -1,0 +1,29 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 87ee425..8f8db21 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1227,11 +1227,13 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+     const uint32_t n_tokens = ubatch->n_tokens;
+     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+ 
+-    if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
+-        LLAMA_LOG_WARN("%s: v_idxs buffer is not host-accessible, skipping\n", __func__);
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: v_idxs buffer is NULL, skipping\n", __func__);
+         return;
+     }
+-    int64_t * data = (int64_t *) dst->data;
++    const size_t n_elems = ggml_nbytes(dst) / sizeof(int64_t);
++    std::vector<int64_t> tmp(n_elems);
++    int64_t * data = tmp.data();
+ 
+     if (!v_trans) {
+         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+@@ -1257,6 +1259,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+             }
+         }
+     }
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
