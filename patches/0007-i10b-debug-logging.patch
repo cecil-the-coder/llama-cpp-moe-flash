@@ -1,10 +1,38 @@
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1687,7 +1687,27 @@ static void ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+@@ -1489,12 +1489,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        // I10b debug: log every split entry to find crash location
++        fprintf(stderr, "[SPLIT] id=%d backend=%s n_nodes=%d n_inputs=%d\n",
++            split_id, ggml_backend_name(split_backend),
++            split->graph.n_nodes, split->n_inputs);
++        fflush(stderr);
++
          if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
              ggml_backend_synchronize(split_backend);
          }
  
++        // I10b debug: survived event sync
++        fprintf(stderr, "[SPLIT-POST-SYNC] id=%d\n", split_id);
++        fflush(stderr);
++
+         // copy the input tensors to the split backend
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+@@ -1687,7 +1698,32 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+         if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
+             ggml_backend_synchronize(split_backend);
+         }
+ 
++        // I10b debug: survived post-copy sync, about to dispatch
++        fprintf(stderr, "[SPLIT-PRE-DISPATCH] id=%d backend=%s\n",
++            split_id, ggml_backend_name(split_backend));
++        fflush(stderr);
++
 +        // I10b debug: log MoE GPU splits before compute to identify crash location
 +        if (split->graph.n_nodes > 0) {
 +            struct ggml_tensor * n0 = split->graph.nodes[0];
