@@ -1,8 +1,8 @@
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 23aa974..9c7d56a 100644
+index 23aa974..8f8db21 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1206,28 +1206,21 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1206,36 +1206,34 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
          sinfo.n_stream());
      fflush(stderr);
  
@@ -39,3 +39,26 @@ index 23aa974..9c7d56a 100644
  }
  
  void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+-    int64_t * data = (int64_t *) dst->data;
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: v_idxs buffer is NULL, skipping\n", __func__);
++        return;
++    }
++    const size_t n_elems = ggml_nbytes(dst) / sizeof(int64_t);
++    std::vector<int64_t> tmp(n_elems);
++    int64_t * data = tmp.data();
+ 
+     if (!v_trans) {
+         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+@@ -1261,6 +1259,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+             }
+         }
+     }
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
