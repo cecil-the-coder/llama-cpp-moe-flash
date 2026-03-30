@@ -16,7 +16,7 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-03-30-i10b-kidxs-buft-base-diag
+ARG CACHE_BUST=2026-03-30-i10b-fix-k-idxs-backend-tensor-set
 COPY patches/0001-moe-flash-complete.patch /build/
 COPY patches/0002-moe-expert-offload.patch /build/
 COPY patches/0003-iouring-prefetch-thread.patch /build/
@@ -24,13 +24,15 @@ COPY patches/0004-tq2-kv.patch /build/
 COPY patches/0005-tq2-kv-vulkan.patch /build/
 COPY patches/0006-expert-bitset-cache.patch /build/
 COPY patches/0007-i10b-debug-logging.patch /build/
+COPY patches/0008-fix-k-idxs-backend-tensor-set.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
     && git apply /build/0002-moe-expert-offload.patch \
     && git apply /build/0003-iouring-prefetch-thread.patch \
     && git apply /build/0004-tq2-kv.patch \
     && git apply /build/0005-tq2-kv-vulkan.patch \
     && git apply /build/0006-expert-bitset-cache.patch \
-    && git apply /build/0007-i10b-debug-logging.patch
+    && git apply /build/0007-i10b-debug-logging.patch \
+    && git apply /build/0008-fix-k-idxs-backend-tensor-set.patch
 
 # Build with Vulkan + io_uring
 # Enable AVX512 + extensions for Strix Halo (Zen 5).
