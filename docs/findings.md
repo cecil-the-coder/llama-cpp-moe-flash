@@ -183,6 +183,30 @@ experts would be faster on CPU despite larger size (see I13).
   Gets RDNA3-tuned parameters. May be suboptimal.
 - **IQ3 VGPR pressure** (#20848): IQ3 dequant uses 64 VGPRs on AMD, 40%
   occupancy loss. Prefer Q4_K_M or Q8_0 for expert matmul on AMD.
+- **maxStorageBufferRange = 4 GiB** (RADV): Blocks large expert tensor GPU access.
+  MUL_MAT_ID src0 for Qwen3-235B Q4_K_M ≈ 10 GiB > 4 GiB limit. Required I10b
+  fix to route through correct Vulkan buffer write path (see below).
+
+### I10b: GPU MoE Matmul Crash Fix (2026-03-30)
+
+**Problem**: `set_input_k_idxs` crashes with SIGSEGV when MoE matmul offloads to GPU.
+
+Root cause chain:
+1. `ggml_backend_sched_reserve` calls `gallocr_reserve_n` with zero-initialized
+   `node_backend_ids` (swap bug: A/B arrays swapped after `sched_split_graph`)
+2. Zero backend_id = Vulkan (first backend) → `k_idxs` tensor allocated in
+   `Vulkan_Host` buffer instead of CPU
+3. `Vulkan_Host` passes `ggml_backend_buffer_is_host()` (buft claims host = true)
+   but `ggml_backend_buffer_get_base()` returns `vk_ptr_base = 0x1000` (sentinel)
+4. `tensor->data = 0x1000 + gpu_offset` — writing to this address causes SIGSEGV
+
+**Diagnostic** (patch 0007): `[K_IDXS] buft=Vulkan_Host base=0x1000 data=0x803000`
+confirmed the root cause.
+
+**Fix** (patch 0008): Replace direct `dst->data` write with `ggml_backend_tensor_set()`.
+For `Vulkan_Host`, this dispatches to `ggml_vk_buffer_write()` which computes
+`vk_tensor_offset = tensor->data - 0x1000 = gpu_offset` and correctly transfers
+CPU data to GPU buffer. For CPU buffers: falls back to memcpy (same as before).
 
 Useful RADV env vars for debugging:
 - `RADV_DEBUG=vm,syncshaders` — VA gap + shader sync for GPU fault debugging
