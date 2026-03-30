@@ -1,0 +1,78 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 82fe58f..0e80435 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1239,9 +1239,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+ }
+ 
+ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+-
+-    int32_t * data = (int32_t *) dst->data;
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: k_shift buffer is NULL, skipping\n", __func__);
++        return;
++    }
++    std::vector<int32_t> tmp(ggml_nbytes(dst) / sizeof(int32_t));
++    int32_t * data = tmp.data();
+ 
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         const auto & cells = v_cells[s];
+@@ -1250,6 +1253,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+             data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+         }
+     }
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ struct args_set_input_kq_mask {
+@@ -1446,8 +1450,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float *
+ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+-    float * data = (float *) dst->data;
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: kq_mask buffer is NULL, skipping\n", __func__);
++        return;
++    }
++    std::vector<float> tmp(ggml_nbytes(dst) / sizeof(float), 0.0f);
++    float * data = tmp.data();
+ 
+     const int64_t n_kv     = dst->ne[0];
+     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+@@ -1480,6 +1488,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     //const int64_t t_end = ggml_time_us();
+ 
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+@@ -1488,12 +1497,16 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
+     const auto & cells = v_cells[0];
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
+ 
+-    int32_t * data = (int32_t *) dst->data;
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: pos_bucket buffer is NULL, skipping\n", __func__);
++        return;
++    }
+ 
+     const int32_t n_kv = dst->ne[0];
++    std::vector<int32_t> tmp(ggml_nbytes(dst) / sizeof(int32_t));
++    int32_t * data = tmp.data();
+ 
+     for (int h = 0; h < 1; ++h) {
+         for (int i = 0; i < n_tokens; ++i) {
+@@ -1505,6 +1518,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+             }
+         }
+     }
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ size_t llama_kv_cache::total_size() const {
