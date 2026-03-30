@@ -1,0 +1,234 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 41e804a..6416b99 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -130,16 +130,18 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
+     if (pos_bucket) {
+         const int64_t n_tokens = ubatch->n_tokens;
+ 
+-        GGML_ASSERT(ggml_backend_buffer_is_host(pos_bucket->buffer));
+         GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
+ 
+-        int32_t * data = (int32_t *) pos_bucket->data;
++        if (!pos_bucket->buffer) { return; }
++        std::vector<int32_t> tmp1(ggml_nbytes(pos_bucket) / sizeof(int32_t));
++        int32_t * data = tmp1.data();
+ 
+         for (int j = 0; j < n_tokens; ++j) {
+             for (int i = 0; i < n_tokens; ++i) {
+                 data[j*n_tokens + i] = llama_relative_position_bucket(ubatch->pos[i], ubatch->pos[j], hparams.n_rel_attn_bkts, true);
+             }
+         }
++        ggml_backend_tensor_set(pos_bucket, tmp1.data(), 0, ggml_nbytes(pos_bucket));
+     }
+ }
+ 
+@@ -154,14 +156,18 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
+-    int32_t * data = (int32_t *) out_ids->data;
++    if (!out_ids->buffer) {
++        LLAMA_LOG_WARN("%s: out_ids buffer is NULL, skipping\n", __func__);
++        return;
++    }
++    std::vector<int32_t> tmp2(ggml_nbytes(out_ids) / sizeof(int32_t));
++    int32_t * data = tmp2.data();
+ 
+     if (n_outputs == n_tokens) {
+         for (int i = 0; i < n_tokens; ++i) {
+             data[i] = i;
+         }
+-
++        ggml_backend_tensor_set(out_ids, tmp2.data(), 0, ggml_nbytes(out_ids));
+         return;
+     }
+ 
+@@ -174,6 +180,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+             data[n_outputs++] = i;
+         }
+     }
++    ggml_backend_tensor_set(out_ids, tmp2.data(), 0, ggml_nbytes(out_ids));
+ }
+ 
+ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
+@@ -194,10 +201,9 @@ void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
+         const int64_t n_seqs_unq   = ubatch->n_seqs_unq;
+ 
+         GGML_ASSERT(mean);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(mean->buffer));
+-
+-        float * data = (float *) mean->data;
+-        memset(mean->data, 0, n_tokens*n_seqs_unq*ggml_element_size(mean));
++        if (!mean->buffer) { return; }
++        std::vector<float> tmp3(ggml_nbytes(mean) / sizeof(float), 0.0f);
++        float * data = tmp3.data();
+ 
+         std::vector<uint64_t> sums(n_seqs_unq, 0);
+         for (int i = 0; i < n_tokens; i += n_seq_tokens) {
+@@ -227,6 +233,7 @@ void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
+                 }
+             }
+         }
++        ggml_backend_tensor_set(mean, tmp3.data(), 0, ggml_nbytes(mean));
+     }
+ }
+ 
+@@ -240,10 +247,9 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+         cparams.pooling_type == LLAMA_POOLING_TYPE_LAST
+     )) {
+         GGML_ASSERT(cls);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(cls->buffer));
+-
+-        uint32_t * data = (uint32_t *) cls->data;
+-        memset(cls->data, 0, n_seqs_unq*ggml_element_size(cls));
++        if (!cls->buffer) { return; }
++        std::vector<uint32_t> tmp4(ggml_nbytes(cls) / sizeof(uint32_t), 0);
++        uint32_t * data = tmp4.data();
+ 
+         std::vector<int> target_pos(n_seqs_unq, -1);
+         std::vector<int> target_row(n_seqs_unq, -1);
+@@ -276,6 +282,7 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+                 data[s] = target_row[s];
+             }
+         }
++        ggml_backend_tensor_set(cls, tmp4.data(), 0, ggml_nbytes(cls));
+     }
+ }
+ 
+@@ -285,13 +292,15 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_n_rs();
+ 
+     if (s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+-        int32_t * data = (int32_t *) s_copy->data;
++        if (!s_copy->buffer) { return; }
++        std::vector<int32_t> tmp5(ggml_nbytes(s_copy) / sizeof(int32_t));
++        int32_t * data = tmp5.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->s_copy(i);
+         }
++        ggml_backend_tensor_set(s_copy, tmp5.data(), 0, ggml_nbytes(s_copy));
+     }
+ }
+ 
+@@ -395,32 +404,30 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
+ 
+     {
+         GGML_ASSERT(self_kq_mask);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+-
+-        float * data = (float *) self_kq_mask->data;
+-
+-        std::fill(data, data + ggml_nelements(self_kq_mask), -INFINITY);
++        if (!self_kq_mask->buffer) { return; }
++        std::vector<float> tmp6a(ggml_nbytes(self_kq_mask) / sizeof(float), -INFINITY);
++        float * data = tmp6a.data();
+ 
+         fill_mask(data, 0, LLAMA_SWA_TYPE_NONE);
+ 
+         if (debug) {
+             print_mask(data, n_tokens, n_kv, 0, LLAMA_SWA_TYPE_NONE);
+         }
++        ggml_backend_tensor_set(self_kq_mask, tmp6a.data(), 0, ggml_nbytes(self_kq_mask));
+     }
+ 
+     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+         GGML_ASSERT(self_kq_mask_swa);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
+-
+-        float * data = (float *) self_kq_mask_swa->data;
+-
+-        std::fill(data, data + ggml_nelements(self_kq_mask_swa), -INFINITY);
++        if (!self_kq_mask_swa->buffer) { return; }
++        std::vector<float> tmp6b(ggml_nbytes(self_kq_mask_swa) / sizeof(float), -INFINITY);
++        float * data = tmp6b.data();
+ 
+         fill_mask(data, hparams.n_swa, hparams.swa_type);
+ 
+         if (debug) {
+             print_mask(data, n_tokens, n_kv, hparams.n_swa, hparams.swa_type);
+         }
++        ggml_backend_tensor_set(self_kq_mask_swa, tmp6b.data(), 0, ggml_nbytes(self_kq_mask_swa));
+     }
+ }
+ 
+@@ -503,10 +510,11 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_enc    = cross_kq_mask->ne[0];
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(cross_kq_mask->buffer));
+     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
+ 
+-    float * data = (float *) cross_kq_mask->data;
++    if (!cross_kq_mask->buffer) { return; }
++    std::vector<float> tmp7(ggml_nbytes(cross_kq_mask) / sizeof(float), -INFINITY);
++    float * data = tmp7.data();
+ 
+     for (int i = 0; i < n_tokens; ++i) {
+         GGML_ASSERT(!cross->seq_ids_enc.empty() && "llama_encode must be called first");
+@@ -524,6 +532,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
+             data[i*n_enc + j] = f;
+         }
+     }
++    ggml_backend_tensor_set(cross_kq_mask, tmp7.data(), 0, ggml_nbytes(cross_kq_mask));
+ }
+ 
+ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -535,13 +544,15 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+     if (inp_rs->s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
++        if (!inp_rs->s_copy->buffer) { return; }
++        std::vector<int32_t> tmp8(ggml_nbytes(inp_rs->s_copy) / sizeof(int32_t));
++        int32_t * data = tmp8.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++        ggml_backend_tensor_set(inp_rs->s_copy, tmp8.data(), 0, ggml_nbytes(inp_rs->s_copy));
+     }
+ }
+ 
+@@ -579,13 +590,15 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+     if (inp_rs->s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
++        if (!inp_rs->s_copy->buffer) { return; }
++        std::vector<int32_t> tmp9(ggml_nbytes(inp_rs->s_copy) / sizeof(int32_t));
++        int32_t * data = tmp9.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++        ggml_backend_tensor_set(inp_rs->s_copy, tmp9.data(), 0, ggml_nbytes(inp_rs->s_copy));
+     }
+ }
+ 
+@@ -633,13 +646,15 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+     if (inp_rs->s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
++        if (!inp_rs->s_copy->buffer) { return; }
++        std::vector<int32_t> tmp10(ggml_nbytes(inp_rs->s_copy) / sizeof(int32_t));
++        int32_t * data = tmp10.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++        ggml_backend_tensor_set(inp_rs->s_copy, tmp10.data(), 0, ggml_nbytes(inp_rs->s_copy));
+     }
+ }
+ 
