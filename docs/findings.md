@@ -203,10 +203,30 @@ Root cause chain:
 **Diagnostic** (patch 0007): `[K_IDXS] buft=Vulkan_Host base=0x1000 data=0x803000`
 confirmed the root cause.
 
-**Fix** (patch 0008): Replace direct `dst->data` write with `ggml_backend_tensor_set()`.
-For `Vulkan_Host`, this dispatches to `ggml_vk_buffer_write()` which computes
-`vk_tensor_offset = tensor->data - 0x1000 = gpu_offset` and correctly transfers
-CPU data to GPU buffer. For CPU buffers: falls back to memcpy (same as before).
+**Fix series** (patches 0008-0012): Multiple crash types, all same root cause.
+
+**Type 1 — set_input writes** (patches 0008-0011): Replace direct `dst->data` write
+with `ggml_backend_tensor_set()`. For `Vulkan_Host`, dispatches to `ggml_vk_buffer_write()`
+which computes `vk_offset = tensor->data - 0x1000 = gpu_offset`. Covers:
+- 0008: `set_input_k_idxs`
+- 0009: `set_input_v_idxs`
+- 0010: `set_input_kq_mask`, `set_input_k_shift`, `set_input_pos_bucket`
+- 0011: 10 `set_input` functions in `llama-graph.cpp`
+
+**Type 2 — CPU compute kernels** (patch 0012): CPU kernels (e.g. `ggml_compute_forward_get_rows`)
+dereference `tensor->data` for READ/WRITE operations. Cannot use `ggml_backend_tensor_set`.
+Fix: keep a `static std::unordered_map<void*, void*> s_vk_host_cpu_ptrs` mapping buffer
+context → real CPU pointer from `ggml_vk_host_malloc`. Override `buffer->iface.get_base`
+per-buffer to return the real CPU ptr. Works because `ggml_backend_buffer` stores
+`iface` by value (mutable after `ggml_backend_buffer_init`). All Vulkan buffer ops that
+compute `vk_offset = tensor->data - get_base()` continue to work correctly.
+
+The `ggml_vk_buffer_write` offset calculation is important:
+- Before 0012: `vk_offset = tensor->data - 0x1000`
+- After 0012: `vk_offset = tensor->data - cpu_ptr = offset` (same result, different base)
+
+Note: `ggml_backend_vk_buffer_set_tensor` already uses `ggml_backend_buffer_get_base(buffer)`
+in the offset calculation, so changing `get_base()` fixes the path automatically.
 
 Useful RADV env vars for debugging:
 - `RADV_DEBUG=vm,syncshaders` — VA gap + shader sync for GPU fault debugging
