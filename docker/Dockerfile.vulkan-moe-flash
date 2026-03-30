@@ -16,7 +16,7 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-03-29-i10b-debug
+ARG CACHE_BUST=2026-03-30-i10b-split-logging
 COPY patches/0001-moe-flash-complete.patch /build/
 COPY patches/0002-moe-expert-offload.patch /build/
 COPY patches/0003-iouring-prefetch-thread.patch /build/
