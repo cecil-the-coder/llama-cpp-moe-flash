@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: moe-flash <moe-flash@localhost>
+Date: Mon, 30 Mar 2026 00:00:00 +0000
+Subject: [PATCH] ggml-vulkan: fix Vulkan_Host buffer get_base to return real
+ CPU address (I10b)
+
+After patch 0006 re-enables ggml_backend_vk_buffer_interface for Vulkan_Host
+buffers, get_base() returns VK_PTR_BASE = 0x1000 (GPU sentinel address, NOT
+a valid CPU pointer).
+
+This causes SIGSEGV in CPU compute kernels that dereference tensor->data:
+  tensor->data = 0x1000 + gpu_offset        (invalid CPU address)
+  CPU kernel reads/writes tensor->data   →  SIGSEGV
+
+Confirmed crash: ggml_compute_forward_get_rows (CPU backend) when its DST
+tensor is gallocr-allocated in Vulkan_Host (sched->bufts[CPU] = Vulkan_Host
+on UMA hardware, set in llama-context.cpp for GPU-0 host buffer type).
+
+Same root cause as previous crashes in set_input_k_idxs, set_input_v_idxs,
+set_input_kq_mask etc. — those were fixed with ggml_backend_tensor_set(), but
+CPU compute kernels cannot use that API.
+
+Fix: maintain a static map from buffer context → real CPU ptr (from
+ggml_vk_host_malloc), and override buffer->iface.get_base per-buffer to
+return it. Works because ggml_backend_buffer stores iface by value.
+
+With cpu_ptr as get_base():
+  tensor->data = cpu_ptr + offset          →  valid CPU address for CPU kernels ✓
+  vk_offset = tensor->data - get_base()    →  offset, unchanged for Vulkan ops ✓
+  ggml_backend_tensor_set/get uses offset  →  correct VK buffer r/w ✓
+  ggml_backend_vk_buffer_free_buffer       →  deletes bufctx (VK buffer), unchanged ✓
+  ggml_backend_vk_host_buffer_free_buffer  →  only for fallback CPU path, unaffected ✓
+----
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -13412,5 +13412,20 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffe
+     ggml_vk_host_free(vk_instance.devices[0], ggml_backend_buffer_get_base(buffer));
+ }
+
++// Map from Vulkan_Host buffer context ptr → real CPU base address.
++// ggml_backend_vk_buffer_interface.get_base returns 0x1000 (GPU sentinel),
++// not a valid CPU address. CPU compute kernels (e.g. ggml_compute_forward_get_rows)
++// dereference tensor->data = get_base() + offset → SIGSEGV on 0x1000 + offset.
++static std::unordered_map<void *, void *> s_vk_host_cpu_ptrs;
++
++// Returns real CPU base address for a Vulkan_Host buffer (overrides 0x1000 sentinel).
++// All Vulkan buffer ops compute: vk_offset = tensor->data - ggml_backend_buffer_get_base()
++// With cpu_ptr as base: vk_offset = (cpu_ptr + offset) - cpu_ptr = offset. Correct. ✓
++static void * ggml_backend_vk_host_buffer_get_base(ggml_backend_buffer_t buffer) {
++    auto it = s_vk_host_cpu_ptrs.find(buffer->context);
++    GGML_ASSERT(it != s_vk_host_cpu_ptrs.end());
++    return it->second;
++}
++
+ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+     void * ptr = nullptr;
+@@ -13441,5 +13456,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml
+         ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+-        return buffer;
++        // Fix I10b: override get_base to return real CPU address, not GPU sentinel 0x1000.
++        // CPU compute kernels dereference tensor->data; must be a valid CPU pointer.
++        s_vk_host_cpu_ptrs[bufctx] = ptr;
++        buffer->iface.get_base = ggml_backend_vk_host_buffer_get_base;
++        return buffer;
+     }
+
+     // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
