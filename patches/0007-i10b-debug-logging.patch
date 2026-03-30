@@ -103,9 +103,11 @@
      GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
 
 +    // I10b debug: log every call to pinpoint what dst->data contains
-+    fprintf(stderr, "[K_IDXS] dst=%p buf=%p data=%p ne0=%lld n_tokens=%u sinfo.size=%zu sinfo.n_stream=%zu\n",
++    fprintf(stderr, "[K_IDXS] dst=%p buf=%p buft=%s base=%p data=%p ne0=%lld n_tokens=%u sinfo.size=%zu sinfo.n_stream=%zu\n",
 +        (void*)dst,
 +        dst ? (void*)dst->buffer : nullptr,
++        (dst && dst->buffer) ? ggml_backend_buft_name(dst->buffer->buft) : "null",
++        (dst && dst->buffer) ? ggml_backend_buffer_get_base(dst->buffer) : nullptr,
 +        dst ? dst->data : nullptr,
 +        dst ? (long long)dst->ne[0] : -1LL,
 +        n_tokens,
