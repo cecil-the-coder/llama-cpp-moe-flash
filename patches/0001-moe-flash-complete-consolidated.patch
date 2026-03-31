@@ -895,7 +895,7 @@ index ee2669c..8819c96 100644
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 41e804a..1d67c9b 100644
+index 41e804a..09fd6c4 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -130,16 +130,18 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
@@ -1128,15 +1128,20 @@ index 41e804a..1d67c9b 100644
      }
  }
  
-@@ -1312,6 +1327,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -1312,6 +1327,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
      }
  
-+    // I10b fix: Mark topk indices as output to prevent buffer aliasing/overwriting
-+    // The gallocr aliases this buffer with other tensors, corrupting expert IDs
-+    ggml_set_output(selected_experts);
-+    fprintf(stderr, "[MOE-FIX] Marked %s as OUTPUT (flags=0x%x)\n", selected_experts->name, selected_experts->flags);
++    // I10b fix: Create a copy of selected_experts to prevent buffer aliasing
++    // The gallocr may alias the original buffer, corrupting expert IDs
++    ggml_tensor * selected_experts_copy = ggml_dup(ctx0, selected_experts);
++    ggml_set_name(selected_experts_copy, "ffn_moe_topk_copy");
++    cb(selected_experts_copy, "ffn_moe_topk_copy", il);
++    // Mark copy as output so it won't be overwritten
++    ggml_set_output(selected_experts_copy);
++    fprintf(stderr, "[MOE-FIX] Created copy %s (flags=0x%x) from %s\n", selected_experts_copy->name, selected_experts_copy->flags, selected_experts->name);
 +    fflush(stderr);
++    selected_experts = selected_experts_copy;
 +
      ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
      cb(weights, "ffn_moe_weights", il);
