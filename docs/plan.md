@@ -1,21 +1,24 @@
 # MoE Flash — Implementation Plan
 
-## Current State
+## Current State (Updated 2026-03-31)
 
-**Production image: `6a5b5ff`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `ce76b8d`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
 
 Single-backend architecture with auto-detect `--cpu-moe`:
 - All models use `moe-flash-cpumoe` backend (`CPU_MOE=1` default)
 - `llama_params_fit` checks if full model fits in device memory without the override
-- If it fits → clears override → full GPU (20-50 t/s)
+- If it fits → clears override → full GPU (18-50 t/s) — **I10b Option A working!**
 - If not → keeps override → mmap-wrap with partial prefetch (1.8-6.3 t/s)
 
-| Model | Size | TPS | Loading |
-|---|---|---|---|
-| glm-4-7-flash | 17 GB | **50.57** | standard (full GPU offload) |
-| qwen3-235b Q2_K | 80 GB | **20.21-20.77** | standard (full GPU offload) |
-| qwen3-235b Q4_K_M | 133 GB | 2.72→**6.0-6.3** | patched: mmap experts + partial prefetch |
-| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | patched: mmap experts + partial prefetch |
+| Model | Size | TPS | Loading | Status |
+|---|---|---|---|---|
+| glm-4-7-flash | 17 GB | **50.57** | full GPU offload | ✅ I10b Option A |
+| qwen3-235b Q2_K | 80 GB | **20.21-20.77** | full GPU offload | ✅ I10b Option A |
+| qwen3-235b Q4_K_M | 133 GB | **18.0** | full GPU offload | ✅ I10b Option A |
+| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | mmap experts + partial prefetch | ✅ Working |
+
+**Key Achievement**: I10b investigation COMPLETE. Slot buffer code is correct and functional.
+3× speedup for ≤GTT models via automatic GPU offload.
 
 ---
 

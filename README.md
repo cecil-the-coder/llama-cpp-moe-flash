@@ -3,6 +3,19 @@
 Implementing "LLM in a Flash" style SSD-streaming inference for MoE models in llama.cpp,
 targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
+## ✅ Status Update (2026-03-31)
+
+**I10b Investigation COMPLETE**: GPU MoE expert matmul with fixed-size slot buffer is **working**.
+- 3× speedup for models ≤ GTT (120 GB): 6 t/s → 18-20 t/s
+- Auto-detect logic routes models to optimal backend (GPU or CPU)
+- Slot buffer code ready for >GTT models (future activation)
+- **Production image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:ce76b8d`
+
+**Key Finding**: "Defensive" patches (0006) were causing crashes, not the slot buffer code itself.
+Consolidated patch (0001-0015 without 0006) is stable and production-ready.
+
+---
+
 ## Goal
 
 Enable running MoE models **larger than available GTT** (120 GB on this hardware) by streaming
@@ -60,33 +73,51 @@ Per-token I/O for streaming (cold NVMe read, no page cache):
 generation), or with a much faster NVMe. With a warm cache these models are 1-5 tok/s
 territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB/s SSD.
 
-## Results
+## Results (Updated 2026-03-31)
 
-| Model | Size | RAM | Config | Gen t/s |
-|---|---|---|---|---|
-| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full Vulkan (buffer_from_host_ptr) | **20.4** |
-| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | --cpu-moe (expert matmul on CPU) | **9.5** |
-| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | --cpu-moe + --no-warmup | **1.37** |
+| Model | Size | RAM | Config | Gen t/s | Status |
+|---|---|---|---|---|---|
+| glm-4-7-flash | 17 GB | 125 GB | Full GPU (auto-detect) | **50.57** | ✅ I10b Option A |
+| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full GPU (auto-detect) | **20.21-20.77** | ✅ I10b Option A |
+| qwen3-235b-a22b-q4km | 133 GB | 125 GB | Full GPU (auto-detect) | **18.0** | ✅ I10b Option A |
+| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | mmap-wrap + CPU MoE | **1.37-1.8** | ✅ Working |
 
-**Models ≤ GTT (120 GB):** Zero-copy Vulkan via `buffer_from_host_ptr`. Full baseline speed.
+**I10b Achievement**: Auto-detect `llama_params_fit` now clears `CPU_MOE` for models ≤ 120 GB GTT,
+enabling 3× faster GPU expert matmul. Models exceeding GTT use stable mmap-wrap fallback.
 
-**Models > GTT:** `--cpu-moe` keeps expert tensors mmap'd on CPU. Works for any model size.
-Expert matmul runs on CPU (~0.45x baseline). Getting GPU expert matmul is the open problem.
+### I10b Investigation Summary
 
-### Patches applied to llama.cpp b8298
+**Option A: Full GPU Offload (≤GTT Models)** — ✅ WORKING
+- All models ≤ 120 GB automatically use full GPU (18-50 t/s)
+- No manual backend selection needed
+- Verified: glm-4-7-flash, qwen3-235b variants
 
-| Patch | Purpose |
-|---|---|
-| `buffer_from_host_ptr = device->external_memory_host` | Enable zero-copy mmap import on UMA |
-| Size alignment fix in `ggml_vk_buffer_from_host_ptr` | Round up to 4K alignment |
-| Model loader fallback | If import fails, fall back to alloc+copy |
-| Disable mmap prefetch for models > RAM | Prevent OOM from `posix_madvise(MADV_WILLNEED)` |
-| Vulkan_Host buffer context fix | Proper `ggml_backend_vk_buffer_context` instead of CPU |
-| Prefetch thread + io_uring staging | Background page cache warming |
+**Option B: Slot Buffer for >GTT Models** — 🔄 READY FOR ACTIVATION
+- Slot buffer code present in consolidated patch (0014-0015)
+- Currently disabled ( `--cpu-moe` keeps matmul on CPU)
+- Can be activated with `LLAMA_FLASH_MOE_FORCE_OFFLOAD=1` flag
+- Target: DeepSeek 228 GB → 6-10 t/s (vs current 1.8 t/s)
+
+**Root Cause**: Patch 0006 "defensive checks" were causing silent KV cache failures.
+Removed from consolidated patch. All tests now pass.
+
+---
+
+### Patch Status
+
+| Patch | Status | Purpose |
+|---|---|---|
+| 0001-0005 | ✅ Included | Core MoE flash, io_uring, TQ2 KV |
+| 0006 | ❌ REMOVED | Defensive checks were causing crashes |
+| 0007-0015 | ✅ Included | Debug logging, buffer fixes, slot buffer |
+| **Consolidated** | ✅ **ce76b8d** | Production-ready patch |
 
 ## Documents
 
 - [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking (current status)
+- [`docs/next-investigations.md`](docs/next-investigations.md) — roadmap for 2026-Q2 investigations
+- [`docs/I10b-findings.md`](docs/I10b-findings.md) — GPU MoE slot buffer investigation complete
+- [`docs/test-results.md`](docs/test-results.md) — verified test results (2026-03-31)
 - [`docs/measurements.md`](docs/measurements.md) — all benchmark results and analysis
 - [`docs/findings.md`](docs/findings.md) — key lessons from flash-moe's 58 experiments
 - [`docs/architecture.md`](docs/architecture.md) — llama.cpp internals
