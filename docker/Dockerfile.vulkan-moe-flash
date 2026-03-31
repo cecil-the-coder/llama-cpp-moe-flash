@@ -16,7 +16,7 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-03-31-vec-fusion-fix
+ARG CACHE_BUST=2026-03-31-moe-topk-input-fix
 COPY patches/0001-moe-flash-complete.patch /build/
 COPY patches/0002-moe-expert-offload.patch /build/
 COPY patches/0003-iouring-prefetch-thread.patch /build/
@@ -31,6 +31,7 @@ COPY patches/0011-fix-graph-inputs-vulkan-host-tensor-set.patch /build/
 COPY patches/0012-fix-vulkan-host-get-base-cpu-ptr.patch /build/
 COPY patches/0013-vec-path-debug-logging.patch /build/
 COPY patches/0014-fix-vec-fusion-buffer-aliasing.patch /build/
+COPY patches/0015-fix-moe-topk-buffer-aliasing.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
     && git apply /build/0002-moe-expert-offload.patch \
     && git apply /build/0003-iouring-prefetch-thread.patch \
@@ -40,6 +41,12 @@ RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
     && git apply /build/0007-i10b-debug-logging.patch \
     && git apply /build/0008-fix-k-idxs-backend-tensor-set.patch \
     && git apply /build/0009-fix-v-idxs-backend-tensor-set.patch \
+    && git apply /build/0010-fix-kq-mask-k-shift-pos-bucket-backend-tensor-set.patch \
+    && git apply /build/0011-fix-graph-inputs-vulkan-host-tensor-set.patch \
+    && git apply /build/0012-fix-vulkan-host-get-base-cpu-ptr.patch \
+    && git apply /build/0013-vec-path-debug-logging.patch \
+    && git apply /build/0014-fix-vec-fusion-buffer-aliasing.patch \
+    && git apply /build/0015-fix-moe-topk-buffer-aliasing.patch \
     && git apply /build/0010-fix-kq-mask-k-shift-pos-bucket-backend-tensor-set.patch \
     && git apply /build/0011-fix-graph-inputs-vulkan-host-tensor-set.patch \
     && git apply /build/0012-fix-vulkan-host-get-base-cpu-ptr.patch \
