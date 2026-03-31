@@ -1155,36 +1155,31 @@ index 41e804a..0b173a8 100644
      cb(weights, "ffn_moe_weights", il);
  
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 82fe58f..8a0b7ad 100644
+index 82fe58f..b0f0774 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -1193,7 +1193,12 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1193,7 +1193,9 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
      const uint32_t n_tokens = ubatch->n_tokens;
      GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
  
 -    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-+    // Defensive: if buffer is not host-accessible, skip writing (prevents SIGSEGV
-+    // when graph splits cause this tensor to be allocated on a non-host backend).
-+    if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
-+        LLAMA_LOG_WARN("%s: k_idxs buffer is not host-accessible, skipping\n", __func__);
-+        return;
-+    }
++    // I10b Fix: Defensive checks removed - they caused silent failures.
++    // The buffer should always be host-accessible here; if not, it's a bug.
++    GGML_ASSERT(dst->buffer && ggml_backend_buffer_is_host(dst->buffer));
      int64_t * data = (int64_t *) dst->data;
  
      for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-@@ -1209,7 +1214,10 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1209,7 +1211,8 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
      const uint32_t n_tokens = ubatch->n_tokens;
      GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
  
 -    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-+    if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
-+        LLAMA_LOG_WARN("%s: v_idxs buffer is not host-accessible, skipping\n", __func__);
-+        return;
-+    }
++    // I10b Fix: Defensive checks removed - they caused silent failures.
++    GGML_ASSERT(dst->buffer && ggml_backend_buffer_is_host(dst->buffer));
      int64_t * data = (int64_t *) dst->data;
  
      if (!v_trans) {
-@@ -1239,9 +1247,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+@@ -1239,9 +1242,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
  }
  
  void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
@@ -1200,7 +1195,7 @@ index 82fe58f..8a0b7ad 100644
  
      for (uint32_t s = 0; s < n_stream; ++s) {
          const auto & cells = v_cells[s];
-@@ -1250,6 +1261,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+@@ -1250,6 +1256,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
              data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
          }
      }
@@ -1208,7 +1203,7 @@ index 82fe58f..8a0b7ad 100644
  }
  
  struct args_set_input_kq_mask {
-@@ -1446,8 +1458,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float *
+@@ -1446,8 +1453,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float *
  void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
      const uint32_t n_tokens = ubatch->n_tokens;
  
@@ -1223,7 +1218,7 @@ index 82fe58f..8a0b7ad 100644
  
      const int64_t n_kv     = dst->ne[0];
      const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
-@@ -1480,6 +1496,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+@@ -1480,6 +1491,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
      //const int64_t t_end = ggml_time_us();
  
      //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
@@ -1231,7 +1226,7 @@ index 82fe58f..8a0b7ad 100644
  }
  
  void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-@@ -1488,12 +1505,16 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+@@ -1488,12 +1500,16 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
      GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
      const auto & cells = v_cells[0];
  
@@ -1250,7 +1245,7 @@ index 82fe58f..8a0b7ad 100644
  
      for (int h = 0; h < 1; ++h) {
          for (int i = 0; i < n_tokens; ++i) {
-@@ -1505,6 +1526,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+@@ -1505,6 +1521,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
              }
          }
      }
