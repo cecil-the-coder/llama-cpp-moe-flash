@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: moe-flash <moe-flash@localhost>
 Date: Mon, 30 Mar 2026 00:00:00 +0000
-Subject: [PATCH] ggml-vulkan: fix Vulkan_Host buffer get_base to return real
- CPU address (I10b)
+Subject: [PATCH] ggml-vulkan: fix Vulkan_Host buffer CPU/GPU address duality
+ (I10b)
 
 After patch 0006 re-enables ggml_backend_vk_buffer_interface for Vulkan_Host
 buffers, get_base() returns VK_PTR_BASE = 0x1000 (GPU sentinel address, NOT
@@ -16,28 +16,45 @@ Confirmed crash: ggml_compute_forward_get_rows (CPU backend) when its DST
 tensor is gallocr-allocated in Vulkan_Host (sched->bufts[CPU] = Vulkan_Host
 on UMA hardware, set in llama-context.cpp for GPU-0 host buffer type).
 
-Same root cause as previous crashes in set_input_k_idxs, set_input_v_idxs,
-set_input_kq_mask etc. — those were fixed with ggml_backend_tensor_set(), but
-CPU compute kernels cannot use that API.
+Fix has two parts:
 
-Fix: maintain a static map from buffer context → real CPU ptr (from
-ggml_vk_host_malloc), and override buffer->iface.get_base per-buffer to
-return it. Works because ggml_backend_buffer stores iface by value.
+Part 1 — fix vk_tensor_offset to use ggml_backend_buffer_get_base(buffer)
+instead of hardcoded vk_ptr_base (0x1000). For regular VK buffers,
+get_base() still returns 0x1000 so behavior is unchanged. For Vulkan_Host
+buffers (after Part 2 fix), get_base() returns the real CPU address, and
+vk_tensor_offset correctly computes the byte offset within the VK buffer:
+  vk_tensor_offset = tensor->data - cpu_ptr = byte_offset_in_vk_buf ✓
+
+Part 2 — maintain a static map from Vulkan_Host buffer context → real CPU
+base address, and override buffer->iface.get_base per-buffer to return it.
+Works because ggml_backend_buffer stores iface by value.
 
 With cpu_ptr as get_base():
   tensor->data = cpu_ptr + offset          →  valid CPU address for CPU kernels ✓
-  vk_offset = tensor->data - get_base()    →  offset, unchanged for Vulkan ops ✓
+  vk_tensor_offset = tensor->data - cpu_ptr → offset for VK buffer ops ✓
   ggml_backend_tensor_set/get uses offset  →  correct VK buffer r/w ✓
+  ggml_vk_buffer_write: memcpy(buf->ptr+offset,...) = memcpy(cpu_ptr+offset,...) ✓
   ggml_backend_vk_buffer_free_buffer       →  deletes bufctx (VK buffer), unchanged ✓
-  ggml_backend_vk_host_buffer_free_buffer  →  only for fallback CPU path, unaffected ✓
 ----
- ggml/src/ggml-vulkan/ggml-vulkan.cpp | 25 ++++++++++++++++++++++----
- 1 file changed, 21 insertions(+), 4 deletions(-)
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 29 ++++++++++++++++++++++-----
+ 1 file changed, 24 insertions(+), 5 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 8fc73fe..93216e2 100644
+index 8fc73fe..55b2789 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -1900,9 +1900,9 @@ static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
+
+ static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
+     if (tensor->view_src) {
+-        return (uint8_t *) tensor->view_src->data - (uint8_t *) vk_ptr_base;
++        return (uint8_t *) tensor->view_src->data - (uint8_t *) ggml_backend_buffer_get_base(tensor->view_src->buffer);
+     }
+-    return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
++    return (uint8_t *) tensor->data - (uint8_t *) ggml_backend_buffer_get_base(tensor->buffer);
+ }
+
+ static uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t)
 @@ -13411,6 +13411,21 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
      ggml_vk_host_free(vk_instance.devices[0], buffer->context);
  }
