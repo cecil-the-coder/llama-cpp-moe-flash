@@ -895,7 +895,7 @@ index ee2669c..8819c96 100644
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 41e804a..09fd6c4 100644
+index 41e804a..0b173a8 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -130,16 +130,18 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
@@ -1128,18 +1128,26 @@ index 41e804a..09fd6c4 100644
      }
  }
  
-@@ -1312,6 +1327,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -1312,6 +1327,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
      }
  
-+    // I10b fix: Create a copy of selected_experts to prevent buffer aliasing
-+    // The gallocr may alias the original buffer, corrupting expert IDs
-+    ggml_tensor * selected_experts_copy = ggml_dup(ctx0, selected_experts);
++    // I10b fix: Create a new tensor with its own buffer for selected_experts
++    // to prevent buffer aliasing that corrupts expert IDs
++    ggml_tensor * selected_experts_buf = ggml_new_tensor(ctx0, GGML_TYPE_I32, 4, selected_experts->ne);
++    ggml_set_name(selected_experts_buf, "ffn_moe_topk_buf");
++    cb(selected_experts_buf, "ffn_moe_topk_buf", il);
++    // Mark buffer as output so it won't be aliased
++    ggml_set_output(selected_experts_buf);
++    // Copy data to the new buffer - this ensures we have a separate buffer
++    ggml_tensor * selected_experts_copy = ggml_cpy(ctx0, selected_experts, selected_experts_buf);
 +    ggml_set_name(selected_experts_copy, "ffn_moe_topk_copy");
 +    cb(selected_experts_copy, "ffn_moe_topk_copy", il);
-+    // Mark copy as output so it won't be overwritten
++    // Mark as output so the buffer won't be reused
 +    ggml_set_output(selected_experts_copy);
-+    fprintf(stderr, "[MOE-FIX] Created copy %s (flags=0x%x) from %s\n", selected_experts_copy->name, selected_experts_copy->flags, selected_experts->name);
++    fprintf(stderr, "[MOE-FIX] Created buffer %s (flags=0x%x) and copy %s (flags=0x%x) from %s\n", 
++            selected_experts_buf->name, selected_experts_buf->flags,
++            selected_experts_copy->name, selected_experts_copy->flags, selected_experts->name);
 +    fflush(stderr);
 +    selected_experts = selected_experts_copy;
 +
