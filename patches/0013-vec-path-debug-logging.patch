@@ -1,0 +1,67 @@
+From a23adb34b83a456931549cf4232fffe40b75ae28 Mon Sep 17 00:00:00 2001
+From: Shadow <shadow@code-puppy.dev>
+Date: Tue, 31 Mar 2026 02:44:06 +0000
+Subject: [PATCH] Add debug logging for vec path garbage output investigation
+
+---
+ ggml/src/ggml-backend.cpp            | 14 ++++++++++++++
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp |  8 ++++++--
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index cdac2cf..00f61c6 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1694,6 +1694,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             cached_ids.resize(ggml_bitset_size(n_expert));
+                         }
+ 
++                        int copied_count = 0;
+                         for (int id = 0; id < n_expert; ++id) {
+                             if (!ggml_bitset_get(used_ids.data(), id)) continue;
+                             if (ggml_bitset_get(cached_ids.data(), id)) continue;
+@@ -1701,12 +1702,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             const size_t expert_offset = (size_t)id * expert_size;
+                             const size_t padding = (id < n_expert - 1) ? std::min<size_t>(expert_size, 512) : 0;
+ 
++                            // Debug: log expert copy details
++                            if (copied_count == 0) {
++                                fprintf(stderr, "[EXPERT-COPY] layer=%s n_expert=%ld expert_size=%zu copying:\n", 
++                                    node->name, (long)n_expert, expert_size);
++                            }
++                            fprintf(stderr, "[EXPERT-COPY]   id=%d src_offset=%zu dst_offset=%zu size=%zu\n",
++                                id, expert_offset, expert_offset, expert_size + padding);
++
+                             ggml_backend_tensor_set_async(split_backend,
+                                 input_cpy,
+                                 (const uint8_t *)input->data + expert_offset, expert_offset,
+                                 expert_size + padding);
+ 
+                             ggml_bitset_set(cached_ids.data(), id);
++                            copied_count++;
++                        }
++                        if (copied_count > 0) {
++                            fprintf(stderr, "[EXPERT-COPY]   total copied: %d experts\n", copied_count);
++                            fflush(stderr);
+                         }
+                     }
+                 } else {
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8fc73fe..e061d4b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -8597,8 +8597,12 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+         ids->name, (void*)ids->buffer,
+         (unsigned long long)nei0, (unsigned long long)nei1,
+         dst->name, (void*)dst->buffer);
+-    fprintf(stderr, "[VEC-DBG] d_Qx.buf=%p d_ids.buf=%p d_D.buf=%p\n",
+-        (void*)d_Qx.buffer.get(), (void*)d_ids.buffer.get(), (void*)d_D.buffer.get());
++    fprintf(stderr, "[VEC-DBG] d_Qx.buf=%p d_ids.buf=%p d_D.buf=%p fusion_flags=0x%x n_fused=%d\n",
++        (void*)d_Qx.buffer.get(), (void*)d_ids.buffer.get(), (void*)d_D.buffer.get(),
++        fusion_flags, ctx->num_additional_fused_ops);
++    if (ctx->num_additional_fused_ops > 0) {
++        fprintf(stderr, "[VEC-DBG] d_F0.buf=%p (bias/scale for fusion)\n", (void*)d_F0.buffer.get());
++    }
+     fflush(stderr);
+ 
+     // Loop over the batch dimension

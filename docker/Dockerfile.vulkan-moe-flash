@@ -16,7 +16,7 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-03-30-i10b-fix-vulkan-host-get-base
+ARG CACHE_BUST=2026-03-31-vec-path-debug
 COPY patches/0001-moe-flash-complete.patch /build/
 COPY patches/0002-moe-expert-offload.patch /build/
 COPY patches/0003-iouring-prefetch-thread.patch /build/
@@ -29,6 +29,7 @@ COPY patches/0009-fix-v-idxs-backend-tensor-set.patch /build/
 COPY patches/0010-fix-kq-mask-k-shift-pos-bucket-backend-tensor-set.patch /build/
 COPY patches/0011-fix-graph-inputs-vulkan-host-tensor-set.patch /build/
 COPY patches/0012-fix-vulkan-host-get-base-cpu-ptr.patch /build/
+COPY patches/0013-vec-path-debug-logging.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
     && git apply /build/0002-moe-expert-offload.patch \
     && git apply /build/0003-iouring-prefetch-thread.patch \
@@ -40,7 +41,8 @@ RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-complete.patch \
     && git apply /build/0009-fix-v-idxs-backend-tensor-set.patch \
     && git apply /build/0010-fix-kq-mask-k-shift-pos-bucket-backend-tensor-set.patch \
     && git apply /build/0011-fix-graph-inputs-vulkan-host-tensor-set.patch \
-    && git apply /build/0012-fix-vulkan-host-get-base-cpu-ptr.patch
+    && git apply /build/0012-fix-vulkan-host-get-base-cpu-ptr.patch \
+    && git apply /build/0013-vec-path-debug-logging.patch
 
 # Build with Vulkan + io_uring
 # Enable AVX512 + extensions for Strix Halo (Zen 5).
