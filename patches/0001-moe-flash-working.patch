@@ -10,6 +10,34 @@ index 41da856..0f02c30 100644
  };
  
  static ggml_type kv_cache_type_from_str(const std::string & s) {
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 9fd3f7f..25a3a63 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -340,6 +340,23 @@ extern "C" {
+     // Set a callback to be called for each resulting node during graph compute
+     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+ 
++    // Called when the scheduler performs selective expert copy for MUL_MAT_ID.
++    // Provides the used expert IDs so the caller can prefetch next-layer experts.
++    //   node      - the MUL_MAT_ID node (name contains layer info)
++    //   used_ids  - bitset of selected expert IDs (use ggml_bitset_get to query)
++    //   n_expert  - total number of experts
++    //   user_data - opaque pointer set by the caller
++    typedef void (*ggml_backend_sched_expert_copy_callback)(
++        const struct ggml_tensor * node,
++        const uint32_t * used_ids_bitset,
++        int n_expert,
++        void * user_data);
++
++    GGML_API void ggml_backend_sched_set_expert_copy_callback(
++        ggml_backend_sched_t sched,
++        ggml_backend_sched_expert_copy_callback callback,
++        void * user_data);
++
+     //
+     // Utils
+     //
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
 index 3323f8e..fede27d 100644
 --- a/ggml/include/ggml.h
@@ -25,41 +53,252 @@ index 3323f8e..fede27d 100644
  
      // precision
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df2..12c1ed9 100644
+index bc57df2..d6e337d 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -1530,13 +1530,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
-                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
-                         const size_t padding = std::min<size_t>(expert_size, 512);
-                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
--
+@@ -20,6 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <unordered_map>
+ #include <vector>
+ 
+ #ifdef __APPLE__
+@@ -724,6 +725,9 @@ struct ggml_backend_sched {
+     ggml_backend_sched_eval_callback callback_eval;
+     void * callback_eval_user_data;
+ 
++    ggml_backend_sched_expert_copy_callback callback_expert_copy;
++    void * callback_expert_copy_user_data;
++
+     char * context_buffer;
+     size_t context_buffer_size;
+ 
+@@ -834,6 +838,18 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+                         return b;
+                     }
+                 }
++                // I10b: Force-offload MUL_MAT_ID to GPU when expert tensor fits
++                // within maxStorageBufferRange (~4 GiB). Bypasses offload_op which
++                // rejects bs=1 (ne[2]=1 < min_batch_size=32). Only activates when
++                // supports_op passes (tensor fits in device buffer limits).
++                if (tensor->op == GGML_OP_MUL_MAT_ID) {
++                    for (int b = 0; b < src_backend_id; b++) {
++                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
++                            SET_CAUSE(tensor, "1.moe");
++                            return b;
++                        }
++                    }
++                }
+             }
+             SET_CAUSE(tensor, "1.wgt%d", i);
+             return src_backend_id;
+@@ -1265,6 +1281,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++
+                             if (sched->n_copies > 1) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+@@ -1450,6 +1467,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
+ 
++    // Expert cache: track which experts are already in GPU copy tensor
++    static std::unordered_map<const ggml_tensor *, std::vector<ggml_bitset_t>> expert_cache;
++
++    // I10b: Slot buffer cache for oversized MoE expert tensors.
++    // Maps expert IDs to fixed slots in a shrunk GPU buffer.
++    struct moe_slot_cache {
++        int n_slots = 0;
++        std::vector<int32_t> expert_to_slot;  // [n_expert] → slot or -1
++        std::vector<int32_t> slot_to_expert;  // [n_slots] → expert or -1
++        std::vector<int64_t> slot_lru;        // [n_slots] → timestamp
++        int64_t clock = 0;
++    };
++    static std::unordered_map<const ggml_tensor *, moe_slot_cache> slot_caches;
++
++    // I10b: Cache original (unrewritten) IDS values per ids_tensor.
++    // When slot buffer mode rewrites IDS with slot indices, other projections
++    // sharing the same IDS tensor must use the original expert IDs for slot assignment.
++    static std::unordered_map<const ggml_tensor *, std::vector<int32_t>> original_ids_cache;
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+@@ -1505,11 +1541,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+                     }
+ 
++                    // I10b: Slot remap mode — when expert tensor exceeds maxStorageBufferRange
++                    // (4 GiB), copy active experts into low slots (0..K-1) and rewrite IDS
++                    // with slot indices. Tensor shape stays ne[2]=n_expert (graph correctness)
++                    // but only the first K*expert_size bytes of the GPU buffer are accessed.
++                    // The descriptor binding is clamped to maxStorageBufferRange by the Vulkan
++                    // backend; the shader early-exits for experts with 0 token count.
++                    #define GGML_MOE_SLOT_BUFFER_SLOTS 32
++                    const bool slot_remap_mode = (size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024;
++
++                    // In slot remap mode, the IDS tensor on GPU may have been rewritten
++                    // by a previous projection (gate/up/down share the same IDS tensor).
++                    // Use cached original expert IDs instead.
++                    if (slot_remap_mode && ids_tensor == prev_ids_tensor) {
++                        auto it = original_ids_cache.find(ids_tensor);
++                        if (it != original_ids_cache.end()) {
++                            ids = it->second;
++                        }
++                    }
++
+                     if (ids_tensor != prev_ids_tensor) {
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                         ggml_backend_synchronize(ids_backend);
+ 
++                        if (slot_remap_mode) {
++                            original_ids_cache[ids_tensor] = ids;
++                        }
++
+                         // find the used experts
+                         used_ids.clear();
+                         used_ids.resize(ggml_bitset_size(n_expert));
+@@ -1522,46 +1581,93 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+ 
+                         prev_ids_tensor = ids_tensor;
++
++                        if (sched->callback_expert_copy) {
++                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
++                        }
+                     }
+ 
+-                    // group consecutive experts and copy them together
+-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+-                        const size_t expert_offset = first_id * expert_size;
+-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+-                        const size_t padding = std::min<size_t>(expert_size, 512);
+-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
++                    if (slot_remap_mode) {
++                        const int n_slots = GGML_MOE_SLOT_BUFFER_SLOTS;
+ 
 -                        ggml_backend_tensor_set_async(split_backend,
 -                            input_cpy,
 -                            (const uint8_t *)input->data + expert_offset, expert_offset,
 -                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
 -                            // this is necessary for MMQ in the CUDA backend
 -                            expert_size_copy + padding_end);
-+                        const size_t copy_size = expert_size_copy + padding_end;
+-                    };
+-
+-                    int id = 0;
+-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+-                        id++;
+-                    }
+-                    int32_t first_id = id;
+-                    int32_t last_id = first_id;
++                        auto & sc = slot_caches[input_cpy];
++                        if (sc.n_slots == 0) {
++                            sc.n_slots = n_slots;
++                            sc.expert_to_slot.assign(n_expert, -1);
++                            sc.slot_to_expert.assign(n_slots, -1);
++                            sc.slot_lru.assign(n_slots, 0);
++                        }
++                        sc.clock++;
+ 
+-                    for (++id; id < n_expert; ++id) {
+-                        if (!ggml_bitset_get(used_ids.data(), id)) {
+-                            continue;
++                        for (int id = 0; id < n_expert; ++id) {
++                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
 +
-+                        if (ggml_backend_buffer_is_host(input->buffer)) {
-+                            // Host buffer: direct pointer access (fast path)
++                            if (sc.expert_to_slot[id] >= 0) {
++                                sc.slot_lru[sc.expert_to_slot[id]] = sc.clock;
++                                continue;
++                            }
++
++                            int slot = -1;
++                            for (int s = 0; s < n_slots; s++) {
++                                if (sc.slot_to_expert[s] == -1) { slot = s; break; }
++                            }
++                            if (slot == -1) {
++                                int64_t min_lru = INT64_MAX;
++                                for (int s = 0; s < n_slots; s++) {
++                                    if (sc.slot_lru[s] < min_lru) { min_lru = sc.slot_lru[s]; slot = s; }
++                                }
++                                int old_expert = sc.slot_to_expert[slot];
++                                if (old_expert >= 0) sc.expert_to_slot[old_expert] = -1;
++                            }
++
++                            sc.expert_to_slot[id] = slot;
++                            sc.slot_to_expert[slot] = id;
++                            sc.slot_lru[slot] = sc.clock;
++
++                            // Copy expert data to LOW slot index (within 4 GiB range)
++                            const size_t src_offset = (size_t)id * expert_size;
++                            const size_t dst_offset = (size_t)slot * expert_size;
++                            const size_t padding = (slot < n_slots - 1) ? std::min<size_t>(expert_size, 512) : 0;
++
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + src_offset, dst_offset,
++                                expert_size + padding);
+                         }
+ 
+-                        if (id == last_id + 1) {
+-                            last_id = id;
+-                            continue;
++                        // Rewrite IDS: replace expert IDs with slot indices
++                        for (size_t i = 0; i < ids.size(); i++) {
++                            int32_t eid = ids[i];
++                            GGML_ASSERT(eid >= 0 && eid < n_expert && sc.expert_to_slot[eid] >= 0);
++                            ids[i] = sc.expert_to_slot[eid];
+                         }
+ 
+-                        copy_experts(first_id, last_id);
++                        // Write rewritten IDS to GPU
++                        ggml_tensor * ids_gpu = node->src[2];
++                        ggml_backend_tensor_set_async(split_backend,
++                            ids_gpu, ids.data(), 0, ids.size() * sizeof(int32_t));
++                    } else {
++                        // Normal mode: full-size copy tensor, use bitset cache
++                        auto & cached_ids = expert_cache[input_cpy];
++                        if (cached_ids.empty()) {
++                            cached_ids.resize(ggml_bitset_size(n_expert));
++                        }
++
++                        for (int id = 0; id < n_expert; ++id) {
++                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
++                            if (ggml_bitset_get(cached_ids.data(), id)) continue;
++
++                            const size_t expert_offset = (size_t)id * expert_size;
++                            const size_t padding = (id < n_expert - 1) ? std::min<size_t>(expert_size, 512) : 0;
++
 +                            ggml_backend_tensor_set_async(split_backend,
 +                                input_cpy,
 +                                (const uint8_t *)input->data + expert_offset, expert_offset,
-+                                copy_size);
-+                        } else {
-+                            // Non-host buffer (e.g., Vulkan_Host with virtual pointers):
-+                            // read through backend API, then write to split buffer
-+                            std::vector<uint8_t> staging(copy_size);
-+                            ggml_backend_tensor_get(input, staging.data(), expert_offset, copy_size);
-+                            ggml_backend_tensor_set_async(split_backend,
-+                                input_cpy,
-+                                staging.data(), expert_offset,
-+                                copy_size);
-+                        }
-                     };
++                                expert_size + padding);
  
-                     int id = 0;
+-                        first_id = id;
+-                        last_id = id;
++                            ggml_bitset_set(cached_ids.data(), id);
++                        }
+                     }
+-                    copy_experts(first_id, last_id);
+                 } else {
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+@@ -1828,6 +1934,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_eval_user_data = user_data;
+ }
+ 
++void ggml_backend_sched_set_expert_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_copy_callback callback, void * user_data) {
++    GGML_ASSERT(sched);
++    sched->callback_expert_copy = callback;
++    sched->callback_expert_copy_user_data = user_data;
++}
++
+ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     return sched->n_splits;
 diff --git a/ggml/src/ggml-common.h b/ggml/src/ggml-common.h
 index 92cf739..73fc813 100644
 --- a/ggml/src/ggml-common.h
@@ -194,76 +433,104 @@ index 00604f7..f966c23 100644
  GGML_API size_t quantize_q2_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
  GGML_API size_t quantize_q3_K(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix);
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-index 61d112c..39e7c7e 100644
+index 61d112c..4862951 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -3399,11 +3399,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
-         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
-         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
-         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
-+        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_SCALAR, )
-     } else {
-         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
-         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
-         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, _fp32)
-         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, _fp32)
-+        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_SCALAR, _fp32)
-     }
- #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
-     if (device->coopmat1_fa_support) {
-@@ -3411,6 +3413,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
-         CREATE_FA(GGML_TYPE_F16, f16, FA_COOPMAT1, _cm1)
-         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_COOPMAT1, _cm1)
-         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_COOPMAT1, _cm1)
-+        CREATE_FA(GGML_TYPE_TQ2_KV, tq2_kv, FA_COOPMAT1, _cm1)
-     }
- #endif
- #if defined(VK_NV_cooperative_matrix2) && defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-@@ -4274,7 +4277,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
-         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_0], "set_rows_q5_0" #itype, set_rows_q5_0 ## itype ## rte ## _len, set_rows_q5_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q5_1], "set_rows_q5_1" #itype, set_rows_q5_1 ## itype ## rte ## _len, set_rows_q5_1 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-         ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_Q8_0], "set_rows_q8_0" #itype, set_rows_q8_0 ## itype ## rte ## _len, set_rows_q8_0 ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
--        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## rte ## _len, set_rows_iq4_nl ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
-+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_IQ4_NL], "set_rows_iq4_nl" #itype, set_rows_iq4_nl ## itype ## rte ## _len, set_rows_iq4_nl ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true); \
-+        ggml_vk_create_pipeline(device, device->pipeline_set_rows ## itype [GGML_TYPE_TQ2_KV], "set_rows_tq2_kv" #itype, set_rows_tq2_kv ## itype ## rte ## _len, set_rows_tq2_kv ## itype ## rte ## _data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+@@ -1900,9 +1900,9 @@ static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
  
-     if (device->float_controls_rte_fp16) {
-         SET_ROWS(_i32, _rte)
-@@ -13407,10 +13411,23 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
-         ptr = ggml_vk_host_malloc(vk_instance.devices[0], size);
-     } catch (vk::SystemError& e) {
-         GGML_LOG_WARN("ggml_vulkan: Failed to allocate pinned memory (%s)\n", e.what());
--        // fallback to cpu buffer
+ static uint64_t vk_tensor_offset(const ggml_tensor * tensor) {
+     if (tensor->view_src) {
+-        return (uint8_t *) tensor->view_src->data - (uint8_t *) vk_ptr_base;
++        return (uint8_t *) tensor->view_src->data - (uint8_t *) ggml_backend_buffer_get_base(tensor->view_src->buffer);
+     }
+-    return (uint8_t *) tensor->data - (uint8_t *) vk_ptr_base;
++    return (uint8_t *) tensor->data - (uint8_t *) ggml_backend_buffer_get_base(tensor->buffer);
+ }
+ 
+ static uint32_t get_misalign_bytes(const ggml_backend_vk_context * ctx, const ggml_tensor * t)
+@@ -8389,7 +8389,14 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+     ggml_tensor * src0 = dst->src[0];
+     ggml_tensor * src1 = dst->src[1];
+     ggml_tensor * ids = dst->src[2];
+-    VK_LOG_DEBUG("ggml_vk_mul_mat_vec_id_q_f16((" << src0 << ", name=" << src0->name << ", type=" << src0->type << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
++    
++    // I10b debug: Always log vec path entry
++    fprintf(stderr, "[I10b-CRASH-DBG] ENTER vec_id node=%d\n", node_idx);
++    fprintf(stderr, "[I10b-CRASH-DBG] dst=%s src0=%s(src2_ne2=%ld) src1=%s ids=%s\n",
++            dst->name, src0->name, src0->ne[2], src1->name, ids->name);
++    fprintf(stderr, "[I10b-CRASH-DBG] src0 buf=%p data=%p ne2=%ld ne3=%ld\n",
++            (void*)src0->buffer, (void*)src0->data, src0->ne[2], src0->ne[3]);
++    fflush(stderr);
+     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << src1->type << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
+     std::cerr << "), (" << ids << ", name=" << ids->name << ", type=" << ids->type << ", ne0=" << ids->ne[0] << ", ne1=" << ids->ne[1] << ", ne2=" << ids->ne[2] << ", ne3=" << ids->ne[3] << ", nb0=" << ids->nb[0] << ", nb1=" << ids->nb[1] << ", nb2=" << ids->nb[2] << ", nb3=" << ids->nb[3];
+     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
+@@ -13398,6 +13405,21 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
+     ggml_vk_host_free(vk_instance.devices[0], buffer->context);
+ }
+ 
++// Map from Vulkan_Host buffer context ptr → real CPU base address.
++// ggml_backend_vk_buffer_interface.get_base returns 0x1000 (GPU sentinel),
++// not a valid CPU address. CPU compute kernels (e.g. ggml_compute_forward_get_rows)
++// dereference tensor->data = get_base() + offset → SIGSEGV on 0x1000 + offset.
++static std::unordered_map<void *, void *> s_vk_host_cpu_ptrs;
++
++// Returns real CPU base address for a Vulkan_Host buffer (overrides 0x1000 sentinel).
++// All Vulkan buffer ops compute: vk_offset = tensor->data - ggml_backend_buffer_get_base()
++// With cpu_ptr as base: vk_offset = (cpu_ptr + offset) - cpu_ptr = offset. Correct.
++static void * ggml_backend_vk_host_buffer_get_base(ggml_backend_buffer_t buffer) {
++    auto it = s_vk_host_cpu_ptrs.find(buffer->context);
++    GGML_ASSERT(it != s_vk_host_cpu_ptrs.end());
++    return it->second;
++}
++
+ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
+ 
+@@ -13411,6 +13433,29 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
          return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
      }
-+    if (ptr == nullptr) {
-+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-+    }
-+
+ 
 +    // Look up the pinned vk_buffer that ggml_vk_host_malloc registered
 +    vk_buffer vk_buf = nullptr;
 +    size_t buf_offset = 0;
 +    ggml_vk_host_get(vk_instance.devices[0], ptr, vk_buf, buf_offset);
 +
-+    // Keep CPU buffer interface — Vulkan dispatch via host_get works for
-+    // selective expert copy (real host pointers). supports_buft + vk_buffer_context
-+    // causes GPU page fault on RADV when compute shaders read from pinned memory.
-+    GGML_UNUSED(vk_buf);
- 
-+    // Fallback: wrap as CPU buffer
++    if (vk_buf) {
++        // Create a proper Vulkan buffer context so that the dispatch code
++        // can cast buffer->context to ggml_backend_vk_buffer_context.
++        // This is critical for supports_buft to work without SIGSEGV.
++        // Copy (not move) the shared_ptr — pinned_memory also holds a reference
++        vk_buffer vk_buf_copy = vk_buf;
++        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(
++            vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
++
++        ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
++        // Fix I10b: override get_base to return real CPU address, not GPU sentinel 0x1000.
++        // CPU compute kernels dereference tensor->data; must be a valid CPU pointer.
++        s_vk_host_cpu_ptrs[bufctx] = ptr;
++        buffer->iface.get_base = ggml_backend_vk_host_buffer_get_base;
++        return buffer;
++    }
++
++    // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
      ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
      buffer->buft = buft;
      buffer->iface.free_buffer = ggml_backend_vk_host_buffer_free_buffer;
-@@ -13421,7 +13438,7 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
- }
+@@ -13798,6 +13843,13 @@ static bool ggml_vk_can_fuse(const ggml_backend_vk_context * ctx, const struct g
+         const ggml_tensor *add = cgraph->nodes[node_idx + 1];
+         const ggml_tensor *bias = add->src[1];
  
- static size_t ggml_backend_vk_host_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
--    return vk_instance.devices[0]->properties.limits.minMemoryMapAlignment;
-+    return vk_instance.devices[0]->properties.limits.minStorageBufferOffsetAlignment;
- 
-     UNUSED(buft);
- }
-@@ -14942,10 +14959,11 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
++        // I10b: Disable ADD_ID fusion when using slot buffer (shrunk expert tensor).
++        // The bias tensor is indexed by expert_id, but with slot buffer the IDS contain
++        // slot indices, not expert IDs. Fusing would index bias by slot instead of expert.
++        if (mul->src[0] && bias && mul->src[0]->ne[2] != bias->ne[1]) {
++            return false;
++        }
++
+         if (mul != add->src[0]) {
+             return false;
+         }
+@@ -14942,10 +14994,11 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
      props->type        = ggml_backend_vk_device_get_type(dev);
      props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
      ggml_backend_vk_device_get_memory(dev, &props->memory_free, &props->memory_total);
@@ -276,28 +543,7 @@ index 61d112c..39e7c7e 100644
          /* .events                = */ true,
      };
  }
-@@ -15126,6 +15144,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
-                 case GGML_TYPE_Q8_0:
-                     // supported in scalar and coopmat2 paths
-                     break;
-+                case GGML_TYPE_TQ2_KV:
-+                    // supported in scalar and coopmat1 paths (not coopmat2)
-+                    if (!device->coopmat1_fa_support) {
-+                        return false;
-+                    }
-+                    break;
-                 case GGML_TYPE_Q4_1:
-                 case GGML_TYPE_Q5_0:
-                 case GGML_TYPE_Q5_1:
-@@ -15202,6 +15226,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
-                     case GGML_TYPE_Q5_1:
-                     case GGML_TYPE_Q8_0:
-                     case GGML_TYPE_IQ4_NL:
-+                    case GGML_TYPE_TQ2_KV:
-                         return true;
-                     default:
-                         return false;
-@@ -15487,14 +15512,13 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+@@ -15487,14 +15540,19 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
  }
  
  static bool ggml_backend_vk_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
@@ -311,13 +557,18 @@ index 61d112c..39e7c7e 100644
  
 -    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
 -    ggml_backend_vk_buffer_type_context * buft_ctx = (ggml_backend_vk_buffer_type_context *)buft->context;
--
++    // Vulkan_Host buffers now use ggml_backend_vk_buffer_context (with dev_buffer),
++    // so they can be safely used in Vulkan dispatch without graph splits.
++    if (buft->iface.get_name == ggml_backend_vk_host_buffer_type_name) {
++        return true;
++    }
+ 
 -    return buft_ctx->device->idx == ctx->device;
 +    return false;
  }
  
  static int64_t ggml_vk_get_op_batch_size(const ggml_tensor * op) {
-@@ -15564,21 +15588,28 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
+@@ -15564,13 +15622,13 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
          return {};
      }
  
@@ -328,8 +579,6 @@ index 61d112c..39e7c7e 100644
 -    }
 -    if (size & (device->min_imported_host_pointer_alignment - 1)) {
 +    if (uptr & (align - 1)) {
-+        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: ptr %p misaligned (need %zu, off by %zu)\n",
-+            ptr, align, uptr & (align - 1));
          return {};
      }
 +    // Round up size to alignment (the mmap'd region extends to page boundary)
@@ -337,43 +586,6 @@ index 61d112c..39e7c7e 100644
  
      const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
  
-     vk_buffer buf {};
-+    if (size > device->max_buffer_size) {
-+        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr: size %.1f GiB exceeds max_buffer_size %.1f GiB\n",
-+            size / (1024.0 * 1024.0 * 1024.0), device->max_buffer_size / (1024.0 * 1024.0 * 1024.0));
-+        return {};
-+    }
-     try {
-         buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
-     } catch (vk::SystemError& e) {
--        GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
-+        GGML_LOG_WARN("ggml_vulkan: buffer_from_host_ptr failed: %s (size=%.1f GiB)\n", e.what(), size / (1024.0 * 1024.0 * 1024.0));
-     }
- 
-     return buf;
-@@ -15591,17 +15622,15 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
-     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
-     auto device = ggml_vk_get_device(ctx->device);
- 
-+    // Try single-buffer import first
-     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
- 
--    if (!buf) {
--        return {};
-+    if (buf) {
-+        ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
-+        return ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
-     }
- 
--    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
--
--    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
--
--    return ret;
-+    return {};
- }
- 
- static const struct ggml_backend_device_i ggml_backend_vk_device_i = {
 diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp b/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
 index b8c40ee..668bce8 100644
 --- a/ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp
@@ -566,10 +778,10 @@ index e5b83e1..be02a45 100644
          case GGML_TYPE_IQ3_XXS: result = quantize_iq3_xxs(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
 diff --git a/include/llama-moe-flash.h b/include/llama-moe-flash.h
 new file mode 100644
-index 0000000..0bfd8bb
+index 0000000..2b04d6d
 --- /dev/null
 +++ b/include/llama-moe-flash.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,60 @@
 +#pragma once
 +
 +#include "llama.h"
@@ -621,6 +833,12 @@ index 0000000..0bfd8bb
 +// this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
 +void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx);
 +
++// Install prediction-based prefetch on the scheduler.
++// When the scheduler copies selected experts for MUL_MAT_ID, this callback
++// prefetches the same experts for the next layer via posix_fadvise.
++// Call after ggml_backend_sched_new, before first compute.
++void llama_moe_flash_install_sched_hook(struct llama_moe_flash_context * ctx, ggml_backend_sched_t sched);
++
 +#ifdef __cplusplus
 +}
 +#endif
@@ -657,7 +875,7 @@ index 283823f..0bfbdf4 100644
      set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
      target_compile_definitions(llama PRIVATE LLAMA_BUILD)
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ee2669c..5c44941 100644
+index ee2669c..8819c96 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -6,6 +6,7 @@
@@ -668,7 +886,19 @@ index ee2669c..5c44941 100644
  #include "llama-model.h"
  
  #include <cinttypes>
-@@ -1164,6 +1165,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -407,6 +408,11 @@ void llama_context::sched_reserve() {
+ 
+     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+ 
++    // Install prediction-based expert prefetch hook on the scheduler
++    if (cparams.cb_eval_user_data) {
++        llama_moe_flash_install_sched_hook((llama_moe_flash_context *)cparams.cb_eval_user_data, sched.get());
++    }
++
+     llama_memory_context_ptr mctx;
+     if (memory) {
+         LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+@@ -1164,6 +1170,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
      }
  
@@ -680,6 +910,370 @@ index ee2669c..5c44941 100644
      const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 41e804a..0b173a8 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -130,16 +130,18 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
+     if (pos_bucket) {
+         const int64_t n_tokens = ubatch->n_tokens;
+ 
+-        GGML_ASSERT(ggml_backend_buffer_is_host(pos_bucket->buffer));
+         GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
+ 
+-        int32_t * data = (int32_t *) pos_bucket->data;
++        if (!pos_bucket->buffer) { return; }
++        std::vector<int32_t> tmp1(ggml_nbytes(pos_bucket) / sizeof(int32_t));
++        int32_t * data = tmp1.data();
+ 
+         for (int j = 0; j < n_tokens; ++j) {
+             for (int i = 0; i < n_tokens; ++i) {
+                 data[j*n_tokens + i] = llama_relative_position_bucket(ubatch->pos[i], ubatch->pos[j], hparams.n_rel_attn_bkts, true);
+             }
+         }
++        ggml_backend_tensor_set(pos_bucket, tmp1.data(), 0, ggml_nbytes(pos_bucket));
+     }
+ }
+ 
+@@ -154,14 +156,18 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+ 
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
+-    int32_t * data = (int32_t *) out_ids->data;
++    if (!out_ids->buffer) {
++        LLAMA_LOG_WARN("%s: out_ids buffer is NULL, skipping\n", __func__);
++        return;
++    }
++    std::vector<int32_t> tmp2(ggml_nbytes(out_ids) / sizeof(int32_t));
++    int32_t * data = tmp2.data();
+ 
+     if (n_outputs == n_tokens) {
+         for (int i = 0; i < n_tokens; ++i) {
+             data[i] = i;
+         }
+-
++        ggml_backend_tensor_set(out_ids, tmp2.data(), 0, ggml_nbytes(out_ids));
+         return;
+     }
+ 
+@@ -174,6 +180,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
+             data[n_outputs++] = i;
+         }
+     }
++    ggml_backend_tensor_set(out_ids, tmp2.data(), 0, ggml_nbytes(out_ids));
+ }
+ 
+ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
+@@ -194,10 +201,9 @@ void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
+         const int64_t n_seqs_unq   = ubatch->n_seqs_unq;
+ 
+         GGML_ASSERT(mean);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(mean->buffer));
+-
+-        float * data = (float *) mean->data;
+-        memset(mean->data, 0, n_tokens*n_seqs_unq*ggml_element_size(mean));
++        if (!mean->buffer) { return; }
++        std::vector<float> tmp3(ggml_nbytes(mean) / sizeof(float), 0.0f);
++        float * data = tmp3.data();
+ 
+         std::vector<uint64_t> sums(n_seqs_unq, 0);
+         for (int i = 0; i < n_tokens; i += n_seq_tokens) {
+@@ -227,6 +233,7 @@ void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
+                 }
+             }
+         }
++        ggml_backend_tensor_set(mean, tmp3.data(), 0, ggml_nbytes(mean));
+     }
+ }
+ 
+@@ -240,10 +247,9 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+         cparams.pooling_type == LLAMA_POOLING_TYPE_LAST
+     )) {
+         GGML_ASSERT(cls);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(cls->buffer));
+-
+-        uint32_t * data = (uint32_t *) cls->data;
+-        memset(cls->data, 0, n_seqs_unq*ggml_element_size(cls));
++        if (!cls->buffer) { return; }
++        std::vector<uint32_t> tmp4(ggml_nbytes(cls) / sizeof(uint32_t), 0);
++        uint32_t * data = tmp4.data();
+ 
+         std::vector<int> target_pos(n_seqs_unq, -1);
+         std::vector<int> target_row(n_seqs_unq, -1);
+@@ -276,6 +282,7 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+                 data[s] = target_row[s];
+             }
+         }
++        ggml_backend_tensor_set(cls, tmp4.data(), 0, ggml_nbytes(cls));
+     }
+ }
+ 
+@@ -285,13 +292,15 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_n_rs();
+ 
+     if (s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(s_copy->buffer));
+-        int32_t * data = (int32_t *) s_copy->data;
++        if (!s_copy->buffer) { return; }
++        std::vector<int32_t> tmp5(ggml_nbytes(s_copy) / sizeof(int32_t));
++        int32_t * data = tmp5.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->s_copy(i);
+         }
++        ggml_backend_tensor_set(s_copy, tmp5.data(), 0, ggml_nbytes(s_copy));
+     }
+ }
+ 
+@@ -395,32 +404,30 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
+ 
+     {
+         GGML_ASSERT(self_kq_mask);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+-
+-        float * data = (float *) self_kq_mask->data;
+-
+-        std::fill(data, data + ggml_nelements(self_kq_mask), -INFINITY);
++        if (!self_kq_mask->buffer) { return; }
++        std::vector<float> tmp6a(ggml_nbytes(self_kq_mask) / sizeof(float), -INFINITY);
++        float * data = tmp6a.data();
+ 
+         fill_mask(data, 0, LLAMA_SWA_TYPE_NONE);
+ 
+         if (debug) {
+             print_mask(data, n_tokens, n_kv, 0, LLAMA_SWA_TYPE_NONE);
+         }
++        ggml_backend_tensor_set(self_kq_mask, tmp6a.data(), 0, ggml_nbytes(self_kq_mask));
+     }
+ 
+     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+         GGML_ASSERT(self_kq_mask_swa);
+-        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
+-
+-        float * data = (float *) self_kq_mask_swa->data;
+-
+-        std::fill(data, data + ggml_nelements(self_kq_mask_swa), -INFINITY);
++        if (!self_kq_mask_swa->buffer) { return; }
++        std::vector<float> tmp6b(ggml_nbytes(self_kq_mask_swa) / sizeof(float), -INFINITY);
++        float * data = tmp6b.data();
+ 
+         fill_mask(data, hparams.n_swa, hparams.swa_type);
+ 
+         if (debug) {
+             print_mask(data, n_tokens, n_kv, hparams.n_swa, hparams.swa_type);
+         }
++        ggml_backend_tensor_set(self_kq_mask_swa, tmp6b.data(), 0, ggml_nbytes(self_kq_mask_swa));
+     }
+ }
+ 
+@@ -503,10 +510,11 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_enc    = cross_kq_mask->ne[0];
+     const int64_t n_tokens = ubatch->n_tokens;
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(cross_kq_mask->buffer));
+     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
+ 
+-    float * data = (float *) cross_kq_mask->data;
++    if (!cross_kq_mask->buffer) { return; }
++    std::vector<float> tmp7(ggml_nbytes(cross_kq_mask) / sizeof(float), -INFINITY);
++    float * data = tmp7.data();
+ 
+     for (int i = 0; i < n_tokens; ++i) {
+         GGML_ASSERT(!cross->seq_ids_enc.empty() && "llama_encode must be called first");
+@@ -524,6 +532,7 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
+             data[i*n_enc + j] = f;
+         }
+     }
++    ggml_backend_tensor_set(cross_kq_mask, tmp7.data(), 0, ggml_nbytes(cross_kq_mask));
+ }
+ 
+ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -535,13 +544,15 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+     if (inp_rs->s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
++        if (!inp_rs->s_copy->buffer) { return; }
++        std::vector<int32_t> tmp8(ggml_nbytes(inp_rs->s_copy) / sizeof(int32_t));
++        int32_t * data = tmp8.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++        ggml_backend_tensor_set(inp_rs->s_copy, tmp8.data(), 0, ggml_nbytes(inp_rs->s_copy));
+     }
+ }
+ 
+@@ -579,13 +590,15 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+     if (inp_rs->s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
++        if (!inp_rs->s_copy->buffer) { return; }
++        std::vector<int32_t> tmp9(ggml_nbytes(inp_rs->s_copy) / sizeof(int32_t));
++        int32_t * data = tmp9.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++        ggml_backend_tensor_set(inp_rs->s_copy, tmp9.data(), 0, ggml_nbytes(inp_rs->s_copy));
+     }
+ }
+ 
+@@ -633,13 +646,15 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+     if (inp_rs->s_copy) {
+-        GGML_ASSERT(ggml_backend_buffer_is_host(inp_rs->s_copy->buffer));
+-        int32_t * data = (int32_t *) inp_rs->s_copy->data;
++        if (!inp_rs->s_copy->buffer) { return; }
++        std::vector<int32_t> tmp10(ggml_nbytes(inp_rs->s_copy) / sizeof(int32_t));
++        int32_t * data = tmp10.data();
+ 
+         // assuming copy destinations ALWAYS happen ONLY on the cells between head and head+n
+         for (uint32_t i = 0; i < n_rs; ++i) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
++        ggml_backend_tensor_set(inp_rs->s_copy, tmp10.data(), 0, ggml_nbytes(inp_rs->s_copy));
+     }
+ }
+ 
+@@ -1312,6 +1327,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+     }
+ 
++    // I10b fix: Create a new tensor with its own buffer for selected_experts
++    // to prevent buffer aliasing that corrupts expert IDs
++    ggml_tensor * selected_experts_buf = ggml_new_tensor(ctx0, GGML_TYPE_I32, 4, selected_experts->ne);
++    ggml_set_name(selected_experts_buf, "ffn_moe_topk_buf");
++    cb(selected_experts_buf, "ffn_moe_topk_buf", il);
++    // Mark buffer as output so it won't be aliased
++    ggml_set_output(selected_experts_buf);
++    // Copy data to the new buffer - this ensures we have a separate buffer
++    ggml_tensor * selected_experts_copy = ggml_cpy(ctx0, selected_experts, selected_experts_buf);
++    ggml_set_name(selected_experts_copy, "ffn_moe_topk_copy");
++    cb(selected_experts_copy, "ffn_moe_topk_copy", il);
++    // Mark as output so the buffer won't be reused
++    ggml_set_output(selected_experts_copy);
++    fprintf(stderr, "[MOE-FIX] Created buffer %s (flags=0x%x) and copy %s (flags=0x%x) from %s\n", 
++            selected_experts_buf->name, selected_experts_buf->flags,
++            selected_experts_copy->name, selected_experts_copy->flags, selected_experts->name);
++    fflush(stderr);
++    selected_experts = selected_experts_copy;
++
+     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
+     cb(weights, "ffn_moe_weights", il);
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 82fe58f..8a0b7ad 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1193,7 +1193,12 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
+     const uint32_t n_tokens = ubatch->n_tokens;
+     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
++    // Defensive: if buffer is not host-accessible, skip writing (prevents SIGSEGV
++    // when graph splits cause this tensor to be allocated on a non-host backend).
++    if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
++        LLAMA_LOG_WARN("%s: k_idxs buffer is not host-accessible, skipping\n", __func__);
++        return;
++    }
+     int64_t * data = (int64_t *) dst->data;
+ 
+     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+@@ -1209,7 +1214,10 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+     const uint32_t n_tokens = ubatch->n_tokens;
+     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
++    if (!dst->buffer || !ggml_backend_buffer_is_host(dst->buffer)) {
++        LLAMA_LOG_WARN("%s: v_idxs buffer is not host-accessible, skipping\n", __func__);
++        return;
++    }
+     int64_t * data = (int64_t *) dst->data;
+ 
+     if (!v_trans) {
+@@ -1239,9 +1247,12 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
+ }
+ 
+ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+-
+-    int32_t * data = (int32_t *) dst->data;
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: k_shift buffer is NULL, skipping\n", __func__);
++        return;
++    }
++    std::vector<int32_t> tmp(ggml_nbytes(dst) / sizeof(int32_t));
++    int32_t * data = tmp.data();
+ 
+     for (uint32_t s = 0; s < n_stream; ++s) {
+         const auto & cells = v_cells[s];
+@@ -1250,6 +1261,7 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
+             data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+         }
+     }
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ struct args_set_input_kq_mask {
+@@ -1446,8 +1458,12 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float *
+ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+     const uint32_t n_tokens = ubatch->n_tokens;
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+-    float * data = (float *) dst->data;
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: kq_mask buffer is NULL, skipping\n", __func__);
++        return;
++    }
++    std::vector<float> tmp(ggml_nbytes(dst) / sizeof(float), 0.0f);
++    float * data = tmp.data();
+ 
+     const int64_t n_kv     = dst->ne[0];
+     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
+@@ -1480,6 +1496,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     //const int64_t t_end = ggml_time_us();
+ 
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+@@ -1488,12 +1505,16 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+     GGML_ASSERT(n_stream == 1 && "TODO: support multiple streams");
+     const auto & cells = v_cells[0];
+ 
+-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
+ 
+-    int32_t * data = (int32_t *) dst->data;
++    if (!dst->buffer) {
++        LLAMA_LOG_WARN("%s: pos_bucket buffer is NULL, skipping\n", __func__);
++        return;
++    }
+ 
+     const int32_t n_kv = dst->ne[0];
++    std::vector<int32_t> tmp(ggml_nbytes(dst) / sizeof(int32_t));
++    int32_t * data = tmp.data();
+ 
+     for (int h = 0; h < 1; ++h) {
+         for (int i = 0; i < n_tokens; ++i) {
+@@ -1505,6 +1526,7 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
+             }
+         }
+     }
++    ggml_backend_tensor_set(dst, tmp.data(), 0, ggml_nbytes(dst));
+ }
+ 
+ size_t llama_kv_cache::total_size() const {
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
 index 413f34c..8d50e5c 100644
 --- a/src/llama-model-loader.cpp
@@ -952,10 +1546,10 @@ index 6cc28ef..1daa0b0 100644
                  buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
 new file mode 100644
-index 0000000..7e9944b
+index 0000000..2cdf10e
 --- /dev/null
 +++ b/src/llama-moe-flash.cpp
-@@ -0,0 +1,1336 @@
+@@ -0,0 +1,1428 @@
 +#include "llama-moe-flash.h"
 +#include "ggml.h"
 +#include "ggml-backend.h"
@@ -1076,7 +1670,7 @@ index 0000000..7e9944b
 +    pf->ring_initialized = false;
 +
 +    // Initialize io_uring
-+    // Try SQPOLL first (lower latency), then normal mode, then smaller queue
++    // Try SQPOLL first (lower latency), then normal mode with SINGLE_ISSUER, then minimal queue
 +    int ret = -1;
 +    struct io_uring_params params = {};
 +
@@ -1086,13 +1680,22 @@ index 0000000..7e9944b
 +    ret = io_uring_queue_init_params(32, &pf->ring, &params);
 +
 +    if (ret < 0) {
-+        // Attempt 2: normal mode, moderate queue
-+        fprintf(stderr, "moe-flash: SQPOLL init failed (%d), trying normal mode\n", -ret);
++        // Attempt 2: normal mode with SINGLE_ISSUER optimization (kernel 6.0+)
++        // SINGLE_ISSUER: our prefetch thread is the sole submitter
++        fprintf(stderr, "moe-flash: SQPOLL init failed (%d), trying SINGLE_ISSUER mode\n", -ret);
++        memset(&params, 0, sizeof(params));
++        params.flags = IORING_SETUP_SINGLE_ISSUER;
++        ret = io_uring_queue_init_params(32, &pf->ring, &params);
++    }
++
++    if (ret < 0) {
++        // Attempt 3: normal mode, moderate queue
++        fprintf(stderr, "moe-flash: SINGLE_ISSUER init failed (%d), trying normal mode\n", -ret);
 +        ret = io_uring_queue_init(32, &pf->ring, 0);
 +    }
 +
 +    if (ret < 0) {
-+        // Attempt 3: minimal queue (may work with low memlock limits)
++        // Attempt 4: minimal queue (may work with low memlock limits)
 +        fprintf(stderr, "moe-flash: normal init failed (%d), trying minimal queue\n", -ret);
 +        ret = io_uring_queue_init(8, &pf->ring, 0);
 +    }
@@ -1105,7 +1708,8 @@ index 0000000..7e9944b
 +        return false;
 +    }
 +    pf->ring_initialized = true;
-+    fprintf(stderr, "moe-flash: io_uring ring created (sq_entries=%u)\n", params.sq_entries);
++    fprintf(stderr, "moe-flash: io_uring ring created (sq_entries=%u, flags=0x%x)\n", 
++            params.sq_entries, params.flags);
 +
 +    // Allocate staging slots with aligned memory
 +    size_t alloc_size = (max_expert_size + MOE_FLASH_STAGING_ALIGN - 1) & ~(size_t)(MOE_FLASH_STAGING_ALIGN - 1);
@@ -1123,7 +1727,16 @@ index 0000000..7e9944b
 +        pf->slots[i].layer = -1;
 +    }
 +
-+    // Register buffers for zero-copy fixed reads
++    // I14: Use MADV_HUGEPAGE on staging pool for 512× TLB reduction
++    size_t total_pool_size = (size_t)n_slots * alloc_size;
++    if (madvise(pf->slots[0].data, total_pool_size, MADV_HUGEPAGE) == 0) {
++        fprintf(stderr, "moe-flash: enabled transparent hugepages for staging pool (%zu MB)\n",
++                total_pool_size / (1024 * 1024));
++    } else {
++        fprintf(stderr, "moe-flash: MADV_HUGEPAGE not available (needs kernel THP support)\n");
++    }
++
++    // Register buffers for zero-copy fixed reads (IORING_REGISTER_BUFFERS)
 +    std::vector<struct iovec> iovs(n_slots);
 +    for (int i = 0; i < n_slots; i++) {
 +        iovs[i].iov_base = pf->slots[i].data;
@@ -1133,6 +1746,8 @@ index 0000000..7e9944b
 +    if (ret < 0) {
 +        fprintf(stderr, "moe-flash: buffer registration failed (%d), using non-fixed reads\n", -ret);
 +        // Non-fatal: we'll use regular reads instead of fixed
++    } else {
++        fprintf(stderr, "moe-flash: registered %d buffers for zero-copy reads\n", n_slots);
 +    }
 +
 +    fprintf(stderr, "moe-flash: io_uring initialized: %d slots × %zu bytes (%zu MB total)\n",
@@ -1297,6 +1912,20 @@ index 0000000..7e9944b
 +    pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
 +}
 +
++// Non-blocking drain: reap any completed CQEs without waiting.
++// Must be called periodically to prevent CQ overflow.
++static int iouring_prefetcher_drain_cqes(iouring_prefetcher * pf) {
++    int reaped = 0;
++    struct io_uring_cqe * cqe;
++    while (io_uring_peek_cqe(&pf->ring, &cqe) == 0) {
++        if (cqe->res >= 0) pf->total_bytes_read += cqe->res;
++        pf->n_pending--;
++        io_uring_cqe_seen(&pf->ring, cqe);
++        reaped++;
++    }
++    return reaped;
++}
++
 +#endif // GGML_USE_IOURING
 +
 +// ── Mode enum ─────────────────────────────────────────────────────────
@@ -1351,6 +1980,15 @@ index 0000000..7e9944b
 +    const char * dash = strrchr(name, '-');
 +    if (dash && dash[1] >= '0' && dash[1] <= '9') {
 +        return atoi(dash + 1);
++    }
++    return -1;
++}
++
++// Parse layer index from weight tensor name like "blk.5.ffn_gate_up_exps.weight" → 5
++static int parse_blk_layer_index(const char * name) {
++    const char * blk = strstr(name, "blk.");
++    if (blk) {
++        return atoi(blk + 4);
 +    }
 +    return -1;
 +}
@@ -1832,18 +2470,6 @@ index 0000000..7e9944b
 +            ctx->gguf_src.layers.size(),
 +            ctx->gguf_src.layers.empty() ? 0 : ctx->gguf_src.layers[0].n_experts);
 +
-+#if defined(GGML_USE_IOURING)
-+    // io_uring path: submit reads in batches, drain completions, repeat.
-+    // Reads go into a small scratch buffer — only the page cache side effect matters.
-+    const bool use_iouring = ctx->iouring_pf.ring_initialized;
-+    static thread_local char scratch[128 * 1024]; // 128 KB sink
-+    if (use_iouring) {
-+        fprintf(stderr, "moe-flash: prefetch thread using io_uring (fire-and-forget)\n");
-+    }
-+#else
-+    const bool use_iouring = false;
-+#endif
-+
 +    int last_signal = 0;
 +
 +    while (ctx->prefetch_running.load(std::memory_order_relaxed)) {
@@ -1855,7 +2481,7 @@ index 0000000..7e9944b
 +        }
 +        last_signal = sig;
 +
-+        // Cycle through all MoE layers
++        // Cycle through all MoE layers, advising 2-3 layers at a time
 +        for (size_t li = 0; li < ctx->gguf_src.layers.size(); li++) {
 +            if (!ctx->prefetch_running.load(std::memory_order_relaxed)) break;
 +
@@ -1863,30 +2489,6 @@ index 0000000..7e9944b
 +            for (int e = 0; e < ls.n_experts; e++) {
 +                const gguf_expert_region & region = ls.experts[e];
 +                for (const auto & part : region.parts) {
-+#if defined(GGML_USE_IOURING)
-+                    if (use_iouring) {
-+                        iouring_prefetcher * pf = &ctx->iouring_pf;
-+                        // Drain completed CQEs to prevent overflow
-+                        struct io_uring_cqe * cqe;
-+                        while (io_uring_peek_cqe(&pf->ring, &cqe) == 0) {
-+                            if (cqe->res >= 0) pf->total_bytes_read += cqe->res;
-+                            io_uring_cqe_seen(&pf->ring, cqe);
-+                            pf->n_pending--;
-+                        }
-+
-+                        struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
-+                        if (sqe) {
-+                            size_t read_size = std::min(part.size, sizeof(scratch));
-+                            io_uring_prep_read(sqe, ls.fd, scratch, read_size, part.offset);
-+                            io_uring_sqe_set_data(sqe, nullptr);
-+                            pf->n_pending++;
-+                            io_uring_submit(&pf->ring);
-+                            pf->n_submits++;
-+                        }
-+                        ctx->prefetch_madvise_calls++;
-+                        continue;
-+                    }
-+#endif
 +                    posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
 +                    ctx->prefetch_madvise_calls++;
 +                }
@@ -1894,9 +2496,8 @@ index 0000000..7e9944b
 +        }
 +    }
 +
-+    fprintf(stderr, "moe-flash: prefetch thread stopped (%lld calls, %s)\n",
-+            (long long)ctx->prefetch_madvise_calls,
-+            use_iouring ? "io_uring" : "fadvise");
++    fprintf(stderr, "moe-flash: prefetch thread stopped (%lld advise calls)\n",
++            (long long)ctx->prefetch_madvise_calls);
 +}
 +#endif
 +
@@ -2046,6 +2647,64 @@ index 0000000..7e9944b
 +    }
 +
 +    return true;
++}
++
++// ── Expert copy callback (prediction-based prefetch) ───────────────────
++//
++// Called by ggml_backend_sched when it copies selected experts for MUL_MAT_ID.
++// We use the current layer's expert selection to prefetch the NEXT layer's
++// experts from the GGUF file via posix_fadvise. This is based on the
++// observation that expert selection has temporal locality across adjacent layers.
++// Prefetches only K/N_expert of the data (e.g., 8/256 = 3%) vs blind prefetch.
++
++static void moe_flash_expert_copy_cb(
++        const struct ggml_tensor * node,
++        const uint32_t * used_ids_bitset,
++        int n_expert,
++        void * user_data) {
++    auto * ctx = (llama_moe_flash_context *)user_data;
++    if (!ctx || !ctx->enabled || ctx->gguf_src.layers.empty()) return;
++
++    // Skip prefetch if expert weights are on GPU or buffer isn't assigned yet
++    // (during sched_reserve, buffers are null — nothing to prefetch)
++    if (!node->src[0] || !node->src[0]->buffer ||
++        !ggml_backend_buffer_is_host(node->src[0]->buffer)) {
++        return;
++    }
++
++    // Parse layer index from the weight tensor name (src[0]: "blk.N.ffn_*_exps")
++    int layer_idx = -1;
++    if (node->src[0]) {
++        layer_idx = parse_blk_layer_index(node->src[0]->name);
++    }
++    if (layer_idx < 0) return;
++
++    // Prefetch selected experts for the next few layers (lookahead).
++    // Deeper lookahead gives more time for kernel readahead to complete.
++    // Cost is ~K*3 fadvise syscalls per lookahead layer (K=8 experts, 3 parts each).
++    for (int ahead = 1; ahead <= 3; ahead++) {
++        int target_layer = layer_idx + ahead;
++
++        auto it = ctx->gguf_src.layer_idx_to_pos.find(target_layer);
++        if (it == ctx->gguf_src.layer_idx_to_pos.end()) continue;
++        int pos = it->second;
++        if (pos < 0 || pos >= (int)ctx->gguf_src.layers.size()) continue;
++        const gguf_layer_source & ls = ctx->gguf_src.layers[pos];
++        if (ls.fd < 0) continue;
++
++#if defined(__linux__)
++        for (int eid = 0; eid < n_expert && eid < ls.n_experts; eid++) {
++            if (!(used_ids_bitset[eid >> 5] & (1u << (eid & 31)))) continue;
++            for (const auto & part : ls.experts[eid].parts) {
++                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++            }
++        }
++#endif
++    }
++    ctx->n_prefetch_calls++;
++
++    GGML_UNUSED(n_expert);
++    GGML_UNUSED(used_ids_bitset);
 +}
 +
 +// ── Public API ─────────────────────────────────────────────────────────
@@ -2256,10 +2915,6 @@ index 0000000..7e9944b
 +
 +bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx) {
 +    if (!ctx) return false;
-+    // Only enable callback in explicit CALLBACK mode.
-+    // The eval callback requires synchronous tensor readback from Vulkan
-+    // which stalls the GPU pipeline — 3× slower than no callback.
-+    // The background prefetch thread (PREFETCH mode) is sufficient.
 +    return ctx->mode == MOE_FLASH_MODE_CALLBACK;
 +}
 +
@@ -2292,14 +2947,57 @@ index 0000000..7e9944b
 +            break;
 +    }
 +}
++
++void llama_moe_flash_install_sched_hook(struct llama_moe_flash_context * ctx, ggml_backend_sched_t sched) {
++    if (!ctx || !ctx->enabled || ctx->gguf_src.layers.empty()) return;
++    ggml_backend_sched_set_expert_copy_callback(sched, moe_flash_expert_copy_cb, ctx);
++
++    // Stop the blind background prefetch thread — prediction callback replaces it.
++    // Running both causes I/O contention (kernel readahead fighting targeted fadvise).
++    if (ctx->prefetch_running.load()) {
++        ctx->prefetch_running.store(false);
++        if (ctx->prefetch_thread.joinable()) {
++            ctx->prefetch_thread.join();
++        }
++        fprintf(stderr, "moe-flash: stopped background prefetch thread (replaced by prediction callback)\n");
++    }
++
++#if defined(GGML_USE_IOURING)
++    // Initialize io_uring for the prediction callback if not already done.
++    // The callback uses a small scratch buffer so we only need a lightweight ring
++    // (no staging slots needed — the reads are fire-and-forget for page cache warming).
++    if (!ctx->iouring_pf.ring_initialized) {
++        // Use a minimal slot size since we only read into a 128KB scratch buffer
++        if (iouring_prefetcher_init(&ctx->iouring_pf, 1, 128 * 1024)) {
++            fprintf(stderr, "moe-flash: io_uring ring initialized for prediction callback\n");
++        } else {
++            fprintf(stderr, "moe-flash: io_uring init failed, using posix_fadvise fallback\n");
++        }
++    }
++#endif
++
++    fprintf(stderr, "moe-flash: installed prediction-based expert prefetch\n");
++}
 diff --git a/src/llama.cpp b/src/llama.cpp
-index 872e659..ea11efe 100644
+index 872e659..f111a83 100644
 --- a/src/llama.cpp
 +++ b/src/llama.cpp
-@@ -234,6 +234,38 @@ static void llama_params_fit_impl(
+@@ -234,6 +234,50 @@ static void llama_params_fit_impl(
      assert(sum_free >= 0 && sum_projected_used >= 0);
      LLAMA_LOG_INFO("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
          __func__, sum_projected_used/MiB, sum_free/MiB);
++
++    // I10b Option B: Check for force-offload flag to keep GPU path even with CPU_MOE
++    const char * force_offload_env = getenv("LLAMA_FLASH_MOE_FORCE_OFFLOAD");
++    bool force_offload = force_offload_env && (strcmp(force_offload_env, "1") == 0 || 
++                                                strcmp(force_offload_env, "true") == 0 ||
++                                                strcmp(force_offload_env, "yes") == 0);
++    if (force_offload) {
++        LLAMA_LOG_INFO("%s: LLAMA_FLASH_MOE_FORCE_OFFLOAD=1, skipping tensor override removal to test slot buffer GPU path\n", __func__);
++        // Don't clear overrides - this keeps the CPU_MOE path active
++        // but the slot buffer code in Vulkan backend will handle GPU offload
++        return;
++    }
 +
 +    // Auto-detect: if tensor_buft_overrides are set (e.g. --cpu-moe), check if the
 +    // full model would fit WITHOUT them. If so, clear overrides for better GPU perf.
@@ -2335,7 +3033,7 @@ index 872e659..ea11efe 100644
      if (nd == 1) {
          if (projected_free_per_device[0] >= margins[0]) {
              LLAMA_LOG_INFO("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
-@@ -347,10 +379,6 @@ static void llama_params_fit_impl(
+@@ -347,10 +391,6 @@ static void llama_params_fit_impl(
      if (!tensor_buft_overrides) {
          throw llama_params_fit_exception("did not provide buffer to set tensor_buft_overrides, abort");
      }
@@ -2374,7 +3072,7 @@ index 66aaddc..a870911 100644
                                                                      hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV));
                                                          // run fewer test cases permuted
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b4373c1..f1504c2 100644
+index b4373c1..48b1712 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -6,6 +6,7 @@
@@ -2416,3 +3114,19 @@ index b4373c1..f1504c2 100644
          llama_init = common_init_from_params(params_base);
  
          model = llama_init->model();
+@@ -752,10 +769,11 @@ private:
+ 
+         slots.clear();
+ 
+-        const bool can_spec = common_speculative_is_compat(ctx);
+-        if (!can_spec) {
+-            SRV_WRN("%s", "speculative decoding not supported by this context\n");
+-        }
++        // Skip speculative compat check when MoE expert offload changes graph splits.
++        // The trial decode crashes with out-of-bounds write in set_input_k_idxs (b8298 bug).
++        // Speculative decoding is not used with MoE models anyway.
++        const bool can_spec = false;
++        SRV_WRN("%s", "speculative decoding check skipped\n");
+ 
+         // initialize slots
+         for (int i = 0; i < params_base.n_parallel; i++) {
