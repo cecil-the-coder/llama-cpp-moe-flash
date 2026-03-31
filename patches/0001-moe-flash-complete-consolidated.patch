@@ -895,7 +895,7 @@ index ee2669c..8819c96 100644
      if (status != GGML_STATUS_SUCCESS) {
          LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 41e804a..953604a 100644
+index 41e804a..1d67c9b 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -130,16 +130,18 @@ void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
@@ -1128,14 +1128,15 @@ index 41e804a..953604a 100644
      }
  }
  
-@@ -1312,6 +1327,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -1312,6 +1327,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
      }
  
-+    // I10b fix: Mark topk indices as input to prevent buffer aliasing
-+    // The gallocr may alias this buffer with other tensors, corrupting expert IDs
-+    ggml_set_input(selected_experts);
-+    fprintf(stderr, "[MOE-FIX] Marked %s as INPUT (flags=0x%x)\n", selected_experts->name, selected_experts->flags);
++    // I10b fix: Mark topk indices as output to prevent buffer aliasing/overwriting
++    // The gallocr aliases this buffer with other tensors, corrupting expert IDs
++    ggml_set_output(selected_experts);
++    fprintf(stderr, "[MOE-FIX] Marked %s as OUTPUT (flags=0x%x)\n", selected_experts->name, selected_experts->flags);
++    fflush(stderr);
 +
      ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
      cb(weights, "ffn_moe_weights", il);
