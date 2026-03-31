@@ -31,14 +31,15 @@ With cpu_ptr as get_base():
   ggml_backend_vk_buffer_free_buffer       →  deletes bufctx (VK buffer), unchanged ✓
   ggml_backend_vk_host_buffer_free_buffer  →  only for fallback CPU path, unaffected ✓
 ----
- ggml/src/ggml-vulkan/ggml-vulkan.cpp | 20 +++++++++++++++++++-
- 1 file changed, 19 insertions(+), 1 deletion(-)
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 25 ++++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 8fc73fe..93216e2 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -13418,5 +13418,20 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffe
-     ggml_vk_host_free(vk_instance.devices[0], ggml_backend_buffer_get_base(buffer));
+@@ -13411,6 +13411,21 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
+     ggml_vk_host_free(vk_instance.devices[0], buffer->context);
  }
 
 +// Map from Vulkan_Host buffer context ptr → real CPU base address.
@@ -49,7 +50,7 @@ diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vu
 +
 +// Returns real CPU base address for a Vulkan_Host buffer (overrides 0x1000 sentinel).
 +// All Vulkan buffer ops compute: vk_offset = tensor->data - ggml_backend_buffer_get_base()
-+// With cpu_ptr as base: vk_offset = (cpu_ptr + offset) - cpu_ptr = offset. Correct. ✓
++// With cpu_ptr as base: vk_offset = (cpu_ptr + offset) - cpu_ptr = offset. Correct.
 +static void * ggml_backend_vk_host_buffer_get_base(ggml_backend_buffer_t buffer) {
 +    auto it = s_vk_host_cpu_ptrs.find(buffer->context);
 +    GGML_ASSERT(it != s_vk_host_cpu_ptrs.end());
@@ -57,15 +58,16 @@ diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vu
 +}
 +
  static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-     void * ptr = nullptr;
-@@ -13447,5 +13462,9 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml
+     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
+
+@@ -13439,6 +13454,10 @@ static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_
+             vk_instance.devices[0], std::move(vk_buf_copy), vk_instance.devices[0]->name);
+
          ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
--        return buffer;
 +        // Fix I10b: override get_base to return real CPU address, not GPU sentinel 0x1000.
 +        // CPU compute kernels dereference tensor->data; must be a valid CPU pointer.
 +        s_vk_host_cpu_ptrs[bufctx] = ptr;
 +        buffer->iface.get_base = ggml_backend_vk_host_buffer_get_base;
-+        return buffer;
+         return buffer;
      }
 
-     // Fallback: wrap as CPU buffer (shouldn't happen if host_malloc succeeded)
