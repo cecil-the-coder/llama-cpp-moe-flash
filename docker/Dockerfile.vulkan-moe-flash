@@ -1,4 +1,4 @@
-# llama.cpp with MoE flash expert streaming (io_uring + Vulkan) - MINIMAL VERSION
+# llama.cpp with MoE flash expert streaming (io_uring + Vulkan)
 # Based on the pre-built Strix Halo Vulkan image
 FROM docker.io/kyuz0/amd-strix-halo-toolboxes:vulkan-radv AS builder
 
@@ -16,12 +16,14 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-03-31-minimal-moe-flash
-COPY patches/0001-moe-flash-minimal.patch /build/
-RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-minimal.patch
+ARG CACHE_BUST=2026-03-31-moe-topk-input-fix-consolidated
+COPY patches/0001-moe-flash-working.patch /build/
+RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-working.patch
 
 # Build with Vulkan + io_uring
 # Enable AVX512 + extensions for Strix Halo (Zen 5).
+# Stock llama.cpp only enables AVX2 by default — AVX512 is OFF.
+# Strix Halo supports: AVX512F/CD/VL/DQ/BW/VBMI/VNNI/BF16/IFMA.
 RUN cd /build/llama.cpp && cmake -B build \
         -DGGML_VULKAN=ON \
         -DGGML_RPC=OFF \
@@ -47,7 +49,7 @@ RUN dnf install -y --setopt=install_weak_deps=False liburing && dnf clean all
 # Fix ld symlink
 RUN ln -sf /usr/bin/ld.bfd /usr/bin/ld 2>/dev/null || true
 
-# Remove ALL old llama.cpp libraries
+# Remove ALL old llama.cpp libraries (including versioned names like .so.0.0.8298)
 RUN rm -f /usr/bin/llama-server && \
     find /lib64 -name 'libllama.so*' -delete && \
     find /lib64 -name 'libggml*.so*' -delete && \
@@ -68,6 +70,9 @@ RUN llama-server --version 2>&1 | head -1 && \
     nm -D /lib64/libllama.so.0 | grep -q moe_flash && echo "moe-flash symbols: OK"
 
 # Default env vars for MoE flash expert streaming
+# CPU_MOE=1 is the safe default (mmap-wrap for > RAM models).
+# Override to 0 in the "fast" backend for models ≤ RAM.
 ENV LLAMA_ARG_CPU_MOE=1
 ENV LLAMA_FLASH_MOE_ENABLED=1
 ENV LLAMA_FLASH_MOE_IOURING=1
+# Force rebuild: Sat Mar 28 06:33:51 PM UTC 2026
