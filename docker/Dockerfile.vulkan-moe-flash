@@ -66,9 +66,10 @@ COPY --from=builder /build/llama.cpp/build/bin/libmtmd.so.0   /lib64/libmtmd.so.
 RUN ldconfig
 
 # Verify the patched binary has moe-flash
-# Note: GGML_VULKAN=0 disables Vulkan to allow version check in build environment without GPU
-RUN GGML_VULKAN=0 llama-server --version 2>&1 | head -1 && \
-    nm -D /lib64/libllama.so.0 | grep -q moe_flash && echo "moe-flash symbols: OK"
+# Note: We only check for symbols here, as running llama-server would require Vulkan GPU
+RUN nm -D /lib64/libllama.so.0 | grep -q moe_flash && \
+    echo "moe-flash symbols: OK" && \
+    strings /usr/bin/llama-server | grep -E "version|b8298" | head -1
 
 # Default env vars for MoE flash expert streaming
 # CPU_MOE=1 is the safe default (mmap-wrap for > RAM models).
