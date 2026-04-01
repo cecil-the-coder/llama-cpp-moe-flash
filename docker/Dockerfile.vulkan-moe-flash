@@ -66,7 +66,8 @@ COPY --from=builder /build/llama.cpp/build/bin/libmtmd.so.0   /lib64/libmtmd.so.
 RUN ldconfig
 
 # Verify the patched binary has moe-flash
-RUN llama-server --version 2>&1 | head -1 && \
+# Note: GGML_VULKAN=0 disables Vulkan to allow version check in build environment without GPU
+RUN GGML_VULKAN=0 llama-server --version 2>&1 | head -1 && \
     nm -D /lib64/libllama.so.0 | grep -q moe_flash && echo "moe-flash symbols: OK"
 
 # Default env vars for MoE flash expert streaming
