@@ -1,0 +1,28 @@
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 9fd3f7f..25a3a63 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -340,6 +340,23 @@ extern "C" {
+     // Set a callback to be called for each resulting node during graph compute
+     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+ 
++    // Called when the scheduler performs selective expert copy for MUL_MAT_ID.
++    // Provides the used expert IDs so the caller can prefetch next-layer experts.
++    //   node      - the MUL_MAT_ID node (name contains layer info)
++    //   used_ids  - bitset of selected expert IDs (use ggml_bitset_get to query)
++    //   n_expert  - total number of experts
++    //   user_data - opaque pointer set by the caller
++    typedef void (*ggml_backend_sched_expert_copy_callback)(
++        const struct ggml_tensor * node,
++        const uint32_t * used_ids_bitset,
++        int n_expert,
++        void * user_data);
++
++    GGML_API void ggml_backend_sched_set_expert_copy_callback(
++        ggml_backend_sched_t sched,
++        ggml_backend_sched_expert_copy_callback callback,
++        void * user_data);
++
+     //
+     // Utils
+     //
