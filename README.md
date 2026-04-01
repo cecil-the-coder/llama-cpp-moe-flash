@@ -3,7 +3,14 @@
 Implementing "LLM in a Flash" style SSD-streaming inference for MoE models in llama.cpp,
 targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
-## ✅ Status Update (2026-03-31)
+## ✅ Status Update (2026-04-01)
+
+**I11 Async Expert Prefetch COMPLETE**: Fully functional async prefetch with `posix_fadvise` is now working.
+- Callback triggers on every MoE layer execution
+- Automatically prefetches next layer's experts to page cache
+- 3 GGUF shards detected and mapped for prefetching
+- See [`docs/I11-async-prefetch-summary.md`](docs/I11-async-prefetch-summary.md) for details
+- **Production image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:86982b0`
 
 **I10b Investigation COMPLETE**: GPU MoE expert matmul with fixed-size slot buffer is **working**.
 - 3× speedup for models ≤ GTT (120 GB): 6 t/s → 18-20 t/s
@@ -117,6 +124,7 @@ Removed from consolidated patch. All tests now pass.
 - [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking (current status)
 - [`docs/next-investigations.md`](docs/next-investigations.md) — roadmap for 2026-Q2 investigations
 - [`docs/I10b-findings.md`](docs/I10b-findings.md) — GPU MoE slot buffer investigation complete
+- [`docs/I11-async-prefetch-summary.md`](docs/I11-async-prefetch-summary.md) — I11 async expert prefetch implementation
 - [`docs/test-results.md`](docs/test-results.md) — verified test results (2026-03-31)
 - [`docs/measurements.md`](docs/measurements.md) — all benchmark results and analysis
 - [`docs/findings.md`](docs/findings.md) — key lessons from flash-moe's 58 experiments
@@ -137,20 +145,49 @@ Tags: short git SHA (e.g. `a1b2c3d`) for deployments, `latest` as convenience al
 
 The flash MoE module is controlled by environment variables:
 
+### Basic Enable (recommended)
 ```bash
-# Enable with GGUF page cache warming (recommended, no split files needed):
+LLAMA_FLASH_MOE_ENABLED=1 \
+llama-server -m /models/model.gguf --n-gpu-layers all ...
+```
+
+### Async Expert Prefetch (NEW - I11)
+Enable async prefetch to load next layer's experts while current layer computes:
+```bash
+LLAMA_FLASH_MOE_ENABLED=1 \
+LLAMA_FLASH_MOE_MODE=async_prefetch \
+LLAMA_FLASH_MOE_GGUF_PATH=/models/model.gguf \
+llama-server -m /models/model.gguf --n-gpu-layers all ...
+```
+
+**What it does:**
+- Registers a callback that triggers on every MoE layer execution
+- Parses layer ID from tensor names (handles `ffn_moe_gate-N` format)
+- Prefetches ALL experts in layer N+1 using `posix_fadvise(WILLNEED)`
+- Works with multi-shard GGUF files (automatically detects shards)
+
+**Requirements:**
+- Linux kernel with POSIX_FADVISE support
+- GGUF file path must be accessible (uses `LLAMA_FLASH_MOE_GGUF_PATH` or falls back to `HF_SOURCE`)
+
+### With io_uring (if compiled with GGML_IOURING=ON)
+```bash
 LLAMA_FLASH_MOE_ENABLED=1 \
 LLAMA_FLASH_MOE_IOURING=1 \
 LLAMA_FLASH_MOE_GGUF_PATH=/models/model.gguf \
 llama-server -m /models/model.gguf --n-gpu-layers all ...
+```
 
-# Alternative: fadvise fallback (no io_uring/IPC_LOCK needed):
+### Alternative: fadvise fallback (no io_uring/IPC_LOCK needed)
+```bash
 LLAMA_FLASH_MOE_ENABLED=1 \
 LLAMA_FLASH_MOE_FADVISE=1 \
 LLAMA_FLASH_MOE_EXPERTS_DIR=/models/experts/ \
 llama-server -m /models/model.gguf ...
+```
 
-# Debug: log expert routing decisions:
+### Debug: log expert routing decisions
+```bash
 LLAMA_FLASH_MOE_ENABLED=1 \
 LLAMA_FLASH_MOE_LOG_ROUTING=1 \
 llama-server -m /models/model.gguf ...
