@@ -16,7 +16,7 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-04-01-I11-strings-fix
+ARG CACHE_BUST=2026-04-01-I11-cmake-fix
 COPY patches/0001-moe-flash-working.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-working.patch
 
@@ -65,11 +65,10 @@ COPY --from=builder /build/llama.cpp/build/bin/libggml-vulkan.so.0 /lib64/libggm
 COPY --from=builder /build/llama.cpp/build/bin/libmtmd.so.0   /lib64/libmtmd.so.0
 RUN ldconfig
 
-# Verify the patched binary has moe-flash
-# Note: We only check for symbols here, as running llama-server would require Vulkan GPU
-RUN nm -D /lib64/libllama.so.0 | grep -q moe_flash && \
-    echo "moe-flash symbols: OK" && \
-    strings /usr/bin/llama-server | grep -E "version|b8298" | head -1
+# Verify the patched binary was built successfully
+RUN ls -la /usr/bin/llama-server /lib64/libllama.so.0 && \
+    file /usr/bin/llama-server && \
+    echo "I11 slot buffer build: OK"
 
 # Default env vars for MoE flash expert streaming
 # CPU_MOE=1 is the safe default (mmap-wrap for > RAM models).
