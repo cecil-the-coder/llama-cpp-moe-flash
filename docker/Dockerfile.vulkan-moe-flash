@@ -67,7 +67,6 @@ RUN ldconfig
 
 # Verify the patched binary was built successfully
 RUN ls -la /usr/bin/llama-server /lib64/libllama.so.0 && \
-    file /usr/bin/llama-server && \
     echo "I11 slot buffer build: OK"
 
 # Default env vars for MoE flash expert streaming
