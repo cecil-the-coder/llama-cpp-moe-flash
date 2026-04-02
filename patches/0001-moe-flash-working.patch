@@ -1,3 +1,30 @@
+From a6799117a2004d6c858bf3f68a7fc0cfffef6c03 Mon Sep 17 00:00:00 2001
+From: Shadow <shadow@code-puppy>
+Date: Thu, 2 Apr 2026 10:08:16 +0000
+Subject: [PATCH] I17 debug: Add Prometheus metrics with debug logging
+
+---
+ ggml/CMakeLists.txt              |    1 +
+ ggml/include/ggml-backend.h      |   17 +
+ ggml/src/CMakeLists.txt          |   24 +
+ ggml/src/ggml-backend.cpp        |  196 ++-
+ include/llama-moe-flash.h        |   63 +
+ src/CMakeLists.txt               |    4 +
+ src/llama-context.cpp            |   17 +
+ src/llama-context.h              |    5 +
+ src/llama-moe-flash-exporter.cpp |  226 ++++
+ src/llama-moe-flash-exporter.h   |   22 +
+ src/llama-moe-flash-metrics.cpp  |   45 +
+ src/llama-moe-flash-metrics.h    |  130 ++
+ src/llama-moe-flash.cpp          | 2027 ++++++++++++++++++++++++++++++
+ 13 files changed, 2748 insertions(+), 29 deletions(-)
+ create mode 100644 include/llama-moe-flash.h
+ create mode 100644 src/llama-moe-flash-exporter.cpp
+ create mode 100644 src/llama-moe-flash-exporter.h
+ create mode 100644 src/llama-moe-flash-metrics.cpp
+ create mode 100644 src/llama-moe-flash-metrics.h
+ create mode 100644 src/llama-moe-flash.cpp
+
 diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
 index 4323afe..56597ab 100644
 --- a/ggml/CMakeLists.txt
@@ -948,12 +975,13 @@ index 0000000..a47f112
 +} // extern "C"
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
 new file mode 100644
-index 0000000..0026e20
+index 0000000..75dd98c
 --- /dev/null
 +++ b/src/llama-moe-flash.cpp
-@@ -0,0 +1,2001 @@
+@@ -0,0 +1,2027 @@
 +#include "llama-moe-flash.h"
 +#include "llama-moe-flash-metrics.h"
++#include "llama-moe-flash-exporter.h"
 +#include "ggml.h"
 +#include "../ggml/src/ggml-impl.h"
 +#include "ggml-backend.h"
@@ -2451,6 +2479,21 @@ index 0000000..0026e20
 +            mode_names[ctx->mode],
 +            !ctx->gguf_src.layers.empty() ? ctx->gguf_src.path.c_str() : "(none)");
 +
++    // I17: Start Prometheus metrics server if port configured
++    fprintf(stderr, "[I17-DEBUG] Checking LLAMA_FLASH_MOE_METRICS_PORT\n");
++    const char * metrics_port_env = getenv("LLAMA_FLASH_MOE_METRICS_PORT");
++    fprintf(stderr, "[I17-DEBUG] metrics_port_env=%s\n", metrics_port_env ? metrics_port_env : "NULL");
++    if (metrics_port_env) {
++        int metrics_port = atoi(metrics_port_env);
++        if (metrics_port > 0) {
++            if (moe_flash::start_metrics_server(&ctx->metrics, metrics_port)) {
++                fprintf(stderr, "moe-flash: Prometheus metrics on http://localhost:%d/metrics\n", metrics_port);
++            } else {
++                fprintf(stderr, "moe-flash: Failed to start metrics server on port %d\n", metrics_port);
++            }
++        }
++    }
++
 +    return ctx;
 +}
 +
@@ -2480,6 +2523,12 @@ index 0000000..0026e20
 +                    100.0 * ctx->cache.hits / total);
 +        }
 +    }
++
++    // I17: Print final metrics report
++    moe_flash_metrics_print(&ctx->metrics);
++    
++    // I17: Stop metrics server
++    moe_flash::stop_metrics_server();
 +
 +#if defined(GGML_USE_IOURING)
 +    if (ctx->prefetch_iouring) {
@@ -2541,6 +2590,10 @@ index 0000000..0026e20
 +            }
 +        }
 +    }
++
++    // I17: Print metrics report and stop metrics server
++    moe_flash_metrics_print(&ctx->metrics);
++    moe_flash::stop_metrics_server();
 +
 +    delete ctx;
 +}
@@ -2953,3 +3006,6 @@ index 0000000..0026e20
 +ggml_backend_sched_expert_copy_callback llama_moe_flash_get_expert_copy_callback(void) {
 +    return expert_copy_callback;
 +}
+-- 
+2.51.1
+
