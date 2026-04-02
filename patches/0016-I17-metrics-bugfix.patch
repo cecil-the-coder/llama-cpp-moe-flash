@@ -1,0 +1,21 @@
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index 1234..5678 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -1825,15 +1825,8 @@ static void moe_flash_callback_enter(
+     ctx->metrics.layers_total.fetch_add(1);
+     ctx->metrics.experts_loaded.fetch_add(used_expert_ids.size());
+ 
+-    // I15: Instrumentation - Track request start on first layer
+-    static std::atomic<int> last_request_id{-1};
+-    int request_id = current_layer / 64;  // Approximate request boundary
+-    if (request_id != last_request_id.load()) {
+-        last_request_id.store(request_id);
+-        ctx->metrics.requests_total.fetch_add(1);
+-    }
+-
+-    // I15: Track layers processed
++    // I15: Track layers processed (removed duplicate request counting)
+     ctx->metrics.layers_total.fetch_add(1);
+ 
+     // I16: Apply prefetch window limit if configured
