@@ -1,0 +1,221 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "moe-flash-metrics",
+    "title": "MoE Flash Performance Dashboard",
+    "tags": ["llama.cpp", "moe", "performance"],
+    "timezone": "utc",
+    "schemaVersion": 36,
+    "refresh": "5s",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Request Rate",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "rate(moe_flash_requests_total[5m])",
+            "legendFormat": "Requests/sec"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "reqps",
+            "thresholds": {
+              "steps": [
+                {"color": "green", "value": null},
+                {"color": "yellow", "value": 10},
+                {"color": "red", "value": 50}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0}
+      },
+      {
+        "id": 2,
+        "title": "Cache Hit Rate",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "moe_flash_cache_hit_rate",
+            "legendFormat": "Hit Rate %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"color": "red", "value": 0},
+                {"color": "yellow", "value": 30},
+                {"color": "green", "value": 70}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0}
+      },
+      {
+        "id": 3,
+        "title": "I/O Savings",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "moe_flash_io_savings_percent",
+            "legendFormat": "Savings %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "thresholds": {
+              "steps": [
+                {"color": "red", "value": null},
+                {"color": "yellow", "value": 50},
+                {"color": "green", "value": 80}
+              ]
+            }
+          }
+        },
+        "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0}
+      },
+      {
+        "id": 4,
+        "title": "Active Experts Cached",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "moe_flash_active_experts_cached",
+            "legendFormat": "Experts"
+          }
+        ],
+        "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0}
+      },
+      {
+        "id": 5,
+        "title": "Request Latency (p50/p95/p99)",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.50, sum(rate(moe_flash_request_duration_ms_bucket[5m])) by (le))",
+            "legendFormat": "p50"
+          },
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(moe_flash_request_duration_ms_bucket[5m])) by (le))",
+            "legendFormat": "p95"
+          },
+          {
+            "expr": "histogram_quantile(0.99, sum(rate(moe_flash_request_duration_ms_bucket[5m])) by (le))",
+            "legendFormat": "p99"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4}
+      },
+      {
+        "id": 6,
+        "title": "Expert Load Time",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, sum(rate(moe_flash_expert_load_duration_ms_bucket[5m])) by (le))",
+            "legendFormat": "p95 Load Time"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "ms"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4}
+      },
+      {
+        "id": 7,
+        "title": "Cache Hits vs Misses",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "rate(moe_flash_cache_hits_total[5m])",
+            "legendFormat": "Hits/sec"
+          },
+          {
+            "expr": "rate(moe_flash_cache_misses_total[5m])",
+            "legendFormat": "Misses/sec"
+          }
+        ],
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12}
+      },
+      {
+        "id": 8,
+        "title": "I/O Throughput",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "rate(moe_flash_bytes_loaded_total[5m])",
+            "legendFormat": "Loaded (B/s)"
+          },
+          {
+            "expr": "rate(moe_flash_bytes_requested_total[5m])",
+            "legendFormat": "Requested (B/s)"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "Bps"
+          }
+        },
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12}
+      },
+      {
+        "id": 9,
+        "title": "Experts Loaded per Request",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "rate(moe_flash_experts_loaded_total[5m]) / rate(moe_flash_requests_total[5m])",
+            "legendFormat": "Experts/Request"
+          }
+        ],
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 20}
+      },
+      {
+        "id": 10,
+        "title": "Cache Utilization",
+        "type": "timeseries",
+        "targets": [
+          {
+            "expr": "moe_flash_cache_utilization_percent",
+            "legendFormat": "Cache Full %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "min": 0,
+            "max": 100
+          }
+        },
+        "gridPos": {"h": 6, "w": 12, "x": 12, "y": 20}
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "model",
+          "type": "query",
+          "query": "label_values(moe_flash_requests_total, model)",
+          "multi": true,
+          "includeAll": true
+        }
+      ]
+    }
+  }
+}
