@@ -16,7 +16,7 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-04-01-I17-fixed
+ARG CACHE_BUST=2026-04-02-I17-v2
 COPY patches/0001-moe-flash-working.patch /build/
 RUN cd /build/llama.cpp && git apply /build/0001-moe-flash-working.patch
 
