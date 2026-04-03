@@ -173,45 +173,66 @@ time curl -s http://localhost:8080/completion \
 
 ## Kubernetes Deployment
 
-### Complete Test Manifest
+### Option 1: Update Flux-Managed Backend (Recommended)
 
-Save as `test-i14-i10b.yaml`:
+The inference system uses Flux GitOps to manage deployments. Update the backend image in the eh-ops-private repo:
+
+```bash
+# 1. Navigate to the eh-ops-private repo
+cd /workspace/eh-ops-private
+
+# 2. Update the backend image to the new version with I14 + I10b
+# Edit: kubernetes/infrastructure/inference/backends/llamacpp-vulkan-moe-flash-cpumoe.yaml
+# Change:
+#   image:
+#     repository: ghcr.io/cecil-the-coder/llama-cpp-moe-flash
+#     tag: c791e75  <-- OLD
+# To:
+#   image:
+#     repository: ghcr.io/cecil-the-coder/lla cpp-moe-flash
+#     tag: f74f3c3   <-- NEW (I14 + I10b)
+
+# 3. Apply the change
+kubectl apply -f kubernetes/infrastructure/inference/backends/llamacpp-vulkan-moe-flash-cpumoe.yaml
+
+# 4. Or commit and let Flux sync:
+git add kubernetes/infrastructure/inference/backends/
+git commit -m "Update llamacpp-vulkan-moe-flash-cpumoe to f74f3c3 with I14 + I10b"
+git push
+```
+
+### Option 2: Create Test InferenceModel
+
+Save as `/workspace/eh-ops-private/kubernetes/infrastructure/inference/models/i14-i10b-test.yaml`:
 
 ```yaml
 apiVersion: inference.models.eh-ops.io/v1
 kind: InferenceModel
 metadata:
   name: i14-i10b-test
-  namespace: default
+  namespace: inference
 spec:
-  # Use the image with I14 + I10b optimizations
-  image: ghcr.io/cecil-the-coder/llama-cpp-moe-flash:f74f3c3
+  # Use model that can test both I14 and I10b
+  modelName: qwen3-235b-a22b-q4km  # For Phase 1 validation
+  # modelName: deepseek-r1-0528    # For Phase 2 speedup test
   
-  backend: llamacpp-vulkan-moe-flash-cpumoe
+  backendRef:
+    name: llamacpp-vulkan-moe-flash-cpumoe
   
-  modelSource:
-    modelName: qwen3-235b-a22b-q4km  # Change to DeepSeek-R1-0528-Q2_K for Phase 2
-    
   env:
-    # I14: io_uring optimizations (automatic when compiled with io_uring)
-    - name: LLAMA_FLASH_MOE_ENABLED
-      value: "1"
-    - name: LLAMA_FLASH_MOE_MODE
-      value: "prefetch"
-    
-    # I10b: Force GPU offload (for testing slot buffer on >GTT models)
+    # I10b: Force GPU offload (set to "1" for slot buffer test)
     - name: LLAMA_ARG_CPU_MOE
-      value: "1"  # Force CPU mode (disable normal GPU)
+      value: "1"  # Force CPU mode
     - name: LLAMA_FLASH_MOE_FORCE_OFFLOAD
       value: "1"  # Enable slot buffer GPU import
     - name: LLAMA_FLASH_MOE_CACHE_SIZE_MB
       value: "128"
     
-    # Prometheus metrics (optional)
+    # Prometheus metrics (optional but recommended)
     - name: LLAMA_FLASH_MOE_METRICS_PORT
       value: "9090"
     
-    # Context size
+    # Reduce context for faster startup during testing
     - name: LLAMA_ARG_CTX_SIZE
       value: "4096"
     - name: LLAMA_ARG_BATCH_SIZE
@@ -220,43 +241,37 @@ spec:
   resources:
     limits:
       memory: "125Gi"
-      amd.com/gpu: "1"  # Request AMD GPU
+      amd.com/gpu: "1"
   
-  # Scale to zero when not in use (optional)
+  # Don't scale to zero during testing
   scaleToZero:
-    enabled: false  # Set to true for production, false for testing
+    enabled: false
 ```
 
-### Deploy and Test
+Then apply and test:
 
 ```bash
-# 1. Apply the manifest
-kubectl apply -f test-i14-i10b.yaml
+cd /workspace/eh-ops-private
 
-# 2. Wait for pod to be ready
-kubectl wait --for=condition=ready pod -l app=i14-i10b-test --timeout=300s
+# Apply the test model
+kubectl apply -f kubernetes/infrastructure/inference/models/i14-i10b-test.yaml
 
-# 3. Port-forward to access the API
-kubectl port-forward svc/i14-i10b-test 8080:8080 &
+# Wait for pod
+kubectl wait --for=condition=ready pod -l app=i14-i10b-test -n inference --timeout=300s
 
-# 4. Check logs for I14 startup messages
-kubectl logs -l app=i14-i10b-test | grep -E "(I14|I10b|moe-flash)" | head -20
+# Check startup logs for I14
+kubectl logs -l app=i14-i10b-test -n inference | grep -E "(I14|moe-flash)" | head -20
 
-# 5. Send test request to trigger inference
+# Port-forward
+kubectl port-forward svc/i14-i10b-test 8080:8080 -n inference &
+
+# Send test request
 curl -s http://localhost:8080/completion \
   -H "Content-Type: application/json" \
-  -d '{
-    "prompt": "Hello, this is a test. Count from 1 to 10:",
-    "n_predict": 128,
-    "temperature": 0.7
-  }' | jq '.tokens_per_second'
+  -d '{"prompt": "Hello", "n_predict": 128}' | jq '.tokens_per_second'
 
-# 6. Watch for I10b messages during inference
-kubectl logs -l app=i14-i10b-test -f | grep -E "(I10b|I17-CACHE)"
-
-# 7. Check metrics (if enabled)
-kubectl port-forward svc/i14-i10b-test 9090:9090 &
-curl -s http://localhost:9090/metrics | grep moe_flash
+# Watch I10b messages during inference
+kubectl logs -l app=i14-i10b-test -n inference -f | grep -E "(I10b|I17-CACHE)"
 ```
 
 ### Expected Results

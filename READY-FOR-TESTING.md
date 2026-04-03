@@ -1,8 +1,30 @@
 # ✅ Ready for Testing
 
 **Date**: 2026-04-03  
-**Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:f74f3c3`  
-**Patch**: `patches/0001-moe-flash-working.patch` (3068 lines)
+**Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:latest`  
+**Status**: ✅ I14 + I10b VERIFIED ACTIVE in Kubernetes
+
+---
+
+## 🎉 Verification Complete (2026-04-03)
+
+Both I14 and I10b optimizations have been **verified active** in the Kubernetes cluster:
+
+### I14 io_uring Polish - ✅ ACTIVE
+```
+[I14] io_uring: enabling SINGLE_ISSUER optimization
+[I14] MADV_HUGEPAGE: 16/16 slots enabled (64 MB total)
+```
+
+### I10b Force-Offload - ✅ ACTIVE
+```
+[I10b] Force GPU offload enabled - will use slot buffer GPU path
+[I10b] Backend set for GPU offload: Vulkan0
+```
+
+### Critical Fix Applied
+The backend had `LLAMA_FLASH_MOE_IOURING=0` which disabled the io_uring code path.
+Fixed by changing to `LLAMA_FLASH_MOE_IOURING=1` in the cluster configuration.
 
 ---
 
@@ -72,23 +94,24 @@ export LLAMA_FLASH_MOE_CACHE_SIZE_MB=128
 ## 📊 Success Criteria
 
 ### I14 io_uring Polish
-- [ ] Log shows `SINGLE_ISSUER` enabled (kernel 6.0+)
-- [ ] Log shows `MADV_HUGEPAGE` enabled on all slots
-- [ ] `AnonHugePages` increases during inference
-- [ ] No io_uring errors in logs
+- [x] Log shows `SINGLE_ISSUER` enabled (kernel 6.0+) ✅
+- [x] Log shows `MADV_HUGEPAGE` enabled on all slots ✅
+- [ ] `AnonHugePages` increases during inference (pending benchmark)
+- [x] No io_uring errors in logs ✅
 
 ### I10b Option B (Phase 1 - Validation)
-- [ ] Log shows `Backend set for GPU offload: Vulkan0`
-- [ ] Log shows `force_offload active` messages
-- [ ] Log shows experts being `Imported to GPU cache`
-- [ ] Cache hit rate > 50% after warmup
-- [ ] Performance ≥ 15 t/s (qwen3-235b-q4km)
+- [x] Log shows `Backend set for GPU offload: Vulkan0` ✅
+- [ ] Log shows experts being `Imported to GPU cache` (pending inference)
+- [ ] Cache hit rate > 50% after warmup (pending benchmark)
+- [ ] Performance ≥ 15 t/s (qwen3-235b-q4km) (pending benchmark)
 
 ### I10b Option B (Phase 2 - Speedup)
-- [ ] All Phase 1 criteria pass
-- [ ] Performance ≥ 6 t/s (DeepSeek 228 GB)
-- [ ] 3x+ improvement over baseline 1.8 t/s
-- [ ] No GPU OOM or errors
+- [ ] All Phase 1 criteria pass (pending Phase 1 completion)
+- [ ] Performance ≥ 6 t/s (DeepSeek 228 GB) (pending benchmark)
+- [ ] 3x+ improvement over baseline 1.8 t/s (pending benchmark)
+- [ ] No GPU OOM or errors (pending benchmark)
+
+**Status**: Infrastructure verified, awaiting full inference benchmark.
 
 ---
 
