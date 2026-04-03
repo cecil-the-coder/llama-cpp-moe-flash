@@ -936,10 +936,10 @@ index 0000000..a47f112
 +} // extern "C"
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
 new file mode 100644
-index 0000000..dae6390
+index 0000000..ee28f34
 --- /dev/null
 +++ b/src/llama-moe-flash.cpp
-@@ -0,0 +1,2061 @@
+@@ -0,0 +1,2062 @@
 +#include "llama-moe-flash.h"
 +#include "llama-moe-flash-metrics.h"
 +#include "llama-moe-flash-exporter.h"
@@ -1521,6 +1521,7 @@ index 0000000..dae6390
 +    bool            prefetch_fadvise;  // use posix_fadvise(WILLNEED) in callback
 +    bool            prefetch_iouring;  // use io_uring reads in callback
 +    bool            gguf_warmcache;    // read from GGUF for page cache warming
++    bool            force_offload;     // I10b Option B: force GPU offload via slot buffer
 +
 +    std::string experts_dir;
 +    std::vector<layer_entry> layers;
@@ -2323,6 +2324,12 @@ index 0000000..dae6390
 +    const char * iouring_env = getenv("LLAMA_FLASH_MOE_IOURING");
 +    bool want_iouring = (iouring_env && strcmp(iouring_env, "1") == 0);
 +    (void)want_iouring; // may be unused if not compiled with GGML_USE_IOURING
++    // I10b Option B: Force GPU offload via slot buffer (for testing >GTT models)
++    const char * force_offload_env = getenv("LLAMA_FLASH_MOE_FORCE_OFFLOAD");
++    ctx->force_offload = (force_offload_env && strcmp(force_offload_env, "1") == 0);
++    if (ctx->force_offload) {
++        fprintf(stderr, "[I10b] Force GPU offload enabled - will use slot buffer GPU path\n");
++    }
 +
 +    // GGUF path for page cache warming mode (Phase 3)
 +    // Try LLAMA_FLASH_MOE_GGUF_PATH first, fall back to HF_SOURCE
@@ -2744,17 +2751,6 @@ index 0000000..dae6390
 +    int current_layer = parse_layer_id(node->name);
 +    if (current_layer < 0) return;
 +    
-+    // Parse used_ids_bitset to get expert IDs
-+    std::vector<int> used_expert_ids;
-+    for (int i = 0; i < n_expert; i++) {
-+        if (ggml_bitset_get(used_ids_bitset, i)) {
-+            used_expert_ids.push_back(i);
-+        }
-+    }
-+    if (used_expert_ids.empty()) return;
-+    
-+    int next_layer = current_layer + 1;
-+    
 +    // I17: Track this request (layer 0 = new request)
 +    if (current_layer == 0) {
 +        ctx->metrics.requests_total.fetch_add(1);
@@ -2846,7 +2842,7 @@ index 0000000..dae6390
 +            ctx->metrics.bytes_requested.fetch_add(expert_size);
 +            
 +            // Only count as "loaded" if it's a cache miss
-+            if (!in_lru_cache) {
++            if (!in_cache) {
 +                ctx->metrics.bytes_loaded.fetch_add(expert_size);
 +            }
 +        }
@@ -2860,6 +2856,11 @@ index 0000000..dae6390
 +            double hit_rate = 100.0 * cache_hits / (cache_hits + cache_misses);
 +            fprintf(stderr, "[I17-CACHE] Layer %d: %d hits, %d misses (%.1f%% hit rate), %d cross-layer\n",
 +                    current_layer, cache_hits, cache_misses, hit_rate, cross_layer_hits);
++        }
++        
++        // I10b Option B: Log force offload status
++        if (ctx->force_offload) {
++            fprintf(stderr, "[I10b] Layer %d: force_offload active (slot buffer GPU path)\n", current_layer);
 +        }
 +        
 +        // Update previous layer tracking
