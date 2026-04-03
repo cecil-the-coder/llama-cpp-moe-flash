@@ -173,23 +173,33 @@ time curl -s http://localhost:8080/completion \
 
 ## Kubernetes Deployment
 
-### Test Deployment YAML
+### Complete Test Manifest
+
+Save as `test-i14-i10b.yaml`:
 
 ```yaml
 apiVersion: inference.models.eh-ops.io/v1
 kind: InferenceModel
 metadata:
-  name: qwen3-235b-i14-test
+  name: i14-i10b-test
+  namespace: default
 spec:
+  # Use the image with I14 + I10b optimizations
+  image: ghcr.io/cecil-the-coder/llama-cpp-moe-flash:f74f3c3
+  
   backend: llamacpp-vulkan-moe-flash-cpumoe
+  
+  modelSource:
+    modelName: qwen3-235b-a22b-q4km  # Change to DeepSeek-R1-0528-Q2_K for Phase 2
+    
   env:
-    # I14: io_uring optimizations (enabled by default when compiled with io_uring)
+    # I14: io_uring optimizations (automatic when compiled with io_uring)
     - name: LLAMA_FLASH_MOE_ENABLED
       value: "1"
     - name: LLAMA_FLASH_MOE_MODE
       value: "prefetch"
     
-    # I10b: Force GPU offload (for testing slot buffer)
+    # I10b: Force GPU offload (for testing slot buffer on >GTT models)
     - name: LLAMA_ARG_CPU_MOE
       value: "1"  # Force CPU mode (disable normal GPU)
     - name: LLAMA_FLASH_MOE_FORCE_OFFLOAD
@@ -197,13 +207,87 @@ spec:
     - name: LLAMA_FLASH_MOE_CACHE_SIZE_MB
       value: "128"
     
-    # Metrics
+    # Prometheus metrics (optional)
     - name: LLAMA_FLASH_MOE_METRICS_PORT
       value: "9090"
+    
+    # Context size
+    - name: LLAMA_ARG_CTX_SIZE
+      value: "4096"
+    - name: LLAMA_ARG_BATCH_SIZE
+      value: "512"
+  
   resources:
     limits:
       memory: "125Gi"
-      amd.com/gpu: "1"
+      amd.com/gpu: "1"  # Request AMD GPU
+  
+  # Scale to zero when not in use (optional)
+  scaleToZero:
+    enabled: false  # Set to true for production, false for testing
+```
+
+### Deploy and Test
+
+```bash
+# 1. Apply the manifest
+kubectl apply -f test-i14-i10b.yaml
+
+# 2. Wait for pod to be ready
+kubectl wait --for=condition=ready pod -l app=i14-i10b-test --timeout=300s
+
+# 3. Port-forward to access the API
+kubectl port-forward svc/i14-i10b-test 8080:8080 &
+
+# 4. Check logs for I14 startup messages
+kubectl logs -l app=i14-i10b-test | grep -E "(I14|I10b|moe-flash)" | head -20
+
+# 5. Send test request to trigger inference
+curl -s http://localhost:8080/completion \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Hello, this is a test. Count from 1 to 10:",
+    "n_predict": 128,
+    "temperature": 0.7
+  }' | jq '.tokens_per_second'
+
+# 6. Watch for I10b messages during inference
+kubectl logs -l app=i14-i10b-test -f | grep -E "(I10b|I17-CACHE)"
+
+# 7. Check metrics (if enabled)
+kubectl port-forward svc/i14-i10b-test 9090:9090 &
+curl -s http://localhost:9090/metrics | grep moe_flash
+```
+
+### Expected Results
+
+**I14 Verification** (first 30 seconds):
+```
+[I14] io_uring: enabling SINGLE_ISSUER optimization
+[I14] MADV_HUGEPAGE: 4/4 slots enabled (24 MB total)
+moe-flash: io_uring initialized: 4 slots × 6291456 bytes (24 MB total)
+```
+
+**I10b Verification** (during first inference):
+```
+[I10b] Force GPU offload enabled - slot buffer GPU path active
+[I10b] Backend set for GPU offload: Vulkan0
+[I10b] Layer 0 Expert 5: Imported to GPU cache (3072000 bytes)
+[I10b] Layer 0: 8 imported, 0 cached for GPU offload
+[I17-CACHE] Layer 0: 8 hits, 0 misses (100.0% hit rate)
+```
+
+### Performance Test
+
+```bash
+# Run multiple requests and capture t/s
+for i in 1 2 3; do
+  echo "Run $i:"
+  curl -s http://localhost:8080/completion \
+    -H "Content-Type: application/json" \
+    -d '{"prompt": "Explain quantum computing:", "n_predict": 256}' | \
+    jq '.tokens_per_second'
+done
 ```
 
 ---
