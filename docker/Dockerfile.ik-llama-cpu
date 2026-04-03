@@ -22,15 +22,17 @@ RUN git clone --depth 1 --branch ${IK_LLAMA_REF} \
 #   - Smart Expert Reduction: skip low-weight experts
 #   - IQ Trellis quantization support
 # Note: build all targets — ik_llama.cpp may use different target names than upstream
+# Use -march=x86-64-v4 (AVX-512 baseline) instead of individual GGML_AVX512_* flags.
+# ik_llama.cpp IQK FA kernels have a type mismatch (__m512 F16 vs __m256 v_tanh)
+# when AVX-512 is enabled via GGML flags — -march handles this correctly.
+# The runtime CPU (Zen 5) is a superset of x86-64-v4.
 RUN cd /build/llama.cpp && cmake -B build \
         -DGGML_VULKAN=OFF \
         -DGGML_CUDA=OFF \
         -DGGML_RPC=OFF \
         -DGGML_NATIVE=OFF \
-        -DGGML_AVX512=ON \
-        -DGGML_AVX512_VBMI=ON \
-        -DGGML_AVX512_VNNI=ON \
-        -DGGML_AVX512_BF16=ON \
+        -DCMAKE_C_FLAGS="-march=x86-64-v4" \
+        -DCMAKE_CXX_FLAGS="-march=x86-64-v4" \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_SERVER=ON \
