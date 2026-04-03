@@ -133,11 +133,12 @@ Removed from consolidated patch. All tests now pass.
 
 ## Documents
 
-- [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking (current status)
+- [`docs/testing-guide.md`](docs/testing-guide.md) — **Testing guide for I14 + I10b optimizations** ← Start here
+- [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking
 - [`docs/next-investigations.md`](docs/next-investigations.md) — roadmap for 2026-Q2 investigations
+- [`docs/I14-iouring-polish.md`](docs/I14-iouring-polish.md) — io_uring performance optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
 - [`docs/I10b-findings.md`](docs/I10b-findings.md) — GPU MoE slot buffer investigation complete
 - [`docs/I10b-option-b-force-offload.md`](docs/I10b-option-b-force-offload.md) — Force-offload testing for >GTT models
-- [`docs/I14-iouring-polish.md`](docs/I14-iouring-polish.md) — io_uring performance optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
 - [`docs/I11-async-prefetch-summary.md`](docs/I11-async-prefetch-summary.md) — I11 async expert prefetch implementation
 - [`docs/test-results.md`](docs/test-results.md) — verified test results (2026-03-31)
 - [`docs/measurements.md`](docs/measurements.md) — all benchmark results and analysis
