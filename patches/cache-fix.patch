@@ -1,0 +1,56 @@
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+index e54e5ee..28e54fc 100644
+--- a/src/llama-moe-flash.cpp
++++ b/src/llama-moe-flash.cpp
+@@ -1807,7 +1807,7 @@ static void expert_copy_callback(
+         ctx->metrics.requests_total.fetch_add(1);
+     }
+     ctx->metrics.layers_total.fetch_add(1);
+-    ctx->metrics.experts_loaded.fetch_add(used_expert_ids.size());
++    // NOTE: experts_loaded is tracked in the cache section below to avoid double-counting
+ 
+     // I17: Track cross-layer expert sharing (measure of expert reuse)
+     static std::vector<int> prev_layer_experts;
+@@ -1839,7 +1839,8 @@ static void expert_copy_callback(
+     }
+ 
+     // Phase 4: Enhanced cache tracking with cross-layer analysis
+-    if (ctx->cache.max_entries > 0) {
++    // Always track metrics, even if LRU cache is not configured
++    if (ctx) {
+         // Track cross-layer expert sharing (the real metric for MoE efficiency)
+         static std::vector<int> prev_layer_experts;  // Experts from previous layer
+         static int prev_layer = -1;
+@@ -1857,18 +1858,25 @@ static void expert_copy_callback(
+             
+             // Check if expert is in our LRU cache
+             int cache_idx = cache_lookup(ctx->cache, current_layer, expert_id);
+-            bool in_cache = (cache_idx >= 0);
++            bool in_lru_cache = (cache_idx >= 0);
++            
++            // Count as cache hit if either:
++            // 1. Expert is in the LRU cache (proper cache hit)
++            // 2. Expert was used in the previous layer (cross-layer sharing)
++            bool cache_hit = in_lru_cache || was_in_prev_layer;
+             
+-            if (in_cache) {
+-                // Expert is in our cache - this is a cache hit
++            if (cache_hit) {
++                // This is a cache hit
+                 cache_hits++;
+                 ctx->metrics.cache_hits.fetch_add(1);
+-                ctx->metrics.experts_from_cache.fetch_add(1);
+-                if (ctx->cache.entries[cache_idx].gpu_buffer) {
+-                    gpu_servable++;
++                if (in_lru_cache) {
++                    ctx->metrics.experts_from_cache.fetch_add(1);
++                    if (ctx->cache.entries[cache_idx].gpu_buffer) {
++                        gpu_servable++;
++                    }
+                 }
+             } else {
+-                // Expert not in cache - this is a miss
++                // This is a cache miss
+                 cache_misses++;
+                 ctx->metrics.cache_misses.fetch_add(1);
+                 // Insert for future tracking
