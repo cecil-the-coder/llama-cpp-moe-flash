@@ -1,0 +1,3004 @@
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 4323afe..56597ab 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -183,6 +183,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
+ # ggml core
+ set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
+ option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
++option(GGML_IOURING                         "ggml: enable io_uring for async I/O"           OFF)
+ option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
+ 
+ # 3rd party libs / backends
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index 9fd3f7f..25a3a63 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -340,6 +340,23 @@ extern "C" {
+     // Set a callback to be called for each resulting node during graph compute
+     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+ 
++    // Called when the scheduler performs selective expert copy for MUL_MAT_ID.
++    // Provides the used expert IDs so the caller can prefetch next-layer experts.
++    //   node      - the MUL_MAT_ID node (name contains layer info)
++    //   used_ids  - bitset of selected expert IDs (use ggml_bitset_get to query)
++    //   n_expert  - total number of experts
++    //   user_data - opaque pointer set by the caller
++    typedef void (*ggml_backend_sched_expert_copy_callback)(
++        const struct ggml_tensor * node,
++        const uint32_t * used_ids_bitset,
++        int n_expert,
++        void * user_data);
++
++    GGML_API void ggml_backend_sched_set_expert_copy_callback(
++        ggml_backend_sched_t sched,
++        ggml_backend_sched_expert_copy_callback callback,
++        void * user_data);
++
+     //
+     // Utils
+     //
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 2650237..5a54cd4 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -468,6 +468,30 @@ endforeach()
+ 
+ target_link_libraries(ggml-base PRIVATE Threads::Threads)
+ 
++# io_uring support for async I/O
++if (GGML_IOURING)
++    find_package(PkgConfig)
++    if (PkgConfig_FOUND)
++        pkg_check_modules(LIBURING liburing)
++    endif()
++    if (LIBURING_FOUND)
++        target_compile_definitions(ggml-base PUBLIC GGML_USE_IOURING)
++        target_link_libraries(ggml-base PRIVATE ${LIBURING_LIBRARIES})
++        target_include_directories(ggml-base PRIVATE ${LIBURING_INCLUDE_DIRS})
++        message(STATUS "io_uring found and enabled")
++    else()
++        # Fallback: try to link directly
++        find_library(LIBURING_LIBRARY uring)
++        if (LIBURING_LIBRARY)
++            target_compile_definitions(ggml-base PUBLIC GGML_USE_IOURING)
++            target_link_libraries(ggml-base PRIVATE ${LIBURING_LIBRARY})
++            message(STATUS "io_uring library found and enabled (without pkg-config)")
++        else()
++            message(WARNING "io_uring requested but liburing not found")
++        endif()
++    endif()
++endif()
++
+ find_library(MATH_LIBRARY m)
+ if (MATH_LIBRARY)
+     if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index bc57df2..66e1152 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -20,6 +20,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <algorithm>
++#include <unordered_map>
+ #include <vector>
+ 
+ #ifdef __APPLE__
+@@ -724,6 +725,9 @@ struct ggml_backend_sched {
+     ggml_backend_sched_eval_callback callback_eval;
+     void * callback_eval_user_data;
+ 
++    ggml_backend_sched_expert_copy_callback callback_expert_copy;
++    void * callback_expert_copy_user_data;
++
+     char * context_buffer;
+     size_t context_buffer_size;
+ 
+@@ -834,6 +838,18 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+                         return b;
+                     }
+                 }
++                // I10b: Force-offload MUL_MAT_ID to GPU when expert tensor fits
++                // within maxStorageBufferRange (~4 GiB). Bypasses offload_op which
++                // rejects bs=1 (ne[2]=1 < min_batch_size=32). Only activates when
++                // supports_op passes (tensor fits in device buffer limits).
++                if (tensor->op == GGML_OP_MUL_MAT_ID) {
++                    for (int b = 0; b < src_backend_id; b++) {
++                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
++                            SET_CAUSE(tensor, "1.moe");
++                            return b;
++                        }
++                    }
++                }
+             }
+             SET_CAUSE(tensor, "1.wgt%d", i);
+             return src_backend_id;
+@@ -1265,6 +1281,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++
+                             if (sched->n_copies > 1) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+@@ -1450,6 +1467,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
+ 
++    // Expert cache: track which experts are already in GPU copy tensor
++    static std::unordered_map<const ggml_tensor *, std::vector<ggml_bitset_t>> expert_cache;
++
++    // I10b: Slot buffer cache for oversized MoE expert tensors.
++    // Maps expert IDs to fixed slots in a shrunk GPU buffer.
++    struct moe_slot_cache {
++        int n_slots = 0;
++        std::vector<int32_t> expert_to_slot;  // [n_expert] → slot or -1
++        std::vector<int32_t> slot_to_expert;  // [n_slots] → expert or -1
++        std::vector<int64_t> slot_lru;        // [n_slots] → timestamp
++        int64_t clock = 0;
++    };
++    static std::unordered_map<const ggml_tensor *, moe_slot_cache> slot_caches;
++
++    // I10b: Cache original (unrewritten) IDS values per ids_tensor.
++    // When slot buffer mode rewrites IDS with slot indices, other projections
++    // sharing the same IDS tensor must use the original expert IDs for slot assignment.
++    static std::unordered_map<const ggml_tensor *, std::vector<int32_t>> original_ids_cache;
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+@@ -1505,11 +1541,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+                     }
+ 
++                    // I10b: Slot remap mode — when expert tensor exceeds maxStorageBufferRange
++                    // (4 GiB), copy active experts into low slots (0..K-1) and rewrite IDS
++                    // with slot indices. Tensor shape stays ne[2]=n_expert (graph correctness)
++                    // but only the first K*expert_size bytes of the GPU buffer are accessed.
++                    // The descriptor binding is clamped to maxStorageBufferRange by the Vulkan
++                    // backend; the shader early-exits for experts with 0 token count.
++                    #define GGML_MOE_SLOT_BUFFER_SLOTS 32
++                    const bool slot_remap_mode = (size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024;
++                    // DEBUG: Log slot buffer condition
++                    fprintf(stderr, "[I11-DEBUG] MUL_MAT_ID: tensor=%s, n_expert=%ld, expert_size=%zu, total=%zu MB, slot_remap_mode=%d\n",
++                            input->name, (long)n_expert, expert_size, ((size_t)n_expert * expert_size) / (1024*1024), slot_remap_mode);
++
++                    // In slot remap mode, the IDS tensor on GPU may have been rewritten
++                    // by a previous projection (gate/up/down share the same IDS tensor).
++                    // Use cached original expert IDs instead.
++                    if (slot_remap_mode && ids_tensor == prev_ids_tensor) {
++                        auto it = original_ids_cache.find(ids_tensor);
++                        if (it != original_ids_cache.end()) {
++                            ids = it->second;
++                        }
++                    }
++
+                     if (ids_tensor != prev_ids_tensor) {
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+                         ggml_backend_synchronize(ids_backend);
+ 
++                        if (slot_remap_mode) {
++                            fprintf(stderr, "[I11-DEBUG] Activating slot remap mode, caching original IDS\n");
++                            original_ids_cache[ids_tensor] = ids;
++                            fprintf(stderr, "[I11-DEBUG] Cached original IDS for slot remap mode\n");
++                        }
++
+                         // find the used experts
+                         used_ids.clear();
+                         used_ids.resize(ggml_bitset_size(n_expert));
+@@ -1522,46 +1586,114 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+ 
+                         prev_ids_tensor = ids_tensor;
++
++                        fprintf(stderr, "[I11-DEBUG] callback_expert_copy=%p, About to call\n", (void*)sched->callback_expert_copy);
++                        if (sched->callback_expert_copy) {
++                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
++                        }
+                     }
+ 
+-                    // group consecutive experts and copy them together
+-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+-                        const size_t expert_offset = first_id * expert_size;
+-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+-                        const size_t padding = std::min<size_t>(expert_size, 512);
+-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
++                    if (slot_remap_mode) {
++                        const int n_slots = GGML_MOE_SLOT_BUFFER_SLOTS;
++
++                        auto & sc = slot_caches[input_cpy];
++                        if (sc.n_slots == 0) {
++                            sc.n_slots = n_slots;
++                            sc.expert_to_slot.assign(n_expert, -1);
++                            sc.slot_to_expert.assign(n_slots, -1);
++                            sc.slot_lru.assign(n_slots, 0);
++                        }
++                        sc.clock++;
++
++                        for (int id = 0; id < n_expert; ++id) {
++                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
++
++                            if (sc.expert_to_slot[id] >= 0) {
++                                sc.slot_lru[sc.expert_to_slot[id]] = sc.clock;
++                                continue;
++                            }
+ 
++                            int slot = -1;
++                            for (int s = 0; s < n_slots; s++) {
++                                if (sc.slot_to_expert[s] == -1) { slot = s; break; }
++                            }
++                            if (slot == -1) {
++                                int64_t min_lru = INT64_MAX;
++                                for (int s = 0; s < n_slots; s++) {
++                                    if (sc.slot_lru[s] < min_lru) { min_lru = sc.slot_lru[s]; slot = s; }
++                                }
++                                int old_expert = sc.slot_to_expert[slot];
++                                if (old_expert >= 0) sc.expert_to_slot[old_expert] = -1;
++                            }
++
++                            sc.expert_to_slot[id] = slot;
++                            sc.slot_to_expert[slot] = id;
++                            sc.slot_lru[slot] = sc.clock;
++
++                            // Copy expert data to LOW slot index (within 4 GiB range)
++                            const size_t src_offset = (size_t)id * expert_size;
++                            const size_t dst_offset = (size_t)slot * expert_size;
++                            const size_t padding = (slot < n_slots - 1) ? std::min<size_t>(expert_size, 512) : 0;
++
++                            fprintf(stderr, "[I11-DEBUG] Copying expert %d -> slot %d (src_offset=%zu, dst_offset=%zu)\n",
++                                    id, slot, src_offset, dst_offset);
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + src_offset, dst_offset,
++                                expert_size + padding);
++                        }
++
++                        // Rewrite IDS: replace expert IDs with slot indices
++                        for (size_t i = 0; i < ids.size(); i++) {
++                            int32_t eid = ids[i];
++                            GGML_ASSERT(eid >= 0 && eid < n_expert && sc.expert_to_slot[eid] >= 0);
++                            ids[i] = sc.expert_to_slot[eid];
++                        }
++                        fprintf(stderr, "[I11-DEBUG] Rewrote %zu IDS entries, writing to GPU\n", ids.size());
++
++                        // Write rewritten IDS to GPU
++                        ggml_tensor * ids_gpu = node->src[2];
+                         ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
+-                    };
+-
+-                    int id = 0;
+-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+-                        id++;
+-                    }
+-                    int32_t first_id = id;
+-                    int32_t last_id = first_id;
++                            ids_gpu, ids.data(), 0, ids.size() * sizeof(int32_t));
++                    } else {
++                        // Normal mode: full-size copy tensor, use bitset cache
++                        auto & cached_ids = expert_cache[input_cpy];
++                        if (cached_ids.empty()) {
++                            cached_ids.resize(ggml_bitset_size(n_expert));
++                        }
+ 
+-                    for (++id; id < n_expert; ++id) {
+-                        if (!ggml_bitset_get(used_ids.data(), id)) {
+-                            continue;
++                        // DEBUG: Count used experts and cache stats
++                        int used_count = 0, cache_hits = 0, cache_misses = 0;
++                        for (int id = 0; id < n_expert; ++id) {
++                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
++                            used_count++;
++                            if (ggml_bitset_get(cached_ids.data(), id)) {
++                                cache_hits++;
++                            } else {
++                                cache_misses++;
++                            }
+                         }
+ 
+-                        if (id == last_id + 1) {
+-                            last_id = id;
+-                            continue;
++                        if (cache_misses > 0) {
++                            fprintf(stderr, "[I11-DEBUG-NORM] n_expert=%d, used=%d, hits=%d, misses=%d, bytes_per_expert=%zu, total_copy=%zu KB\n",
++                                    n_expert, used_count, cache_hits, cache_misses, expert_size, (cache_misses * expert_size) / 1024);
+                         }
+ 
+-                        copy_experts(first_id, last_id);
++                        for (int id = 0; id < n_expert; ++id) {
++                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
++                            if (ggml_bitset_get(cached_ids.data(), id)) continue;
++
++                            const size_t expert_offset = (size_t)id * expert_size;
++                            const size_t padding = (id < n_expert - 1) ? std::min<size_t>(expert_size, 512) : 0;
++
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + expert_offset, expert_offset,
++                                expert_size + padding);
+ 
+-                        first_id = id;
+-                        last_id = id;
++                            ggml_bitset_set(cached_ids.data(), id);
++                        }
+                     }
+-                    copy_experts(first_id, last_id);
+                 } else {
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+@@ -1828,6 +1960,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+     sched->callback_eval_user_data = user_data;
+ }
+ 
++GGML_API void ggml_backend_sched_set_expert_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_copy_callback callback, void * user_data) {
++    GGML_ASSERT(sched);
++    sched->callback_expert_copy = callback;
++    sched->callback_expert_copy_user_data = user_data;
++}
++
+ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     return sched->n_splits;
+diff --git a/include/llama-moe-flash.h b/include/llama-moe-flash.h
+new file mode 100644
+index 0000000..db26801
+--- /dev/null
++++ b/include/llama-moe-flash.h
+@@ -0,0 +1,63 @@
++#pragma once
++
++#include "llama.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++// ── MoE Flash: expert weight prefetching ────────────────────────────────
++//
++// Modes (set via LLAMA_FLASH_MOE_MODE env var):
++//
++//   "callback"  — Original eval callback approach. Intercepts routing
++//                 decisions per-layer but serializes GPU execution (~7x slower).
++//                 Only useful for debugging/routing analysis.
++//
++//   "prefetch"  — (Default) Background prefetch thread that cycles through
++//                 MoE layers calling madvise(MADV_WILLNEED) on the mmap'd
++//                 expert tensor regions. Zero inference overhead.
++//
++//   "fadvise"   — Before each graph compute, issue posix_fadvise(WILLNEED)
++//                 for all expert regions in upcoming layers. Zero inference
++//                 overhead but less targeted than routing-aware prefetch.
++
++struct llama_moe_flash_context;
++
++// Initialize the flash MoE context. Returns nullptr if disabled or on error.
++struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir);
++
++// Free the flash MoE context.
++void llama_moe_flash_free(struct llama_moe_flash_context * ctx);
++
++// Returns true if the eval callback should be installed.
++// Only true for "callback" mode; other modes have zero overhead.
++bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx);
++
++// Get the eval callback function (only for "callback" mode).
++ggml_backend_sched_eval_callback llama_moe_flash_get_callback(void);
++
++// Get the context pointer to pass as cb_eval_user_data.
++void * llama_moe_flash_get_user_data(struct llama_moe_flash_context * ctx);
++
++// Notify the prefetch system that a decode is about to start.
++// Call this before graph_compute. For "prefetch" and "fadvise" modes,
++// this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
++void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx);
++
++
++// Check if async expert copy callback should be enabled.
++// Returns true if LLAMA_FLASH_MOE_MODE=async_prefetch is set.
++bool llama_moe_flash_needs_expert_copy_callback(struct llama_moe_flash_context * ctx);
++
++// Get the expert copy callback for async prefetch.
++ggml_backend_sched_expert_copy_callback llama_moe_flash_get_expert_copy_callback(void);
++
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 283823f..b41db29 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -14,6 +14,10 @@ add_library(llama
+             llama-batch.cpp
+             llama-chat.cpp
+             llama-context.cpp
++            llama-moe-flash.cpp
++            llama-moe-flash-metrics.cpp
++            llama-moe-flash-exporter.cpp
++            llama-moe-flash-exporter.cpp
+             llama-cparams.cpp
+             llama-grammar.cpp
+             llama-graph.cpp
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ee2669c..c644f36 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-moe-flash.h"
+ 
+ #include "llama-arch.h"
+ #include "llama-impl.h"
+@@ -62,6 +63,9 @@ llama_context::llama_context(
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+ 
++    // I11: Initialize MoE flash context for expert prefetching
++    moe_flash_ctx = llama_moe_flash_init(nullptr);
++
+     // Initialize backend samplers here so they are part of the sampling graph
+     // before the reserve passes run later in this function. This avoids a later
+     // re-reserve when graph nodes change.
+@@ -379,6 +383,11 @@ llama_context::~llama_context() {
+             }
+         }
+     }
++    // I11: Cleanup MoE flash context
++    if (moe_flash_ctx) {
++        llama_moe_flash_free(moe_flash_ctx);
++    }
++
+     ggml_opt_free(opt_ctx);
+ }
+ 
+@@ -1135,6 +1144,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
++        // I11: Register async expert prefetch callback for MoE models
++        fprintf(stderr, "[I11-DEBUG] Checking moe_flash_ctx=%p\n", (void*)moe_flash_ctx);
++        if (moe_flash_ctx && llama_moe_flash_needs_expert_copy_callback(moe_flash_ctx)) {
++            fprintf(stderr, "[I11-DEBUG] Registering expert copy callback\n");
++            ggml_backend_sched_set_expert_copy_callback(sched.get(),
++                llama_moe_flash_get_expert_copy_callback(), moe_flash_ctx);
++        }
++
+         //const auto t_start_us = ggml_time_us();
+ 
+         gf = model.build_graph(gparams);
+diff --git a/src/llama-context.h b/src/llama-context.h
+index e0d0085..ffb63b6 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "llama.h"
++#include "llama-moe-flash.h"
+ #include "llama-cparams.h"
+ #include "llama-graph.h"
+ #include "llama-adapter.h"
+@@ -340,6 +341,10 @@ private:
+ 
+     bool has_evaluated_once = false;
+ 
++    // MoE flash context for expert prefetching
++    llama_moe_flash_context * moe_flash_ctx = nullptr;
++
++
+     // env: LLAMA_GRAPH_REUSE_DISABLE
+     bool graph_reuse_disable = false;
+ 
+diff --git a/src/llama-moe-flash-exporter.cpp b/src/llama-moe-flash-exporter.cpp
+new file mode 100644
+index 0000000..c7b4e53
+--- /dev/null
++++ b/src/llama-moe-flash-exporter.cpp
+@@ -0,0 +1,226 @@
++#include "llama-moe-flash-exporter.h"
++#include "llama-moe-flash-metrics.h"
++#include <cstdio>
++#include <cstring>
++#include <unistd.h>
++#include <sys/socket.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++#include <thread>
++#include <atomic>
++
++namespace moe_flash {
++
++// Simple HTTP server for Prometheus metrics export
++class PrometheusExporter {
++    int port;
++    int server_fd;
++    std::thread server_thread;
++    std::atomic<bool> running{false};
++    moe_flash::Metrics* metrics;
++    
++public:
++    PrometheusExporter(int p = 9090) : port(p), server_fd(-1), metrics(nullptr) {}
++    
++    bool start(moe_flash::Metrics* m) {
++        metrics = m;
++        
++        server_fd = socket(AF_INET, SOCK_STREAM, 0);
++        if (server_fd < 0) {
++            fprintf(stderr, "moe-flash-exporter: failed to create socket\n");
++            return false;
++        }
++        
++        int opt = 1;
++        setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
++        
++        struct sockaddr_in addr;
++        memset(&addr, 0, sizeof(addr));
++        addr.sin_family = AF_INET;
++        addr.sin_addr.s_addr = INADDR_ANY;
++        addr.sin_port = htons(port);
++        
++        if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
++            fprintf(stderr, "moe-flash-exporter: failed to bind to port %d\n", port);
++            close(server_fd);
++            return false;
++        }
++        
++        if (listen(server_fd, 5) < 0) {
++            fprintf(stderr, "moe-flash-exporter: failed to listen\n");
++            close(server_fd);
++            return false;
++        }
++        
++        running = true;
++        server_thread = std::thread([this]() { this->serve(); });
++        
++        fprintf(stderr, "moe-flash-exporter: serving metrics on http://localhost:%d/metrics\n", port);
++        return true;
++    }
++    
++    void stop() {
++        running = false;
++        if (server_fd >= 0) {
++            close(server_fd);
++        }
++        if (server_thread.joinable()) {
++            server_thread.join();
++        }
++    }
++    
++private:
++    void serve() {
++        while (running) {
++            struct sockaddr_in client_addr;
++            socklen_t client_len = sizeof(client_addr);
++            
++            int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
++            if (client_fd < 0) {
++                if (running) {
++                    fprintf(stderr, "moe-flash-exporter: accept failed\n");
++                }
++                continue;
++            }
++            
++            handle_client(client_fd);
++            close(client_fd);
++        }
++    }
++    
++    void handle_client(int client_fd) {
++        char buffer[1024];
++        ssize_t n = recv(client_fd, buffer, sizeof(buffer) - 1, 0);
++        if (n <= 0) return;
++        
++        buffer[n] = '\0';
++        
++        // Simple HTTP parsing - check if it's a GET request for /metrics
++        if (strstr(buffer, "GET /metrics") != nullptr) {
++            send_metrics(client_fd);
++        } else {
++            send_404(client_fd);
++        }
++    }
++    
++    void send_metrics(int client_fd) {
++        // Generate Prometheus format metrics
++        char response[8192];
++        int pos = 0;
++        
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "HTTP/1.1 200 OK\r\n"
++            "Content-Type: text/plain; version=0.0.4\r\n"
++            "\r\n");
++        
++        // Requests
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_requests_total Total inference requests\n"
++            "# TYPE moe_flash_requests_total counter\n"
++            "moe_flash_requests_total %llu\n\n",
++            (unsigned long long)metrics->requests_total.load());
++        
++        // Layers
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_layers_total Total MoE layers processed\n"
++            "# TYPE moe_flash_layers_total counter\n"
++            "moe_flash_layers_total %llu\n\n",
++            (unsigned long long)metrics->layers_total.load());
++        
++        // Experts loaded
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_experts_loaded_total Total experts loaded from disk\n"
++            "# TYPE moe_flash_experts_loaded_total counter\n"
++            "moe_flash_experts_loaded_total %llu\n\n",
++            (unsigned long long)metrics->experts_loaded.load());
++        
++        // Cache hits
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_cache_hits_total Total cache hits\n"
++            "# TYPE moe_flash_cache_hits_total counter\n"
++            "moe_flash_cache_hits_total %llu\n\n",
++            (unsigned long long)metrics->cache_hits.load());
++        
++        // Cache misses
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_cache_misses_total Total cache misses\n"
++            "# TYPE moe_flash_cache_misses_total counter\n"
++            "moe_flash_cache_misses_total %llu\n\n",
++            (unsigned long long)metrics->cache_misses.load());
++        
++        // Bytes loaded
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_bytes_loaded_total Total bytes loaded from disk\n"
++            "# TYPE moe_flash_bytes_loaded_total counter\n"
++            "moe_flash_bytes_loaded_total %llu\n\n",
++            (unsigned long long)metrics->bytes_loaded.load());
++        
++        // Cache hit rate (calculated)
++        double hit_rate = metrics->get_cache_hit_rate();
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_cache_hit_rate Cache hit rate percentage\n"
++            "# TYPE moe_flash_cache_hit_rate gauge\n"
++            "moe_flash_cache_hit_rate %.2f\n\n",
++            hit_rate);
++        
++        // I/O savings (calculated)
++        double savings = metrics->get_io_savings_percent();
++        pos += snprintf(response + pos, sizeof(response) - pos,
++            "# HELP moe_flash_io_savings_percent I/O savings vs baseline\n"
++            "# TYPE moe_flash_io_savings_percent gauge\n"
++            "moe_flash_io_savings_percent %.2f\n",
++            savings);
++        
++        send(client_fd, response, pos, 0);
++    }
++    
++    void send_404(int client_fd) {
++        const char* response = 
++            "HTTP/1.1 404 Not Found\r\n"
++            "Content-Length: 0\r\n"
++            "\r\n";
++        send(client_fd, response, strlen(response), 0);
++    }
++};
++
++// Global exporter instance
++static PrometheusExporter* g_exporter = nullptr;
++
++bool start_metrics_server(moe_flash::Metrics* metrics, int port) {
++    if (g_exporter) {
++        fprintf(stderr, "moe-flash-exporter: already running\n");
++        return false;
++    }
++    
++    g_exporter = new PrometheusExporter(port);
++    if (!g_exporter->start(metrics)) {
++        delete g_exporter;
++        g_exporter = nullptr;
++        return false;
++    }
++    
++    return true;
++}
++
++void stop_metrics_server() {
++    if (g_exporter) {
++        g_exporter->stop();
++        delete g_exporter;
++        g_exporter = nullptr;
++    }
++}
++
++} // namespace moe_flash
++
++// C interface
++extern "C" {
++
++int moe_flash_start_metrics_server(void* metrics, int port) {
++    return moe_flash::start_metrics_server((moe_flash::Metrics*)metrics, port) ? 1 : 0;
++}
++
++void moe_flash_stop_metrics_server() {
++    moe_flash::stop_metrics_server();
++}
++
++} // extern "C"
+diff --git a/src/llama-moe-flash-exporter.h b/src/llama-moe-flash-exporter.h
+new file mode 100644
+index 0000000..8457905
+--- /dev/null
++++ b/src/llama-moe-flash-exporter.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include "llama-moe-flash-metrics.h"
++
++namespace moe_flash {
++
++// Start Prometheus metrics HTTP server
++// Returns true on success, false on failure
++bool start_metrics_server(moe_flash::Metrics* metrics, int port = 9090);
++
++// Stop the metrics server
++void stop_metrics_server();
++
++} // namespace moe_flash
++
++// C interface
++extern "C" {
++
++int moe_flash_start_metrics_server(void* metrics, int port);
++void moe_flash_stop_metrics_server();
++
++} // extern "C"
+diff --git a/src/llama-moe-flash-metrics.cpp b/src/llama-moe-flash-metrics.cpp
+new file mode 100644
+index 0000000..9173e1a
+--- /dev/null
++++ b/src/llama-moe-flash-metrics.cpp
+@@ -0,0 +1,45 @@
++#include "llama-moe-flash-metrics.h"
++#include <cstdio>
++
++extern "C" {
++
++void moe_flash_metrics_get(void* metrics_ptr, moe_flash_metrics_c* out) {
++    if (!metrics_ptr || !out) return;
++    
++    auto* metrics = static_cast<moe_flash::Metrics*>(metrics_ptr);
++    
++    out->cache_hits = metrics->cache_hits.load();
++    out->cache_misses = metrics->cache_misses.load();
++    out->experts_loaded = metrics->experts_loaded.load();
++    out->bytes_loaded = metrics->bytes_loaded.load();
++    out->bytes_requested = metrics->bytes_requested.load();
++    out->requests_total = metrics->requests_total.load();
++    out->cache_hit_rate = metrics->get_cache_hit_rate();
++    out->io_savings_percent = metrics->get_io_savings_percent();
++}
++
++void moe_flash_metrics_reset(void* metrics_ptr) {
++    if (!metrics_ptr) return;
++    auto* metrics = static_cast<moe_flash::Metrics*>(metrics_ptr);
++    metrics->reset();
++}
++
++void moe_flash_metrics_print(void* metrics_ptr) {
++    if (!metrics_ptr) return;
++    
++    moe_flash_metrics_c m;
++    moe_flash_metrics_get(metrics_ptr, &m);
++    
++    fprintf(stderr, "\n╔════════════════════════════════════════════════════════════════╗\n");
++    fprintf(stderr, "║           MoE Flash Metrics Report                             ║\n");
++    fprintf(stderr, "╠════════════════════════════════════════════════════════════════╣\n");
++    fprintf(stderr, "║ Requests:           %20lu                          ║\n", m.requests_total);
++    fprintf(stderr, "║ Experts Loaded:      %20lu                          ║\n", m.experts_loaded);
++    fprintf(stderr, "║ Cache Hit Rate:     %19.1f%%                          ║\n", m.cache_hit_rate);
++    fprintf(stderr, "║ I/O Savings:         %19.1f%%                          ║\n", m.io_savings_percent);
++    fprintf(stderr, "║ Bytes Loaded:        %20lu MB                       ║\n", m.bytes_loaded / (1024*1024));
++    fprintf(stderr, "║ Bytes Requested:    %20lu MB                       ║\n", m.bytes_requested / (1024*1024));
++    fprintf(stderr, "╚════════════════════════════════════════════════════════════════╝\n\n");
++}
++
++} // extern "C"
+diff --git a/src/llama-moe-flash-metrics.h b/src/llama-moe-flash-metrics.h
+new file mode 100644
+index 0000000..a47f112
+--- /dev/null
++++ b/src/llama-moe-flash-metrics.h
+@@ -0,0 +1,130 @@
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <chrono>
++
++// ═══════════════════════════════════════════════════════════════════════════
++// MoE Flash Metrics - Lightweight performance tracking
++// ═══════════════════════════════════════════════════════════════════════════
++
++namespace moe_flash {
++
++// Simple atomic metrics (always available, zero overhead when disabled)
++struct Metrics {
++    // Cache effectiveness
++    std::atomic<uint64_t> cache_hits{0};
++    std::atomic<uint64_t> cache_misses{0};
++    
++    // Expert loading
++    std::atomic<uint64_t> experts_loaded{0};
++    std::atomic<uint64_t> experts_prefetched{0};
++    std::atomic<uint64_t> experts_from_cache{0};
++    
++    // I/O statistics
++    std::atomic<uint64_t> bytes_loaded{0};        // Actual bytes read from disk
++    std::atomic<uint64_t> bytes_requested{0};     // Bytes that would be loaded without optimization
++    
++    // Request tracking
++    std::atomic<uint64_t> requests_total{0};
++    std::atomic<uint64_t> layers_total{0};
++    std::atomic<uint64_t> tokens_total{0};
++    
++    // Timing (nanoseconds)
++    std::atomic<uint64_t> expert_load_ns{0};       // Time spent loading experts
++    std::atomic<uint64_t> request_duration_ns{0};  // Total request time
++    std::atomic<uint64_t> graph_compute_ns{0};     // Time in graph compute
++    
++    void reset() {
++        cache_hits = 0;
++        cache_misses = 0;
++        experts_loaded = 0;
++        experts_prefetched = 0;
++        experts_from_cache = 0;
++        bytes_loaded = 0;
++        bytes_requested = 0;
++        requests_total = 0;
++        layers_total = 0;
++        tokens_total = 0;
++        expert_load_ns = 0;
++        request_duration_ns = 0;
++        graph_compute_ns = 0;
++    }
++    
++    // Helper to calculate I/O savings percentage
++    double get_io_savings_percent() const {
++        uint64_t requested = bytes_requested.load();
++        uint64_t loaded = bytes_loaded.load();
++        if (requested == 0) return 0.0;
++        return 100.0 * (1.0 - (double)loaded / (double)requested);
++    }
++    
++    // Helper to calculate cache hit rate
++    double get_cache_hit_rate() const {
++        uint64_t hits = cache_hits.load();
++        uint64_t misses = cache_misses.load();
++        uint64_t total = hits + misses;
++        if (total == 0) return 0.0;
++        return 100.0 * (double)hits / (double)total;
++    }
++};
++
++// RAII timer for measuring operations
++class Timer {
++    std::atomic<uint64_t>& counter;
++    std::chrono::steady_clock::time_point start;
++    
++public:
++    explicit Timer(std::atomic<uint64_t>& ctr) 
++        : counter(ctr), start(std::chrono::steady_clock::now()) {}
++    
++    ~Timer() {
++        auto end = std::chrono::steady_clock::now();
++        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
++        counter.fetch_add(static_cast<uint64_t>(ns));
++    }
++};
++
++// Scope guard for request timing
++class RequestTimer {
++    Metrics& metrics;
++    std::chrono::steady_clock::time_point start;
++    
++public:
++    explicit RequestTimer(Metrics& m) : metrics(m), start(std::chrono::steady_clock::now()) {
++        metrics.requests_total.fetch_add(1);
++    }
++    
++    ~RequestTimer() {
++        auto end = std::chrono::steady_clock::now();
++        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
++        metrics.request_duration_ns.fetch_add(static_cast<uint64_t>(ns));
++    }
++};
++
++} // namespace moe_flash
++
++// C-compatible interface for integration with llama.cpp
++extern "C" {
++
++typedef struct moe_flash_metrics_c {
++    uint64_t cache_hits;
++    uint64_t cache_misses;
++    uint64_t experts_loaded;
++    uint64_t bytes_loaded;
++    uint64_t bytes_requested;
++    uint64_t requests_total;
++    double cache_hit_rate;
++    double io_savings_percent;
++} moe_flash_metrics_c;
++
++// Get current metrics snapshot (thread-safe read)
++void moe_flash_metrics_get(void* metrics_ptr, moe_flash_metrics_c* out);
++
++// Reset all metrics to zero
++void moe_flash_metrics_reset(void* metrics_ptr);
++
++// Print metrics to stderr
++void moe_flash_metrics_print(void* metrics_ptr);
++
++} // extern "C"
+diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
+new file mode 100644
+index 0000000..28e54fc
+--- /dev/null
++++ b/src/llama-moe-flash.cpp
+@@ -0,0 +1,2050 @@
++#include "llama-moe-flash.h"
++#include "llama-moe-flash-metrics.h"
++#include "llama-moe-flash-exporter.h"
++#include "ggml.h"
++#include "../ggml/src/ggml-impl.h"
++#include "ggml-backend.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <algorithm>
++#include <map>
++#include <unordered_map>
++#include <atomic>
++#include <chrono>
++#include <thread>
++
++#if defined(__linux__)
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#endif
++
++
++
++#if defined(GGML_USE_IOURING)
++#include <liburing.h>
++#endif
++
++// ── GGUF source mapping (for page cache warming) ──────────────────────
++
++// Maps (layer, expert) to regions in the original GGUF file.
++// Reading these regions via io_uring warms the page cache so that
++// the mmap'd tensor access doesn't cause major page faults.
++struct gguf_expert_part {
++    size_t offset;   // absolute file offset in the GGUF
++    size_t size;     // bytes to read
++};
++
++struct gguf_expert_region {
++    std::vector<gguf_expert_part> parts; // gate, up, down tensor slices
++    size_t total_size;                    // sum of all parts
++};
++
++struct gguf_layer_source {
++    int layer_idx;
++    int fd;        // file descriptor for the GGUF shard containing this layer
++    int n_experts;
++    std::vector<gguf_expert_region> experts; // indexed by expert_id
++};
++
++struct gguf_source {
++    int         fd;        // open file descriptor for first shard
++    std::string path;
++    std::vector<gguf_layer_source> layers;
++    std::unordered_map<int, int> layer_idx_to_pos;
++    std::vector<int> extra_fds; // fds for additional shards
++};
++
++// ── Manifest types ─────────────────────────────────────────────────────
++
++struct expert_part {
++    std::string name;     // "gate", "up", "down", or "gate_up"
++    size_t      offset;   // offset within the expert file
++    size_t      size;     // bytes
++};
++
++struct expert_entry {
++    int         id;
++    std::string file;
++    size_t      raw_size;
++    size_t      padded_size;
++    std::vector<expert_part> parts;
++    int         fd;       // open file descriptor (for prefetch)
++};
++
++struct layer_entry {
++    int layer_idx;
++    int n_experts;
++    std::vector<expert_entry> experts;
++};
++
++// ── io_uring staging pool ──────────────────────────────────────────────
++
++#if defined(GGML_USE_IOURING)
++
++#define MOE_FLASH_MAX_EXPERTS_PER_TOKEN 16  // max K (top-k) per token
++#define MOE_FLASH_STAGING_ALIGN (2 * 1024 * 1024)  // 2 MB alignment for O_DIRECT
++
++struct iouring_staging_slot {
++    void *  data;           // 2MB-aligned host pointer
++    size_t  capacity;       // allocated size
++    int     expert_id;      // which expert is loaded here (-1 = empty)
++    int     layer;          // which layer
++};
++
++struct iouring_prefetcher {
++    struct io_uring ring;
++    bool            ring_initialized;
++
++    // Staging slots — one set for active reads
++    std::vector<iouring_staging_slot> slots;
++    int n_slots;
++
++    // Pending read tracking
++    int     n_pending;
++    int     pending_layer;
++    int32_t pending_ids[MOE_FLASH_MAX_EXPERTS_PER_TOKEN];
++
++    // Timing stats
++    int64_t total_submit_ns;
++    int64_t total_wait_ns;
++    int64_t n_submits;
++    int64_t n_waits;
++    int64_t total_bytes_read;
++};
++
++static bool iouring_prefetcher_init(iouring_prefetcher * pf, int n_slots, size_t max_expert_size) {
++    memset(pf, 0, sizeof(*pf));
++    pf->n_slots = n_slots;
++    pf->ring_initialized = false;
++
++    // Initialize io_uring
++    // Try SQPOLL first (lower latency), then normal mode, then smaller queue
++    int ret = -1;
++    struct io_uring_params params = {};
++
++    // Attempt 1: SQPOLL (needs CAP_SYS_NICE or root)
++    params.flags = IORING_SETUP_SQPOLL;
++    params.sq_thread_idle = 2000;
++    ret = io_uring_queue_init_params(32, &pf->ring, &params);
++
++    if (ret < 0) {
++        // Attempt 2: normal mode, moderate queue
++        fprintf(stderr, "moe-flash: SQPOLL init failed (%d), trying normal mode\n", -ret);
++        ret = io_uring_queue_init(32, &pf->ring, 0);
++    }
++
++    if (ret < 0) {
++        // Attempt 3: minimal queue (may work with low memlock limits)
++        fprintf(stderr, "moe-flash: normal init failed (%d), trying minimal queue\n", -ret);
++        ret = io_uring_queue_init(8, &pf->ring, 0);
++    }
++
++    if (ret < 0) {
++        fprintf(stderr, "moe-flash: io_uring init failed: %d (check ulimit -l, currently %d KB)\n",
++                -ret, (int)(sysconf(_SC_MEMLOCK) / 1024));
++        fprintf(stderr, "moe-flash: hint: increase memlock with 'ulimit -l unlimited' or set "
++                "LimitMEMLOCK=infinity in container security context\n");
++        return false;
++    }
++    pf->ring_initialized = true;
++    fprintf(stderr, "moe-flash: io_uring ring created (sq_entries=%u)\n", params.sq_entries);
++
++    // Allocate staging slots with aligned memory
++    size_t alloc_size = (max_expert_size + MOE_FLASH_STAGING_ALIGN - 1) & ~(size_t)(MOE_FLASH_STAGING_ALIGN - 1);
++    pf->slots.resize(n_slots);
++
++    for (int i = 0; i < n_slots; i++) {
++        void * ptr = nullptr;
++        if (posix_memalign(&ptr, MOE_FLASH_STAGING_ALIGN, alloc_size) != 0) {
++            fprintf(stderr, "moe-flash: posix_memalign failed for slot %d\n", i);
++            return false;
++        }
++        pf->slots[i].data = ptr;
++        pf->slots[i].capacity = alloc_size;
++        pf->slots[i].expert_id = -1;
++        pf->slots[i].layer = -1;
++    }
++
++    // Register buffers for zero-copy fixed reads
++    std::vector<struct iovec> iovs(n_slots);
++    for (int i = 0; i < n_slots; i++) {
++        iovs[i].iov_base = pf->slots[i].data;
++        iovs[i].iov_len = alloc_size;
++    }
++    ret = io_uring_register_buffers(&pf->ring, iovs.data(), n_slots);
++    if (ret < 0) {
++        fprintf(stderr, "moe-flash: buffer registration failed (%d), using non-fixed reads\n", -ret);
++        // Non-fatal: we'll use regular reads instead of fixed
++    }
++
++    fprintf(stderr, "moe-flash: io_uring initialized: %d slots × %zu bytes (%zu MB total)\n",
++            n_slots, alloc_size, (size_t)n_slots * alloc_size / (1024 * 1024));
++
++    return true;
++}
++
++static void iouring_prefetcher_destroy(iouring_prefetcher * pf) {
++    if (pf->ring_initialized) {
++        io_uring_queue_exit(&pf->ring);
++        pf->ring_initialized = false;
++    }
++    for (auto & slot : pf->slots) {
++        if (slot.data) {
++            free(slot.data);
++            slot.data = nullptr;
++        }
++    }
++}
++
++// Submit async reads for selected experts in the given layer
++// Submit reads from split expert files into staging buffers
++static void iouring_prefetcher_submit(
++        iouring_prefetcher * pf,
++        const std::vector<layer_entry> & layers,
++        const std::unordered_map<int, int> & layer_idx_to_pos,
++        int layer_idx,
++        const int32_t * expert_ids,
++        int k) {
++    auto it = layer_idx_to_pos.find(layer_idx);
++    if (it == layer_idx_to_pos.end()) return;
++
++    const layer_entry & le = layers[it->second];
++
++    auto t_start = std::chrono::steady_clock::now();
++
++    int submitted = 0;
++    for (int i = 0; i < k && i < pf->n_slots; i++) {
++        int eid = expert_ids[i];
++        if (eid < 0 || eid >= le.n_experts) continue;
++
++        const expert_entry & ee = le.experts[eid];
++        if (ee.fd < 0) continue;
++
++        iouring_staging_slot & slot = pf->slots[i];
++
++        struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
++        if (!sqe) {
++            fprintf(stderr, "moe-flash: no SQE available\n");
++            break;
++        }
++
++        io_uring_prep_read(sqe, ee.fd, slot.data, ee.raw_size, 0);
++        io_uring_sqe_set_data(sqe, (void *)(uintptr_t)i);
++
++        slot.expert_id = eid;
++        slot.layer = layer_idx;
++        pf->pending_ids[submitted] = eid;
++        submitted++;
++    }
++
++    if (submitted > 0) {
++        io_uring_submit(&pf->ring);
++    }
++
++    pf->n_pending = submitted;
++    pf->pending_layer = layer_idx;
++    pf->n_submits++;
++
++    auto t_end = std::chrono::steady_clock::now();
++    pf->total_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
++}
++
++// Submit reads from original GGUF file to warm page cache.
++// The data goes into staging buffers (which we discard), but the side effect
++// is that the kernel populates the page cache for these GGUF regions.
++// When the mmap'd tensor is subsequently accessed by the Vulkan shader,
++// the data is already in page cache → no major faults.
++static void iouring_prefetcher_submit_gguf(
++        iouring_prefetcher * pf,
++        const gguf_source & src,
++        int layer_idx,
++        const int32_t * expert_ids,
++        int k) {
++    auto it = src.layer_idx_to_pos.find(layer_idx);
++    if (it == src.layer_idx_to_pos.end()) return;
++
++    const gguf_layer_source & ls = src.layers[it->second];
++
++    auto t_start = std::chrono::steady_clock::now();
++
++    // Submit one io_uring read per tensor part per expert.
++    // Each part (gate, up, down) is a separate contiguous region in the GGUF.
++    // The reads go into staging buffers (which are discarded), but the side
++    // effect is that the kernel populates the page cache for these regions.
++    int submitted = 0;
++    int slot_idx = 0;
++    for (int i = 0; i < k; i++) {
++        int eid = expert_ids[i];
++        if (eid < 0 || eid >= ls.n_experts) continue;
++
++        const gguf_expert_region & region = ls.experts[eid];
++
++        for (const auto & part : region.parts) {
++            if (slot_idx >= pf->n_slots) break;
++
++            iouring_staging_slot & slot = pf->slots[slot_idx % pf->n_slots];
++            size_t read_size = std::min(part.size, slot.capacity);
++
++            struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
++            if (!sqe) goto done_submit;
++
++            io_uring_prep_read(sqe, src.fd, slot.data, read_size, part.offset);
++            io_uring_sqe_set_data(sqe, (void *)(uintptr_t)submitted);
++            submitted++;
++        }
++
++        pf->pending_ids[slot_idx] = eid;
++        slot_idx++;
++    }
++
++done_submit:
++    if (submitted > 0) {
++        io_uring_submit(&pf->ring);
++    }
++
++    pf->n_pending = submitted;
++    pf->pending_layer = layer_idx;
++    pf->n_submits++;
++
++    auto t_end = std::chrono::steady_clock::now();
++    pf->total_submit_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
++}
++
++// Wait for all pending reads to complete
++static void iouring_prefetcher_wait(iouring_prefetcher * pf) {
++    if (pf->n_pending == 0) return;
++
++    auto t_start = std::chrono::steady_clock::now();
++
++    struct io_uring_cqe * cqe;
++    for (int i = 0; i < pf->n_pending; i++) {
++        int ret = io_uring_wait_cqe(&pf->ring, &cqe);
++        if (ret < 0) {
++            fprintf(stderr, "moe-flash: io_uring wait failed: %d\n", -ret);
++            break;
++        }
++        if (cqe->res < 0) {
++            fprintf(stderr, "moe-flash: read failed for slot %llu: %d\n",
++                    (unsigned long long)(unsigned long long)(uintptr_t)io_uring_cqe_get_data(cqe), cqe->res);
++        } else {
++            pf->total_bytes_read += cqe->res;
++        }
++        io_uring_cqe_seen(&pf->ring, cqe);
++    }
++
++    pf->n_waits++;
++    pf->n_pending = 0;
++
++    auto t_end = std::chrono::steady_clock::now();
++    pf->total_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
++}
++
++// Non-blocking poll for completed reads
++static void iouring_prefetcher_poll(iouring_prefetcher * pf) {
++    if (pf->n_pending == 0) return;
++
++    struct io_uring_cqe * cqe;
++    int completed = 0;
++    
++    // Process all completed reads without blocking
++    while (io_uring_peek_cqe(&pf->ring, &cqe) == 0) {
++        if (cqe->res < 0) {
++            fprintf(stderr, "moe-flash: read failed for slot %llu: %d\n",
++                    (unsigned long long)(uintptr_t)io_uring_cqe_get_data(cqe), cqe->res);
++        } else {
++            pf->total_bytes_read += cqe->res;
++        }
++        io_uring_cqe_seen(&pf->ring, cqe);
++        completed++;
++    }
++    
++    pf->n_pending -= completed;
++}
++
++#endif // GGML_USE_IOURING
++
++// ── Mode enum ─────────────────────────────────────────────────────────
++
++enum moe_flash_mode {
++    MOE_FLASH_MODE_CALLBACK,   // eval callback (accurate but slow — serializes graph)
++    MOE_FLASH_MODE_PREFETCH,   // background madvise thread (zero overhead)
++    MOE_FLASH_MODE_FADVISE,    // pre-graph fadvise on all expert regions (zero overhead)
++};
++
++// ── Flash MoE context ──────────────────────────────────────────────────
++
++
++// ── LRU Cache for GPU Expert Storage ───────────────────────────────────
++
++// Cache entry for a single expert
++struct expert_cache_entry {
++    int layer_idx;           // Which layer this expert belongs to
++    int expert_id;           // Expert ID within the layer
++    void * gpu_buffer;       // GPU memory buffer (via ggml_backend_buffer)
++    size_t size;             // Size of expert data in bytes
++    int64_t last_access;     // Timestamp for LRU eviction
++    bool valid;              // Whether this entry contains valid data
++    
++    // Phase 4: GPU buffer management
++    ggml_backend_buffer_t backend_buffer;  // Backend buffer for GPU memory
++};
++
++// Simple LRU cache for MoE experts in GPU memory
++struct moe_expert_cache {
++    size_t max_size;         // Maximum cache size in bytes
++    size_t current_size;     // Current cache usage in bytes
++    size_t entry_size;       // Size per expert (assumed uniform)
++    int max_entries;         // Maximum number of entries
++    
++    std::vector<expert_cache_entry> entries;  // Cache slots
++    std::unordered_map<uint64_t, int> lookup; // (layer<<16 | expert) -> entry index
++    
++    int64_t access_counter;  // Incrementing counter for LRU
++    int64_t hits;            // Cache hit count
++    int64_t misses;          // Cache miss count
++    int64_t evictions;       // Number of evictions
++    
++    moe_expert_cache() : max_size(0), current_size(0), entry_size(0), 
++                         max_entries(0), access_counter(0), 
++                         hits(0), misses(0), evictions(0) {}
++};
++
++// Generate cache key from layer and expert ID
++static inline uint64_t cache_key(int layer_idx, int expert_id) {
++    return (uint64_t(layer_idx) << 32) | uint64_t(expert_id);
++}
++
++
++// ── Cache Helper Functions ─────────────────────────────────────────────
++
++// Check if expert is in cache
++// Returns: entry index if found, -1 if not found
++static int cache_lookup(moe_expert_cache& cache, int layer_idx, int expert_id) {
++    uint64_t key = cache_key(layer_idx, expert_id);
++    auto it = cache.lookup.find(key);
++    if (it != cache.lookup.end()) {
++        int idx = it->second;
++        if (idx >= 0 && idx < (int)cache.entries.size() && cache.entries[idx].valid) {
++            // Update access time (LRU)
++            cache.entries[idx].last_access = ++cache.access_counter;
++            cache.hits++;
++            return idx;
++        }
++    }
++    cache.misses++;
++    return -1;
++}
++
++// Find least recently used entry for eviction
++// Returns: index of entry to evict
++static int cache_find_lru(moe_expert_cache& cache) {
++    int64_t oldest_access = INT64_MAX;
++    int lru_idx = 0;
++    
++    for (int i = 0; i < (int)cache.entries.size(); i++) {
++        if (!cache.entries[i].valid) {
++            return i;  // Empty slot
++        }
++        if (cache.entries[i].last_access < oldest_access) {
++            oldest_access = cache.entries[i].last_access;
++            lru_idx = i;
++        }
++    }
++    
++    cache.evictions++;
++    return lru_idx;
++}
++
++// Insert expert into cache
++// Returns: entry index where stored, -1 on error
++static int cache_insert(moe_expert_cache& cache, int layer_idx, int expert_id, 
++                        const void * data, size_t size) {
++    if (cache.max_entries == 0) return -1;
++    
++    // Find slot (evict LRU if necessary)
++    int idx = cache_find_lru(cache);
++    
++    // Remove old entry from lookup if valid
++    if (cache.entries[idx].valid) {
++        uint64_t old_key = cache_key(cache.entries[idx].layer_idx, 
++                                     cache.entries[idx].expert_id);
++        cache.lookup.erase(old_key);
++        cache.current_size -= cache.entries[idx].size;
++        // Note: gpu_buffer would be freed here in full implementation
++    }
++    
++    // Store new entry
++    cache.entries[idx].layer_idx = layer_idx;
++    cache.entries[idx].expert_id = expert_id;
++    cache.entries[idx].size = size;
++    cache.entries[idx].last_access = ++cache.access_counter;
++    cache.entries[idx].valid = true;
++    
++    uint64_t new_key = cache_key(layer_idx, expert_id);
++    cache.lookup[new_key] = idx;
++    cache.current_size += size;
++    
++    // In full implementation: copy data to GPU buffer here
++    // For now, just track the metadata
++    
++    return idx;
++}
++
++// Get cache statistics
++static void cache_get_stats(moe_expert_cache& cache, int64_t& hits, int64_t& misses, 
++                            int64_t& evictions) {
++    hits = cache.hits;
++    misses = cache.misses;
++    evictions = cache.evictions;
++}
++
++// Phase 4: Get GPU buffer for cached expert
++// Returns: GPU buffer pointer if cached, nullptr if not
++static void * cache_get_gpu_buffer(moe_expert_cache& cache, int layer_idx, int expert_id) {
++    int idx = cache_lookup(cache, layer_idx, expert_id);
++    if (idx >= 0 && cache.entries[idx].valid && cache.entries[idx].gpu_buffer) {
++        return cache.entries[idx].gpu_buffer;
++    }
++    return nullptr;
++}
++
++// Phase 4: Store expert in GPU cache
++// This is called when an expert is evicted from slot buffer or explicitly cached
++static bool cache_store_expert(moe_expert_cache& cache, int layer_idx, int expert_id,
++                               const void * data, size_t size,
++                               ggml_backend_t backend) {
++    if (cache.max_entries == 0) return false;
++    
++    // Find or create entry
++    int idx = cache_find_lru(cache);
++    
++    // Free old GPU buffer if present
++    if (cache.entries[idx].valid && cache.entries[idx].backend_buffer) {
++        ggml_backend_buffer_free(cache.entries[idx].backend_buffer);
++        cache.entries[idx].gpu_buffer = nullptr;
++        cache.entries[idx].backend_buffer = nullptr;
++    }
++    
++    // Allocate new GPU buffer
++    // Note: Using GGML's buffer allocation system
++    size_t alloc_size = ((size + 511) / 512) * 512;  // Align to 512 bytes
++    ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(backend, alloc_size);
++    if (!buf) {
++        fprintf(stderr, "[I11-CACHE] Failed to allocate GPU buffer (%zu bytes)\n", alloc_size);
++        return false;
++    }
++    
++    // Copy data to GPU
++    void * gpu_data = ggml_backend_buffer_get_base(buf);
++    ggml_backend_tensor_set_async(backend, 
++        (ggml_tensor *)gpu_data,  // This needs proper tensor wrapping
++        data, 0, size);
++    
++    // Update entry
++    if (cache.entries[idx].valid) {
++        uint64_t old_key = cache_key(cache.entries[idx].layer_idx, 
++                                     cache.entries[idx].expert_id);
++        cache.lookup.erase(old_key);
++        cache.current_size -= cache.entries[idx].size;
++    }
++    
++    cache.entries[idx].layer_idx = layer_idx;
++    cache.entries[idx].expert_id = expert_id;
++    cache.entries[idx].size = size;
++    cache.entries[idx].gpu_buffer = gpu_data;
++    cache.entries[idx].backend_buffer = buf;
++    cache.entries[idx].last_access = ++cache.access_counter;
++    cache.entries[idx].valid = true;
++    
++    uint64_t new_key = cache_key(layer_idx, expert_id);
++    cache.lookup[new_key] = idx;
++    cache.current_size += size;
++    
++    return true;
++}
++
++// ─────────────────────────────────────────────────────────────────────────
++
++// ─────────────────────────────────────────────────────────────────────────
++
++struct llama_moe_flash_context {
++    bool            enabled;
++    moe_flash_mode  mode;
++    bool            log_routing;       // log routing decisions to stderr
++    bool            prefetch_fadvise;  // use posix_fadvise(WILLNEED) in callback
++    bool            prefetch_iouring;  // use io_uring reads in callback
++    bool            gguf_warmcache;    // read from GGUF for page cache warming
++
++    std::string experts_dir;
++    std::vector<layer_entry> layers;
++    std::unordered_map<int, int> layer_idx_to_pos; // layer_idx → position in layers[]
++
++    // GGUF source for page cache warming / madvise
++    gguf_source gguf_src;
++
++    // Scratch buffer for reading tensor data from GPU
++    std::vector<int32_t> topk_buf;
++
++#if defined(GGML_USE_IOURING)
++    iouring_prefetcher iouring_pf;
++#endif
++
++    // Background prefetch thread (MOE_FLASH_MODE_PREFETCH)
++    std::thread             prefetch_thread;
++    std::atomic<bool>       prefetch_running{false};
++    std::atomic<int>        prefetch_signal{0};  // incremented on each pre_graph call
++    int64_t                 prefetch_madvise_calls;
++
++    // Stats
++    int64_t n_callbacks;
++    int64_t n_prefetch_calls;
++    int64_t n_pre_graph_calls;
++    
++    // LRU cache for GPU expert storage
++    moe_expert_cache cache;
++    
++    // I16: Dynamic prefetch window size (0 = use actual used expert count)
++    int prefetch_window;
++    
++    // Performance metrics (always collected)
++    moe_flash::Metrics metrics;
++
++};
++
++// ── Helpers ────────────────────────────────────────────────────────────
++
++// Parse layer index from tensor name like "ffn_moe_topk-5" → 5
++static int parse_layer_index(const char * name) {
++    // Find the last '-' and parse the number after it
++    const char * dash = strrchr(name, '-');
++    if (dash && dash[1] >= '0' && dash[1] <= '9') {
++        return atoi(dash + 1);
++    }
++    return -1;
++}
++
++// ── Manifest loader ────────────────────────────────────────────────────
++
++// Minimal JSON parser for manifest.json (avoids external dependency).
++// The manifest has a known, simple structure so we parse it with string ops.
++static bool load_manifest(llama_moe_flash_context * ctx) {
++    std::string manifest_path = ctx->experts_dir + "/manifest.json";
++    FILE * f = fopen(manifest_path.c_str(), "r");
++    if (!f) {
++        fprintf(stderr, "moe-flash: cannot open manifest: %s\n", manifest_path.c_str());
++        return false;
++    }
++
++    // Read entire file
++    fseek(f, 0, SEEK_END);
++    long size = ftell(f);
++    fseek(f, 0, SEEK_SET);
++    std::string json(size, '\0');
++    size_t nread = fread(&json[0], 1, size, f);
++    fclose(f);
++    if ((long)nread != size) {
++        fprintf(stderr, "moe-flash: short read on manifest\n");
++        return false;
++    }
++
++    // Parse layer entries using simple string scanning.
++    // We look for "layer": N patterns and "experts": [...] arrays.
++    // This is fragile but sufficient for our known manifest format.
++
++    size_t pos = 0;
++    auto find_key = [&](const std::string & key) -> size_t {
++        size_t p = json.find("\"" + key + "\"", pos);
++        if (p == std::string::npos) return std::string::npos;
++        p = json.find(':', p + key.size() + 2);
++        return p != std::string::npos ? p + 1 : std::string::npos;
++    };
++
++    auto read_int = [&](size_t p) -> int {
++        while (p < json.size() && (json[p] == ' ' || json[p] == '\t' || json[p] == '\n' || json[p] == '\r')) p++;
++        return atoi(&json[p]);
++    };
++
++    auto read_string = [&](size_t p) -> std::string {
++        size_t q1 = json.find('"', p);
++        if (q1 == std::string::npos) return "";
++        size_t q2 = json.find('"', q1 + 1);
++        if (q2 == std::string::npos) return "";
++        return json.substr(q1 + 1, q2 - q1 - 1);
++    };
++
++    // Find top-level "layers" array
++    size_t layers_pos = json.find("\"layers\"");
++    if (layers_pos == std::string::npos) {
++        fprintf(stderr, "moe-flash: no 'layers' key in manifest\n");
++        return false;
++    }
++
++    // Helper: find matching closing bracket in `s`, respecting nesting
++    auto find_matching_bracket = [](const std::string & s, size_t start, char open, char close) -> size_t {
++        int depth = 0;
++        for (size_t i = start; i < s.size(); i++) {
++            if (s[i] == open) depth++;
++            else if (s[i] == close) {
++                depth--;
++                if (depth == 0) return i;
++            }
++        }
++        return std::string::npos;
++    };
++
++    // Find the opening '[' of the layers array
++    size_t layers_arr_start = json.find('[', layers_pos);
++    if (layers_arr_start == std::string::npos) {
++        fprintf(stderr, "moe-flash: no layers array found\n");
++        return false;
++    }
++
++    // Scan for each layer object (identified by '{' at depth 1 within layers array)
++    size_t scan = layers_arr_start + 1;
++    while (scan < json.size()) {
++        // Find next layer object
++        size_t obj_start = json.find('{', scan);
++        if (obj_start == std::string::npos) break;
++
++        size_t obj_end = find_matching_bracket(json, obj_start, '{', '}');
++        if (obj_end == std::string::npos) break;
++
++        std::string layer_json = json.substr(obj_start, obj_end - obj_start + 1);
++
++        // Parse layer index
++        size_t lk = layer_json.find("\"layer\"");
++        if (lk == std::string::npos) { scan = obj_end + 1; continue; }
++        size_t lc = layer_json.find(':', lk + 7);
++        int layer_idx = atoi(layer_json.c_str() + lc + 1);
++
++        layer_entry le;
++        le.layer_idx = layer_idx;
++
++        // Find experts array within this layer object
++        size_t exp_arr = layer_json.find("\"experts\"");
++        if (exp_arr == std::string::npos) { scan = obj_end + 1; continue; }
++        size_t exp_arr_start = layer_json.find('[', exp_arr);
++        if (exp_arr_start == std::string::npos) { scan = obj_end + 1; continue; }
++
++        // Scan for each expert object within the experts array
++        size_t exp_scan = exp_arr_start + 1;
++        while (exp_scan < layer_json.size()) {
++            size_t eobj_start = layer_json.find('{', exp_scan);
++            if (eobj_start == std::string::npos) break;
++
++            size_t eobj_end = find_matching_bracket(layer_json, eobj_start, '{', '}');
++            if (eobj_end == std::string::npos) break;
++
++            std::string ej = layer_json.substr(eobj_start, eobj_end - eobj_start + 1);
++
++            expert_entry ee;
++            ee.fd = -1;
++
++            // Parse id
++            size_t ik = ej.find("\"id\"");
++            if (ik != std::string::npos) {
++                size_t ic = ej.find(':', ik + 4);
++                ee.id = atoi(ej.c_str() + ic + 1);
++            }
++
++            // Parse file
++            size_t fk = ej.find("\"file\"");
++            if (fk != std::string::npos) {
++                size_t q1 = ej.find('"', fk + 6 + 1);  // skip "file": and find opening quote
++                if (q1 != std::string::npos) {
++                    size_t q2 = ej.find('"', q1 + 1);
++                    if (q2 != std::string::npos) {
++                        ee.file = ej.substr(q1 + 1, q2 - q1 - 1);
++                    }
++                }
++            }
++
++            // Parse raw_size
++            size_t rk = ej.find("\"raw_size\"");
++            if (rk != std::string::npos) {
++                size_t rc = ej.find(':', rk + 10);
++                ee.raw_size = atol(ej.c_str() + rc + 1);
++            }
++
++            // Parse padded_size
++            size_t pk = ej.find("\"padded_size\"");
++            if (pk != std::string::npos) {
++                size_t pc = ej.find(':', pk + 13);
++                ee.padded_size = atol(ej.c_str() + pc + 1);
++            }
++
++            // Open file descriptor for prefetch (fadvise or io_uring)
++            if (!ee.file.empty()) {
++                std::string path = ctx->experts_dir + "/" + ee.file;
++                ee.fd = open(path.c_str(), O_RDONLY);
++                if (ee.fd < 0) {
++                    fprintf(stderr, "moe-flash: warning: cannot open %s\n", path.c_str());
++                }
++            }
++
++            le.experts.push_back(std::move(ee));
++            exp_scan = eobj_end + 1;
++        }
++
++        le.n_experts = (int)le.experts.size();
++        ctx->layer_idx_to_pos[layer_idx] = (int)ctx->layers.size();
++        ctx->layers.push_back(std::move(le));
++
++        scan = obj_end + 1;
++    }
++
++    fprintf(stderr, "moe-flash: loaded manifest: %zu layers, %d experts/layer\n",
++            ctx->layers.size(),
++            ctx->layers.empty() ? 0 : ctx->layers[0].n_experts);
++
++    return !ctx->layers.empty();
++}
++
++// ── GGUF header scanner (for page cache warming) ─────────────────────
++
++// Minimal GGUF header parsing to find expert tensor offsets.
++// This allows io_uring to read from the original GGUF at the exact offsets
++// where expert data lives, warming the page cache for the mmap'd tensor.
++
++static void gguf_skip_value(FILE * f, int vtype) {
++    static const int sizes[] = {1,1,2,2,4,4,4,1,8,0,8,8,8,4};
++    if (vtype == 8) { // string
++        uint64_t len; if (fread(&len, 8, 1, f) != 1) return; fseek(f, (long)len, SEEK_CUR);
++    } else if (vtype == 9) { // array
++        int32_t atype; if (fread(&atype, 4, 1, f) != 1) return;
++        uint64_t alen; if (fread(&alen, 8, 1, f) != 1) return;
++        for (uint64_t i = 0; i < alen; i++) gguf_skip_value(f, atype);
++    } else if (vtype >= 0 && vtype <= 13) {
++        fseek(f, sizes[vtype], SEEK_CUR);
++    }
++}
++
++static std::string gguf_read_string(FILE * f) {
++    uint64_t len = 0;
++    if (fread(&len, 8, 1, f) != 1) return "";
++    std::string s(len, '\0');
++    if (fread(&s[0], 1, len, f) != len) return "";
++    return s;
++}
++
++// GGML type info: (block_size_elements, block_size_bytes)
++static size_t gguf_type_bytes(int ttype, size_t n_elements) {
++    static const int block_elems[] = {1,1,32,32,0,0,32,32,32,32,256,256,256,256,256,256,256,256,256,256,32,256,256,256,256,1,32,32,32,0,256,256,32};
++    static const int block_bytes[] = {4,2,18,20,0,0,20,24,34,36,84,110,144,176,210,292,66,74,98,54,18,110,66,70,56,2,18,18,18,0,54,66,18};
++    if (ttype < 0 || ttype > 32 || block_elems[ttype] == 0) return 0;
++    return (n_elements / block_elems[ttype]) * block_bytes[ttype];
++}
++
++static bool load_gguf_source(gguf_source * src, const char * gguf_path) {
++    FILE * f = fopen(gguf_path, "rb");
++    if (!f) {
++        fprintf(stderr, "moe-flash: cannot open GGUF: %s\n", gguf_path);
++        return false;
++    }
++
++    // Read header
++    char magic[4];
++    if (fread(magic, 4, 1, f) != 1 || memcmp(magic, "GGUF", 4) != 0) {
++        fprintf(stderr, "moe-flash: not a GGUF file: %s\n", gguf_path);
++        fclose(f); return false;
++    }
++    uint32_t version = 0; (void)fread(&version, 4, 1, f);
++    uint64_t n_tensors = 0; (void)fread(&n_tensors, 8, 1, f);
++    uint64_t n_kv = 0; (void)fread(&n_kv, 8, 1, f);
++
++    // Skip KV pairs
++    uint32_t alignment = 32;
++    for (uint64_t i = 0; i < n_kv; i++) {
++        std::string key = gguf_read_string(f);
++        uint32_t vtype = 0; (void)fread(&vtype, 4, 1, f);
++        if (key == "general.alignment" && vtype == 4) {
++            (void)fread(&alignment, 4, 1, f);
++        } else {
++            gguf_skip_value(f, vtype);
++        }
++    }
++
++    // Read tensor metadata
++    struct tensor_meta {
++        std::string name;
++        std::vector<uint64_t> dims;
++        int ttype;
++        uint64_t offset;
++        size_t n_bytes;
++    };
++    std::vector<tensor_meta> tensors;
++
++    for (uint64_t i = 0; i < n_tensors; i++) {
++        tensor_meta tm;
++        tm.name = gguf_read_string(f);
++        uint32_t n_dims = 0; (void)fread(&n_dims, 4, 1, f);
++        tm.dims.resize(n_dims);
++        for (uint32_t d = 0; d < n_dims; d++) {
++            (void)fread(&tm.dims[d], 8, 1, f);
++        }
++        uint32_t ttype = 0; (void)fread(&ttype, 4, 1, f);
++        tm.ttype = ttype;
++        (void)fread(&tm.offset, 8, 1, f);
++
++        size_t n_elements = 1;
++        for (auto d : tm.dims) n_elements *= d;
++        tm.n_bytes = gguf_type_bytes(ttype, n_elements);
++
++        tensors.push_back(std::move(tm));
++    }
++
++    // Data section starts at next alignment boundary
++    size_t data_start = ((size_t)ftell(f) + alignment - 1) & ~(size_t)(alignment - 1);
++    fclose(f);
++
++    // Open the GGUF for io_uring reads
++    src->fd = open(gguf_path, O_RDONLY);
++    if (src->fd < 0) {
++        fprintf(stderr, "moe-flash: cannot open GGUF for reading: %s\n", gguf_path);
++        return false;
++    }
++    src->path = gguf_path;
++
++    // Build expert offset map from tensor metadata
++    // Expert tensors follow the pattern: blk.N.ffn_{gate,up,down}_exps.weight
++    // Shape: [inner_dims..., n_experts] — expert is last dimension
++    std::map<int, std::map<std::string, tensor_meta *>> by_layer;
++
++    for (auto & tm : tensors) {
++        if (tm.name.find("_exps") == std::string::npos) continue;
++        // Parse layer: "blk.N.ffn_*_exps.weight"
++        size_t dot1 = tm.name.find('.');
++        size_t dot2 = tm.name.find('.', dot1 + 1);
++        if (dot1 == std::string::npos || dot2 == std::string::npos) continue;
++        int layer = atoi(tm.name.c_str() + dot1 + 1);
++
++        // Determine type: gate, up, down, or gate_up
++        std::string type;
++        if (tm.name.find("gate_up_exps") != std::string::npos) type = "gate_up";
++        else if (tm.name.find("gate_exps") != std::string::npos) type = "gate";
++        else if (tm.name.find("up_exps") != std::string::npos) type = "up";
++        else if (tm.name.find("down_exps") != std::string::npos) type = "down";
++        else continue;
++
++        by_layer[layer][type] = &tm;
++    }
++
++    // Build layer entries
++    for (auto & [layer_idx, types] : by_layer) {
++        gguf_layer_source ls;
++        ls.layer_idx = layer_idx;
++        ls.fd = src->fd;
++
++        // Determine n_experts from the last dimension of any expert tensor
++        int n_experts = 0;
++        for (auto & [type, tm] : types) {
++            if (!tm->dims.empty()) {
++                n_experts = (int)tm->dims.back();
++                break;
++            }
++        }
++        ls.n_experts = n_experts;
++        ls.experts.resize(n_experts);
++
++        // For each expert, collect individual tensor parts (gate, up, down)
++        for (int e = 0; e < n_experts; e++) {
++            gguf_expert_region region;
++            region.total_size = 0;
++
++            for (auto & [type, tm] : types) {
++                size_t inner_elements = 1;
++                for (size_t d = 0; d + 1 < tm->dims.size(); d++) {
++                    inner_elements *= tm->dims[d];
++                }
++                size_t expert_stride = gguf_type_bytes(tm->ttype, inner_elements);
++                size_t abs_offset = data_start + tm->offset + (size_t)e * expert_stride;
++
++                region.parts.push_back({abs_offset, expert_stride});
++                region.total_size += expert_stride;
++            }
++
++            ls.experts[e] = std::move(region);
++        }
++
++        src->layer_idx_to_pos[layer_idx] = (int)src->layers.size();
++        src->layers.push_back(std::move(ls));
++    }
++
++    fprintf(stderr, "moe-flash: loaded GGUF shard: %zu MoE layers, %d experts/layer, data_start=%zu\n",
++            src->layers.size(),
++            src->layers.empty() ? 0 : src->layers[0].n_experts,
++            data_start);
++
++    return !src->layers.empty();
++}
++
++// Load all shards of a multi-shard GGUF.
++// Detects patterns like "model-00001-of-00005.gguf" and loads all shards,
++// merging their layer maps into a single gguf_source.
++static bool load_gguf_source_multi(gguf_source * src, const char * gguf_path) {
++    std::string path(gguf_path);
++
++    // Detect multi-shard pattern: *-NNNNN-of-NNNNN.gguf
++    size_t of_pos = path.rfind("-of-");
++    if (of_pos == std::string::npos) {
++        // Single shard
++        return load_gguf_source(src, gguf_path);
++    }
++
++    // Find the shard number start
++    size_t dash_pos = path.rfind('-', of_pos - 1);
++    if (dash_pos == std::string::npos) {
++        return load_gguf_source(src, gguf_path);
++    }
++
++    // Extract total shards
++    size_t dot_pos = path.rfind(".gguf");
++    if (dot_pos == std::string::npos) {
++        return load_gguf_source(src, gguf_path);
++    }
++
++    std::string total_str = path.substr(of_pos + 4, dot_pos - (of_pos + 4));
++    int n_shards = atoi(total_str.c_str());
++    if (n_shards <= 0 || n_shards > 100) {
++        return load_gguf_source(src, gguf_path);
++    }
++
++    std::string prefix = path.substr(0, dash_pos + 1);
++    std::string suffix = path.substr(of_pos); // "-of-NNNNN.gguf"
++    int shard_digits = (int)(of_pos - dash_pos - 1); // number of digits in shard number
++
++    fprintf(stderr, "moe-flash: detected %d GGUF shards\n", n_shards);
++
++    // Track extra fds for shards beyond the first
++    std::vector<int> extra_fds;
++
++    for (int s = 1; s <= n_shards; s++) {
++        char shard_num[16];
++        snprintf(shard_num, sizeof(shard_num), "%0*d", shard_digits, s);
++        std::string shard_path = prefix + shard_num + suffix;
++
++        if (s == 1) {
++            // First shard: load into src directly
++            if (!load_gguf_source(src, shard_path.c_str())) {
++                fprintf(stderr, "moe-flash: failed to load shard 1: %s\n", shard_path.c_str());
++                return false;
++            }
++        } else {
++            // Subsequent shards: load into a temp source and merge layers
++            gguf_source tmp;
++            tmp.fd = -1;
++            if (!load_gguf_source(&tmp, shard_path.c_str())) {
++                fprintf(stderr, "moe-flash: failed to load shard %d: %s\n", s, shard_path.c_str());
++                continue;
++            }
++
++            // Merge layers from this shard into the main source
++            for (auto & layer : tmp.layers) {
++                // Check if this layer already exists (split across shards)
++                auto it = src->layer_idx_to_pos.find(layer.layer_idx);
++                if (it != src->layer_idx_to_pos.end()) {
++                    // Layer exists in a previous shard — merge expert parts
++                    auto & existing = src->layers[it->second];
++                    for (int e = 0; e < layer.n_experts && e < existing.n_experts; e++) {
++                        for (auto & part : layer.experts[e].parts) {
++                            existing.experts[e].parts.push_back(part);
++                            existing.experts[e].total_size += part.size;
++                        }
++                    }
++                    // Update fd to the shard that has the additional parts
++                    // (keep existing fd for existing parts, new parts have tmp.fd)
++                } else {
++                    // New layer — add to source
++                    src->layer_idx_to_pos[layer.layer_idx] = (int)src->layers.size();
++                    src->layers.push_back(std::move(layer));
++                }
++            }
++
++            // Keep the shard fd alive (don't close it — layers reference it)
++            extra_fds.push_back(tmp.fd);
++            tmp.fd = -1; // prevent close in destructor
++        }
++    }
++
++    // Store extra fds so they get closed on cleanup
++    // (We'll store them in a vector on the source)
++    src->extra_fds = std::move(extra_fds);
++
++    // Sort layers by index
++    std::sort(src->layers.begin(), src->layers.end(),
++              [](const gguf_layer_source & a, const gguf_layer_source & b) {
++                  return a.layer_idx < b.layer_idx;
++              });
++    // Rebuild index
++    src->layer_idx_to_pos.clear();
++    for (size_t i = 0; i < src->layers.size(); i++) {
++        src->layer_idx_to_pos[src->layers[i].layer_idx] = (int)i;
++    }
++
++    fprintf(stderr, "moe-flash: total after merging %d shards: %zu MoE layers\n",
++            n_shards, src->layers.size());
++
++    return !src->layers.empty();
++}
++
++// ── Background prefetch thread (Option C) ─────────────────────────────
++//
++// Continuously cycles through MoE layers calling madvise(MADV_WILLNEED)
++// on the mmap'd GGUF regions for each expert. This tells the kernel to
++// start readahead for those pages. The thread runs independently of
++// inference — no synchronization needed, zero overhead on the hot path.
++
++#if defined(__linux__)
++static void prefetch_thread_fn(llama_moe_flash_context * ctx) {
++    fprintf(stderr, "moe-flash: prefetch thread started (%zu layers, %d experts/layer)\n",
++            ctx->gguf_src.layers.size(),
++            ctx->gguf_src.layers.empty() ? 0 : ctx->gguf_src.layers[0].n_experts);
++
++#if defined(GGML_USE_IOURING)
++    // io_uring path: submit reads in batches, drain completions, repeat.
++    // Reads go into a small scratch buffer — only the page cache side effect matters.
++    const bool use_iouring = ctx->iouring_pf.ring_initialized;
++    static thread_local char scratch[128 * 1024]; // 128 KB sink
++    if (use_iouring) {
++        fprintf(stderr, "moe-flash: prefetch thread using io_uring (fire-and-forget)\n");
++    }
++#else
++    const bool use_iouring = false;
++#endif
++
++    int last_signal = 0;
++
++    while (ctx->prefetch_running.load(std::memory_order_relaxed)) {
++        // Wait for a signal that inference is active
++        int sig = ctx->prefetch_signal.load(std::memory_order_relaxed);
++        if (sig == last_signal) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++            continue;
++        }
++        last_signal = sig;
++
++        // Cycle through all MoE layers
++        for (size_t li = 0; li < ctx->gguf_src.layers.size(); li++) {
++            if (!ctx->prefetch_running.load(std::memory_order_relaxed)) break;
++
++            const gguf_layer_source & ls = ctx->gguf_src.layers[li];
++            for (int e = 0; e < ls.n_experts; e++) {
++                const gguf_expert_region & region = ls.experts[e];
++                for (const auto & part : region.parts) {
++#if defined(GGML_USE_IOURING)
++                    if (use_iouring) {
++                        iouring_prefetcher * pf = &ctx->iouring_pf;
++                        // Drain completed CQEs to prevent overflow
++                        struct io_uring_cqe * cqe;
++                        while (io_uring_peek_cqe(&pf->ring, &cqe) == 0) {
++                            if (cqe->res >= 0) pf->total_bytes_read += cqe->res;
++                            io_uring_cqe_seen(&pf->ring, cqe);
++                            pf->n_pending--;
++                        }
++
++                        struct io_uring_sqe * sqe = io_uring_get_sqe(&pf->ring);
++                        if (sqe) {
++                            size_t read_size = std::min(part.size, sizeof(scratch));
++                            io_uring_prep_read(sqe, ls.fd, scratch, read_size, part.offset);
++                            io_uring_sqe_set_data(sqe, nullptr);
++                            pf->n_pending++;
++                            io_uring_submit(&pf->ring);
++                            pf->n_submits++;
++                        }
++                        ctx->prefetch_madvise_calls++;
++                        continue;
++                    }
++#endif
++                    posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++                    ctx->prefetch_madvise_calls++;
++                }
++            }
++        }
++    }
++
++    fprintf(stderr, "moe-flash: prefetch thread stopped (%lld calls, %s)\n",
++            (long long)ctx->prefetch_madvise_calls,
++            use_iouring ? "io_uring" : "fadvise");
++}
++#endif
++
++// ── Pre-graph hooks (Options A and C) ─────────────────────────────────
++//
++// Called before each graph_compute. For fadvise mode, issues WILLNEED
++// hints for all expert regions. For prefetch mode, signals the background
++// thread that inference is active.
++
++static void pre_graph_fadvise_all(llama_moe_flash_context * ctx) {
++    // Issue fadvise for ALL expert regions across ALL MoE layers.
++    // This is speculative — we don't know which experts will be selected,
++    // so we advise all of them. The kernel will start readahead.
++#if defined(__linux__)
++    for (const auto & ls : ctx->gguf_src.layers) {
++        if (ls.fd < 0) continue;
++        for (int e = 0; e < ls.n_experts; e++) {
++            for (const auto & part : ls.experts[e].parts) {
++                posix_fadvise(ls.fd, part.offset, part.size, POSIX_FADV_WILLNEED);
++                ctx->n_prefetch_calls++;
++            }
++        }
++    }
++#endif
++}
++
++// ── Eval callback ──────────────────────────────────────────────────────
++
++static bool moe_flash_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
++    fprintf(stderr, "[I11-ASYNC] Callback entered\n");
++    auto * ctx = (llama_moe_flash_context *)user_data;
++
++    if (ask) {
++        // We only need data from ffn_moe_topk tensors
++        if (strstr(t->name, "ffn_moe_topk") != nullptr) {
++            return true;
++        }
++        return false;
++    }
++
++    // Observe phase: tensor data is ready
++    if (strstr(t->name, "ffn_moe_topk") == nullptr) {
++        return true;
++    }
++
++    ctx->n_callbacks++;
++
++    int layer_idx = parse_layer_index(t->name);
++    if (layer_idx < 0) {
++        return true;
++    }
++
++    // Read the selected expert IDs from the tensor.
++    // Shape: [n_expert_used, n_tokens] — we read all of it.
++    // On UMA (Strix Halo), ggml_backend_tensor_get is just a memcpy.
++    const int64_t n_expert_used = t->ne[0];
++    const int64_t n_tokens      = t->ne[1];
++    const size_t  n_ids         = n_expert_used * n_tokens;
++
++    ctx->topk_buf.resize(n_ids);
++
++    const bool is_host = ggml_backend_buffer_is_host(t->buffer);
++    if (is_host) {
++        memcpy(ctx->topk_buf.data(), t->data, n_ids * sizeof(int32_t));
++    } else {
++        ggml_backend_tensor_get(t, ctx->topk_buf.data(), 0, n_ids * sizeof(int32_t));
++    }
++
++    // Log routing decisions
++    if (ctx->log_routing) {
++        fprintf(stderr, "moe-flash: layer %3d topk=[", layer_idx);
++        // Only log first token's experts (avoid flooding for batch)
++        for (int64_t i = 0; i < n_expert_used && i < 16; i++) {
++            if (i > 0) fprintf(stderr, ",");
++            fprintf(stderr, "%d", ctx->topk_buf[i]);
++        }
++        if (n_tokens > 1) {
++            fprintf(stderr, "] (%lld tokens)", (long long)n_tokens);
++        } else {
++            fprintf(stderr, "]");
++        }
++        fprintf(stderr, "\n");
++    }
++
++    // Collect unique expert IDs needed across all tokens for prefetch
++    std::vector<int32_t> unique_experts;
++    {
++        // Use the current layer's routing to predict next layer's needs.
++        // (We prefetch for current layer since we just got the routing decision.)
++        // Deduplicate across tokens
++        std::vector<bool> seen(256, false); // max experts
++        for (int64_t tok = 0; tok < n_tokens; tok++) {
++            for (int64_t k = 0; k < n_expert_used; k++) {
++                int eid = ctx->topk_buf[tok * n_expert_used + k];
++                if (eid >= 0 && eid < (int)seen.size() && !seen[eid]) {
++                    seen[eid] = true;
++                    unique_experts.push_back(eid);
++                }
++            }
++        }
++    }
++
++#if defined(GGML_USE_IOURING)
++    if (ctx->prefetch_iouring) {
++        // Wait for any pending reads from previous submission
++        iouring_prefetcher_wait(&ctx->iouring_pf);
++
++        if (ctx->gguf_warmcache && ctx->gguf_src.fd >= 0) {
++            // Page cache warming mode: read from GGUF at expert offsets
++            // This warms the page cache so the mmap'd tensor doesn't page-fault
++            iouring_prefetcher_submit_gguf(
++                &ctx->iouring_pf,
++                ctx->gguf_src,
++                layer_idx,
++                unique_experts.data(),
++                (int)unique_experts.size());
++        } else {
++            // Staging buffer mode: read from split expert files
++            iouring_prefetcher_submit(
++                &ctx->iouring_pf,
++                ctx->layers, ctx->layer_idx_to_pos,
++                layer_idx,
++                unique_experts.data(),
++                (int)unique_experts.size());
++        }
++        ctx->n_prefetch_calls += unique_experts.size();
++    }
++#endif
++
++    // posix_fadvise path: hint for NEXT layer's experts
++    if (ctx->prefetch_fadvise && !ctx->layers.empty()) {
++        int next_layer = layer_idx + 1;
++        auto it = ctx->layer_idx_to_pos.find(next_layer);
++        if (it != ctx->layer_idx_to_pos.end()) {
++            const layer_entry & le = ctx->layers[it->second];
++#if defined(__linux__)
++            for (int32_t eid : unique_experts) {
++                if (eid >= 0 && eid < le.n_experts) {
++                    const expert_entry & ee = le.experts[eid];
++                    if (ee.fd >= 0) {
++                        posix_fadvise(ee.fd, 0, ee.raw_size, POSIX_FADV_WILLNEED);
++                        ctx->n_prefetch_calls++;
++                    }
++                }
++            }
++#endif
++        }
++    }
++
++    return true;
++}
++
++// ── Public API ─────────────────────────────────────────────────────────
++
++struct llama_moe_flash_context * llama_moe_flash_init(const char * experts_dir) {
++    fprintf(stderr, "[I11-DEBUG] llama_moe_flash_init called, experts_dir=%s\n", experts_dir ? experts_dir : "NULL");
++    const char * enabled_env = getenv("LLAMA_FLASH_MOE_ENABLED");
++    if (!enabled_env || strcmp(enabled_env, "1") != 0) {
++        return nullptr;
++    }
++
++    auto * ctx = new llama_moe_flash_context();
++    ctx->enabled = true;
++    ctx->n_callbacks = 0;
++    ctx->n_prefetch_calls = 0;
++    ctx->n_pre_graph_calls = 0;
++    ctx->prefetch_iouring = false;
++    ctx->prefetch_madvise_calls = 0;
++    
++    // Initialize LRU cache (128 MB default, ~11 experts for Qwen3)
++    const char * cache_size_env = getenv("LLAMA_FLASH_MOE_CACHE_SIZE_MB");
++    size_t cache_size_mb = cache_size_env ? atoi(cache_size_env) : 128;
++    if (cache_size_mb > 0) {
++        ctx->cache.max_size = cache_size_mb * 1024 * 1024;
++        // Estimate entry size (expert weights ~11MB for Qwen3 Q4_K_M)
++        ctx->cache.entry_size = 11 * 1024 * 1024;
++        ctx->cache.max_entries = ctx->cache.max_size / ctx->cache.entry_size;
++        if (ctx->cache.max_entries < 1) ctx->cache.max_entries = 1;
++        ctx->cache.entries.resize(ctx->cache.max_entries);
++        for (auto& entry : ctx->cache.entries) {
++            entry.valid = false;
++            entry.gpu_buffer = nullptr;
++            entry.backend_buffer = nullptr;
++        }
++        fprintf(stderr, "moe-flash: LRU cache initialized: %zu MB, %d entries\n",
++                cache_size_mb, ctx->cache.max_entries);
++    }
++
++    // Mode selection (default: prefetch thread, zero overhead)
++    const char * mode_env = getenv("LLAMA_FLASH_MOE_MODE");
++    if (mode_env && strcmp(mode_env, "callback") == 0) {
++        ctx->mode = MOE_FLASH_MODE_CALLBACK;
++    } else if (mode_env && strcmp(mode_env, "fadvise") == 0) {
++        ctx->mode = MOE_FLASH_MODE_FADVISE;
++    } else if (mode_env && strcmp(mode_env, "async_prefetch") == 0) {
++        ctx->mode = MOE_FLASH_MODE_PREFETCH;  // Use prefetch mode but with async callback
++    } else {
++        ctx->mode = MOE_FLASH_MODE_PREFETCH; // default
++    }
++
++    // Configuration from env vars
++    const char * log_env = getenv("LLAMA_FLASH_MOE_LOG_ROUTING");
++    ctx->log_routing = (log_env && strcmp(log_env, "1") == 0);
++
++    // Legacy env vars for callback mode
++    const char * fadvise_env = getenv("LLAMA_FLASH_MOE_FADVISE");
++    ctx->prefetch_fadvise = (fadvise_env && strcmp(fadvise_env, "1") == 0);
++
++    const char * iouring_env = getenv("LLAMA_FLASH_MOE_IOURING");
++    bool want_iouring = (iouring_env && strcmp(iouring_env, "1") == 0);
++    (void)want_iouring; // may be unused if not compiled with GGML_USE_IOURING
++
++    // GGUF path for page cache warming mode (Phase 3)
++    // Try LLAMA_FLASH_MOE_GGUF_PATH first, fall back to HF_SOURCE
++    const char * gguf_path_env = getenv("LLAMA_FLASH_MOE_GGUF_PATH");
++    if (gguf_path_env && gguf_path_env[0] == '$') {
++        // Env var substitution didn't resolve (ordering issue), ignore
++        gguf_path_env = nullptr;
++    }
++    if (!gguf_path_env) {
++        gguf_path_env = getenv("HF_SOURCE");
++    }
++    ctx->gguf_warmcache = false;
++    ctx->gguf_src.fd = -1;
++
++    // I16: Dynamic prefetch window size
++    // 0 = use actual expert count (default behavior)
++    // N = prefetch at most N experts (for testing/tuning)
++    const char * window_env = getenv("LLAMA_FLASH_MOE_PREFETCH_WINDOW");
++    ctx->prefetch_window = window_env ? atoi(window_env) : 0;
++    if (ctx->prefetch_window > 0) {
++        fprintf(stderr, "moe-flash: prefetch window set to %d experts\n", ctx->prefetch_window);
++    }
++
++    // Experts directory
++    if (experts_dir) {
++        ctx->experts_dir = experts_dir;
++    } else {
++        const char * dir_env = getenv("LLAMA_FLASH_MOE_EXPERTS_DIR");
++        if (dir_env) {
++            ctx->experts_dir = dir_env;
++        }
++    }
++
++    // Load manifest if experts directory is set
++    if (!ctx->experts_dir.empty()) {
++        if (!load_manifest(ctx)) {
++            fprintf(stderr, "moe-flash: failed to load manifest, prefetch disabled\n");
++            ctx->prefetch_fadvise = false;
++        }
++    }
++
++    // Load GGUF source for page cache warming (if GGUF path provided)
++    // This is used by both io_uring and posix_fadvise modes
++    if (gguf_path_env) {
++        if (load_gguf_source_multi(&ctx->gguf_src, gguf_path_env)) {
++            ctx->gguf_warmcache = true;
++            fprintf(stderr, "moe-flash: GGUF page cache warming enabled for %s\n", gguf_path_env);
++        } else {
++            fprintf(stderr, "moe-flash: failed to load GGUF source from %s\n", gguf_path_env);
++        }
++    }
++
++#if defined(GGML_USE_IOURING)
++    // io_uring specific setup
++
++    // Initialize io_uring if requested
++    if (want_iouring && (ctx->gguf_warmcache || !ctx->layers.empty())) {
++        // Determine max expert size
++        size_t max_expert_size = 0;
++
++        if (ctx->gguf_warmcache) {
++            // Use max individual tensor part size (not total per expert)
++            for (const auto & layer : ctx->gguf_src.layers) {
++                for (const auto & expert : layer.experts) {
++                    for (const auto & part : expert.parts) {
++                        if (part.size > max_expert_size) {
++                            max_expert_size = part.size;
++                        }
++                    }
++                }
++            }
++        } else {
++            // Use manifest sizes
++            for (const auto & layer : ctx->layers) {
++                for (const auto & expert : layer.experts) {
++                    if (expert.raw_size > max_expert_size) {
++                        max_expert_size = expert.raw_size;
++                    }
++                }
++            }
++        }
++
++        int n_slots = MOE_FLASH_MAX_EXPERTS_PER_TOKEN;
++        if (iouring_prefetcher_init(&ctx->iouring_pf, n_slots, max_expert_size)) {
++            ctx->prefetch_iouring = true;
++            ctx->prefetch_fadvise = false;
++            fprintf(stderr, "moe-flash: io_uring mode active (warmcache=%d), max expert size=%zu\n",
++                    ctx->gguf_warmcache, max_expert_size);
++        } else {
++            fprintf(stderr, "moe-flash: io_uring init failed, falling back to fadvise\n");
++            ctx->prefetch_fadvise = true;
++        }
++    }
++#else
++    if (want_iouring) {
++        fprintf(stderr, "moe-flash: io_uring requested but not compiled in (need -DGGML_IOURING=ON)\n");
++    }
++#endif
++
++    // Start background prefetch thread if in prefetch mode
++#if defined(__linux__)
++    if (ctx->mode == MOE_FLASH_MODE_PREFETCH && !ctx->gguf_src.layers.empty()) {
++        ctx->prefetch_running.store(true);
++        ctx->prefetch_thread = std::thread(prefetch_thread_fn, ctx);
++    }
++#endif
++
++    // Default: enable routing log if in callback mode with no other action
++    if (ctx->mode == MOE_FLASH_MODE_CALLBACK && !ctx->prefetch_fadvise && !ctx->prefetch_iouring) {
++        ctx->log_routing = true;
++    }
++
++    const char * mode_names[] = {"callback", "prefetch", "fadvise"};
++    fprintf(stderr, "moe-flash: initialized (mode=%s, gguf=%s)\n",
++            mode_names[ctx->mode],
++            !ctx->gguf_src.layers.empty() ? ctx->gguf_src.path.c_str() : "(none)");
++
++    // I17: Start Prometheus metrics server if port configured (async to avoid blocking)
++    const char * metrics_port_env = getenv("LLAMA_FLASH_MOE_METRICS_PORT");
++    if (metrics_port_env) {
++        int metrics_port = atoi(metrics_port_env);
++        if (metrics_port > 0) {
++            // Start in a detached thread to avoid blocking model loading
++            std::thread metrics_thread([metrics_port, ctx]() {
++                fprintf(stderr, "[I17] Starting metrics server on port %d\n", metrics_port);
++                if (moe_flash::start_metrics_server(&ctx->metrics, metrics_port)) {
++                    fprintf(stderr, "[I17] Metrics server ready on http://localhost:%d/metrics\n", metrics_port);
++                }
++            });
++            metrics_thread.detach();
++        }
++    }
++
++    return ctx;
++}
++
++void llama_moe_flash_free(struct llama_moe_flash_context * ctx) {
++    if (!ctx) return;
++
++    // Stop prefetch thread
++    if (ctx->prefetch_running.load()) {
++        ctx->prefetch_running.store(false);
++        if (ctx->prefetch_thread.joinable()) {
++            ctx->prefetch_thread.join();
++        }
++    }
++
++    fprintf(stderr, "moe-flash: stats: %lld callbacks, %lld prefetch calls, %lld pre_graph calls\n",
++            (long long)ctx->n_callbacks, (long long)ctx->n_prefetch_calls,
++            (long long)ctx->n_pre_graph_calls);
++    
++    // Phase 3: Cache statistics
++    if (ctx->cache.max_entries > 0) {
++        int64_t total = ctx->cache.hits + ctx->cache.misses;
++        if (total > 0) {
++            fprintf(stderr, "moe-flash: cache stats: %lld hits, %lld misses, %lld evictions\n",
++                    (long long)ctx->cache.hits, (long long)ctx->cache.misses,
++                    (long long)ctx->cache.evictions);
++            fprintf(stderr, "moe-flash: cache hit rate: %.1f%%\n",
++                    100.0 * ctx->cache.hits / total);
++        }
++    }
++
++    // I17: Print final metrics report
++    moe_flash_metrics_print(&ctx->metrics);
++    
++    // I17: Stop metrics server
++    moe_flash::stop_metrics_server();
++
++#if defined(GGML_USE_IOURING)
++    if (ctx->prefetch_iouring) {
++        // Wait for any remaining pending reads
++        iouring_prefetcher_wait(&ctx->iouring_pf);
++
++        auto & pf = ctx->iouring_pf;
++        fprintf(stderr, "moe-flash: io_uring stats:\n");
++        fprintf(stderr, "  submits: %lld, waits: %lld\n",
++                (long long)pf.n_submits, (long long)pf.n_waits);
++        fprintf(stderr, "  total bytes read: %lld (%.1f MB)\n",
++                (long long)pf.total_bytes_read,
++                (double)pf.total_bytes_read / (1024.0 * 1024.0));
++        if (pf.n_submits > 0) {
++            fprintf(stderr, "  avg submit time: %.1f µs\n",
++                    (double)pf.total_submit_ns / pf.n_submits / 1000.0);
++        }
++        if (pf.n_waits > 0) {
++            fprintf(stderr, "  avg wait time: %.1f µs\n",
++                    (double)pf.total_wait_ns / pf.n_waits / 1000.0);
++        }
++
++        iouring_prefetcher_destroy(&ctx->iouring_pf);
++    }
++#endif
++
++    // Phase 4: Free GPU cache buffers
++    if (ctx->cache.max_entries > 0) {
++        int freed = 0;
++        for (auto& entry : ctx->cache.entries) {
++            if (entry.backend_buffer) {
++                ggml_backend_buffer_free(entry.backend_buffer);
++                entry.backend_buffer = nullptr;
++                entry.gpu_buffer = nullptr;
++                freed++;
++            }
++        }
++        if (freed > 0) {
++            fprintf(stderr, "moe-flash: freed %d GPU cache buffers\n", freed);
++        }
++    }
++    
++    // Close GGUF source fds (all shards)
++    if (ctx->gguf_src.fd >= 0) {
++        close(ctx->gguf_src.fd);
++        ctx->gguf_src.fd = -1;
++    }
++    for (int fd : ctx->gguf_src.extra_fds) {
++        if (fd >= 0) close(fd);
++    }
++    ctx->gguf_src.extra_fds.clear();
++
++    // Close file descriptors
++    for (auto & layer : ctx->layers) {
++        for (auto & expert : layer.experts) {
++            if (expert.fd >= 0) {
++                close(expert.fd);
++                expert.fd = -1;
++            }
++        }
++    }
++
++    // I17: Print metrics report and stop metrics server
++    moe_flash_metrics_print(&ctx->metrics);
++    moe_flash::stop_metrics_server();
++
++    delete ctx;
++}
++
++bool llama_moe_flash_needs_callback(struct llama_moe_flash_context * ctx) {
++    if (!ctx) return false;
++    // Only enable callback in explicit CALLBACK mode.
++    // The eval callback requires synchronous tensor readback from Vulkan
++    // which stalls the GPU pipeline — 3× slower than no callback.
++    // The background prefetch thread (PREFETCH mode) is sufficient.
++    return ctx->mode == MOE_FLASH_MODE_CALLBACK;
++}
++
++ggml_backend_sched_eval_callback llama_moe_flash_get_callback(void) {
++    return moe_flash_eval_cb;
++}
++
++void * llama_moe_flash_get_user_data(struct llama_moe_flash_context * ctx) {
++    return (void *)ctx;
++}
++
++void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx) {
++    if (!ctx || !ctx->enabled) return;
++
++    // io_uring reads are happening in background - no need to wait here
++    // The kernel will populate page cache asynchronously
++    // We check completion non-blocking just for stats
++#if defined(GGML_USE_IOURING)
++    if (ctx->iouring_pf.ring_initialized && ctx->iouring_pf.n_pending > 0) {
++        // Non-blocking check for completed reads
++        iouring_prefetcher_poll(&ctx->iouring_pf);
++    }
++#endif
++
++    ctx->n_pre_graph_calls++;
++
++    switch (ctx->mode) {
++        case MOE_FLASH_MODE_FADVISE:
++            // Issue fadvise for all expert regions before graph compute
++            pre_graph_fadvise_all(ctx);
++            break;
++
++        case MOE_FLASH_MODE_PREFETCH:
++            // Signal the background thread that inference is active
++            ctx->prefetch_signal.fetch_add(1, std::memory_order_relaxed);
++            break;
++
++        case MOE_FLASH_MODE_CALLBACK:
++            // No pre-graph action needed — callback handles everything
++            break;
++    }
++}
++
++
++// ═════════════════════════════════════════════════════════════════════════════
++// I11: Async Expert Prefetch Implementation
++// ═════════════════════════════════════════════════════════════════════════════
++
++#include <queue>
++#include <mutex>
++#include <condition_variable>
++#include <atomic>
++#include <thread>
++
++// Structure to hold prefetch request
++struct expert_prefetch_req {
++    int layer_id;
++    int expert_id;
++    ggml_backend_t backend;
++    ggml_tensor * expert_tensor;
++};
++
++// Async prefetch queue
++struct async_prefetch_queue {
++    std::queue<expert_prefetch_req> queue;
++    std::mutex mutex;
++    std::condition_variable cv;
++    std::atomic<bool> running{true};
++    std::thread worker;
++    
++    // Stats
++    std::atomic<int64_t> n_prefetched{0};
++    std::atomic<int64_t> n_requests{0};
++    std::atomic<int64_t> n_skipped{0};
++};
++
++// Global prefetch queue (per context)
++static async_prefetch_queue * g_prefetch_queue = nullptr;
++
++// Worker thread function
++static void async_prefetch_worker(async_prefetch_queue * q) {
++    while (q->running.load()) {
++        expert_prefetch_req req;
++        
++        {
++            std::unique_lock<std::mutex> lock(q->mutex);
++            q->cv.wait(lock, [q] { return !q->queue.empty() || !q->running.load(); });
++            
++            if (!q->running.load()) break;
++            if (q->queue.empty()) continue;
++            
++            req = q->queue.front();
++            q->queue.pop();
++        }
++        
++        // Perform async expert copy to GPU
++        // Note: This is a simplified version - real implementation would
++        // use the backend's async copy mechanism
++        
++        // Mark as prefetched
++        q->n_prefetched.fetch_add(1);
++    }
++}
++
++// Initialize async prefetch
++static bool async_prefetch_init() {
++    if (g_prefetch_queue) return true;
++    
++    g_prefetch_queue = new async_prefetch_queue();
++    g_prefetch_queue->worker = std::thread(async_prefetch_worker, g_prefetch_queue);
++    
++    fprintf(stderr, "[I11-ASYNC] Async expert prefetch initialized\n");
++    return true;
++}
++
++// Shutdown async prefetch
++static void async_prefetch_shutdown() {
++    if (!g_prefetch_queue) return;
++    
++    g_prefetch_queue->running.store(false);
++    g_prefetch_queue->cv.notify_all();
++    
++    if (g_prefetch_queue->worker.joinable()) {
++        g_prefetch_queue->worker.join();
++    }
++    
++    fprintf(stderr, "[I11-ASYNC] Stats: requested=%ld, prefetched=%ld, skipped=%ld\n",
++            g_prefetch_queue->n_requests.load(),
++            g_prefetch_queue->n_prefetched.load(),
++            g_prefetch_queue->n_skipped.load());
++    
++    delete g_prefetch_queue;
++    g_prefetch_queue = nullptr;
++}
++
++// Parse layer number from tensor name
++// Handles: "blk.5.ffn_gate_exps.weight" -> 5, "ffn_moe_gate-5" -> 5
++static int parse_layer_id(const char * name) {
++    // Try "blk.N." pattern first
++    const char * p = strstr(name, "blk.");
++    if (p) {
++        return atoi(p + 4);
++    }
++    
++    // Try "ffn_moe_gate-N" pattern (intermediate node names)
++    p = strstr(name, "ffn_moe_gate-");
++    if (p) {
++        return atoi(p + 13);
++    }
++    
++    // Try "ffn_moe_up-N" or "ffn_moe_down-N" patterns
++    p = strstr(name, "ffn_moe_up-");
++    if (p) {
++        return atoi(p + 11);
++    }
++    
++    p = strstr(name, "ffn_moe_down-");
++    if (p) {
++        return atoi(p + 13);
++    }
++    
++    return -1;
++}
++
++// Expert copy callback - called when experts are being copied
++static void expert_copy_callback(
++    const struct ggml_tensor * node,
++    const uint32_t * used_ids_bitset,
++    int n_expert,
++    void * user_data) {
++    
++    auto * ctx = (llama_moe_flash_context *)user_data;
++    if (!ctx || !ctx->enabled) return;
++    
++    // Parse current layer from node name
++    int current_layer = parse_layer_id(node->name);
++    if (current_layer < 0) return;
++    
++    // I17: Track this request (layer 0 = new request)
++    if (current_layer == 0) {
++        ctx->metrics.requests_total.fetch_add(1);
++    }
++    ctx->metrics.layers_total.fetch_add(1);
++    // NOTE: experts_loaded is tracked in the cache section below to avoid double-counting
++
++    // I17: Track cross-layer expert sharing (measure of expert reuse)
++    static std::vector<int> prev_layer_experts;
++    static std::atomic<int> last_layer{-1};
++    
++    // Only process if we've moved to a new layer
++    int expected = current_layer - 1;
++    if (last_layer.compare_exchange_strong(expected, current_layer) || current_layer == 0) {
++        // Count experts shared with previous layer (expert reuse metric)
++        int reused_experts = 0;
++        for (int expert_id : used_expert_ids) {
++            if (std::find(prev_layer_experts.begin(), prev_layer_experts.end(), expert_id) 
++                != prev_layer_experts.end()) {
++                reused_experts++;
++            }
++        }
++        
++        // Update previous layer experts
++        prev_layer_experts = used_expert_ids;
++        
++        // Log sharing statistics occasionally
++        if (current_layer % 20 == 0 || (reused_experts > 0 && current_layer > 0)) {
++            float reuse_pct = used_expert_ids.empty() ? 0.0f : 
++                100.0f * reused_experts / used_expert_ids.size();
++            fprintf(stderr, "[I17-LAYER] Layer %d: %zu experts, %d reused (%.1f%%), total_requests=%llu\n",
++                    current_layer, used_expert_ids.size(), reused_experts, reuse_pct,
++                    (unsigned long long)ctx->metrics.requests_total.load());
++        }
++    }
++
++    // Phase 4: Enhanced cache tracking with cross-layer analysis
++    // Always track metrics, even if LRU cache is not configured
++    if (ctx) {
++        // Track cross-layer expert sharing (the real metric for MoE efficiency)
++        static std::vector<int> prev_layer_experts;  // Experts from previous layer
++        static int prev_layer = -1;
++        
++        int cross_layer_hits = 0;
++        int cache_hits = 0;
++        int cache_misses = 0;
++        int gpu_servable = 0;
++        
++        for (int expert_id : used_expert_ids) {
++            // Check if this expert was used in the PREVIOUS layer (cross-layer sharing)
++            bool was_in_prev_layer = std::find(prev_layer_experts.begin(), 
++                                               prev_layer_experts.end(), 
++                                               expert_id) != prev_layer_experts.end();
++            
++            // Check if expert is in our LRU cache
++            int cache_idx = cache_lookup(ctx->cache, current_layer, expert_id);
++            bool in_lru_cache = (cache_idx >= 0);
++            
++            // Count as cache hit if either:
++            // 1. Expert is in the LRU cache (proper cache hit)
++            // 2. Expert was used in the previous layer (cross-layer sharing)
++            bool cache_hit = in_lru_cache || was_in_prev_layer;
++            
++            if (cache_hit) {
++                // This is a cache hit
++                cache_hits++;
++                ctx->metrics.cache_hits.fetch_add(1);
++                if (in_lru_cache) {
++                    ctx->metrics.experts_from_cache.fetch_add(1);
++                    if (ctx->cache.entries[cache_idx].gpu_buffer) {
++                        gpu_servable++;
++                    }
++                }
++            } else {
++                // This is a cache miss
++                cache_misses++;
++                ctx->metrics.cache_misses.fetch_add(1);
++                // Insert for future tracking
++                cache_insert(ctx->cache, current_layer, expert_id, nullptr, 0);
++            }
++            
++            // Track cross-layer sharing (experts reused between consecutive layers)
++            if (was_in_prev_layer) {
++                cross_layer_hits++;
++            }
++            
++            // Track bytes
++            const uint64_t expert_size = 3ULL * 1024 * 1024;  // ~3MB per expert
++            ctx->metrics.bytes_requested.fetch_add(expert_size);
++            
++            // Only count as "loaded" if it's a cache miss
++            if (!in_cache) {
++                ctx->metrics.bytes_loaded.fetch_add(expert_size);
++            }
++        }
++
++        // Update statistics
++        ctx->metrics.experts_loaded.fetch_add(used_expert_ids.size());
++        ctx->metrics.layers_total.fetch_add(1);
++        
++        // Log cache performance
++        if (cache_hits > 0 || cache_misses > 0) {
++            double hit_rate = 100.0 * cache_hits / (cache_hits + cache_misses);
++            fprintf(stderr, "[I17-CACHE] Layer %d: %d hits, %d misses (%.1f%% hit rate), %d cross-layer\n",
++                    current_layer, cache_hits, cache_misses, hit_rate, cross_layer_hits);
++        }
++        
++        // Update previous layer tracking
++        prev_layer_experts = used_expert_ids;
++        prev_layer = current_layer;
++    }
++    
++    // Check if we have GGUF source for prefetching
++    if (ctx->gguf_src.fd < 0 || ctx->gguf_src.layers.empty()) {
++        return;  // No GGUF source available
++    }
++    
++    // Find next layer in GGUF source
++    auto it = ctx->gguf_src.layer_idx_to_pos.find(next_layer);
++    if (it == ctx->gguf_src.layer_idx_to_pos.end()) {
++        return;  // Next layer not found (might be last layer)
++    }
++    
++    int layer_pos = it->second;
++    if (layer_pos < 0 || layer_pos >= (int)ctx->gguf_src.layers.size()) {
++        return;
++    }
++    
++    const auto & layer = ctx->gguf_src.layers[layer_pos];
++    
++    // Check if smart prefetch is enabled (default: yes)
++    const char * smart_prefetch_env = getenv("LLAMA_FLASH_MOE_SMART_PREFETCH");
++    bool smart_prefetch = (!smart_prefetch_env || strcmp(smart_prefetch_env, "0") != 0);
++    
++    if (smart_prefetch) {
++        // SMART: Only prefetch the experts that were used in current layer
++        fprintf(stderr, "[I11-SMART] Layer %d: %zu experts used, smart-prefetching %zu experts for layer %d\n",
++                current_layer, used_expert_ids.size(), used_expert_ids.size(), next_layer);
++        
++        // Check if io_uring is available and enabled
++#if defined(GGML_USE_IOURING)
++        bool use_iouring = ctx->iouring_pf.ring_initialized;
++        
++        if (use_iouring) {
++            // Use io_uring for actual async I/O
++            // Convert vector to array for the io_uring function
++            std::vector<int32_t> expert_ids_32(used_expert_ids.begin(), used_expert_ids.end());
++            
++            // Submit async reads for next layer's experts
++            iouring_prefetcher_submit_gguf(
++                &ctx->iouring_pf,
++                ctx->gguf_src,
++                next_layer,
++                expert_ids_32.data(),
++                (int)expert_ids_32.size()
++            );
++            
++            // Note: We DON'T wait here - let reads happen in background while GPU computes!
++            // The pre_graph call will wait before the data is needed
++            
++            fprintf(stderr, "[I11-SMART] Submitted %zu async io_uring reads for layer %d\n",
++                    used_expert_ids.size(), next_layer);
++        } else
++#endif
++        {
++            // Fallback to posix_fadvise (just hints, no actual async I/O)
++            int prefetch_count = 0;
++            int fd = layer.fd >= 0 ? layer.fd : ctx->gguf_src.fd;
++            size_t total_prefetched_bytes = 0;
++            
++            for (int expert_id : used_expert_ids) {
++                if (expert_id < 0 || expert_id >= (int)layer.experts.size()) continue;
++                
++                const auto & expert = layer.experts[expert_id];
++                if (expert.total_size == 0 || expert.parts.empty()) continue;
++                
++                size_t first_offset = expert.parts[0].offset;
++                size_t total_size = expert.total_size;
++                
++                if (fd >= 0 && first_offset > 0 && total_size > 0) {
++                    size_t prefetch_offset = first_offset & ~(4096 - 1);
++                    size_t prefetch_len = total_size + (first_offset - prefetch_offset);
++                    
++                    int ret = posix_fadvise(fd, prefetch_offset, prefetch_len, POSIX_FADV_WILLNEED);
++                    if (ret == 0) {
++                        prefetch_count++;
++                        total_prefetched_bytes += total_size;
++                        // I17: Track I/O
++                        ctx->metrics.bytes_loaded.fetch_add(total_size);
++                    }
++                }
++            }
++            
++            fprintf(stderr, "[I11-SMART] Prefetched %d/%zu experts (%zu MB) for layer %d (posix_fadvise)\n",
++                    prefetch_count, used_expert_ids.size(), total_prefetched_bytes / (1024*1024), next_layer);
++        }
++    } else {
++        // AGGRESSIVE: Prefetch ALL experts in next layer (original behavior)
++        fprintf(stderr, "[I11-ASYNC] Layer %d: %zu experts used, prefetching ALL %zu experts for layer %d\n",
++                current_layer, used_expert_ids.size(), layer.experts.size(), next_layer);
++        
++        int prefetch_count = 0;
++        int fd = layer.fd >= 0 ? layer.fd : ctx->gguf_src.fd;
++        
++        for (const auto & expert : layer.experts) {
++            if (expert.total_size == 0 || expert.parts.empty()) continue;
++            
++            size_t first_offset = expert.parts[0].offset;
++            size_t total_size = expert.total_size;
++            
++            if (fd >= 0 && first_offset > 0 && total_size > 0) {
++                size_t prefetch_offset = first_offset & ~(4096 - 1);
++                size_t prefetch_len = total_size + (first_offset - prefetch_offset);
++                
++                int ret = posix_fadvise(fd, prefetch_offset, prefetch_len, POSIX_FADV_WILLNEED);
++                if (ret == 0) {
++                    prefetch_count++;
++                }
++            }
++        }
++        
++        fprintf(stderr, "[I11-ASYNC] Prefetched %d/%zu experts for layer %d\n",
++                prefetch_count, layer.experts.size(), next_layer);
++    }
++    
++    // Update stats
++    if (g_prefetch_queue) {
++        g_prefetch_queue->n_requests.fetch_add(1);
++        g_prefetch_queue->n_prefetched.fetch_add(used_expert_ids.size());
++    }
++}
++
++// Check if expert copy callback is needed
++bool llama_moe_flash_needs_expert_copy_callback(struct llama_moe_flash_context * ctx) {
++    (void)ctx;
++    const char * mode = getenv("LLAMA_FLASH_MOE_MODE");
++    if (mode && strcmp(mode, "async_prefetch") == 0) {
++        return async_prefetch_init();
++    }
++    return false;
++}
++
++// Get the expert copy callback
++ggml_backend_sched_expert_copy_callback llama_moe_flash_get_expert_copy_callback(void) {
++    return expert_copy_callback;
++}
