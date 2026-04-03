@@ -21,7 +21,7 @@
 |---------------|--------|--------|--------|----------------|
 | **I14** - io_uring Polish | Medium | Low | ✅ **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
 | **I10b Option B** - Force-offload | High | Medium | ✅ **COMPLETE** | Ready to test with DeepSeek |
-| **I12** - ik_llama.cpp Benchmark | High | Medium | Not started | ⭐ **DO FIRST** |
+| **I12** - ik_llama.cpp Benchmark | High | Medium | 🚀 **DEPLOYED** | See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
 | **I11** - Dynamic Expert Import | High | High | Not started | Future work |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
 | **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 fix |
@@ -62,27 +62,17 @@ madvise(staging_pool, size, MADV_HUGEPAGE | MADV_COLLAPSE);
 
 ---
 
-### 2. I12: ik_llama.cpp Benchmark — Baseline Comparison
+### 2. I12: ik_llama.cpp Benchmark — 🚀 DEPLOYED
 
 **Goal**: Establish CPU-only performance baseline for comparison.
 
-**Why**:
-- ik_llama.cpp has FlashMLA (fastest CPU DeepSeek inference)
-- Fused MoE FFN, Smart Expert Reduction
-- No Vulkan - pure CPU with AVX-512 optimizations
-- With 125 GB RAM + Zen 5, might match/bebeat our 1.8 t/s hybrid
+**Status**: Image + K8s deployment created. Awaiting CI build + Flux reconciliation.
 
-**Test**:
-```bash
-# Build ik_llama.cpp with Zen 5 flags
-cmake -B build -DLLAMA_NATIVE=OFF -DLLAMA_AVX512=ON ...
-# Benchmark DeepSeek-R1-0528 Q2_K CPU-only
-# Compare to our current 1.8 t/s with Vulkan/CPU hybrid
-```
-
-**Effort**: 1-2 days to build and benchmark
-**Risk**: Low (benchmark only, no production change)
-**Value**: Know if we're leaving performance on the table
+**Deployment**:
+- **Image**: `ghcr.io/cecil-the-coder/ik-llama-cpu:latest` (built via CI)
+- **Backend**: `ik-llama-cpu` (CPU-only, no GPU mounts, AVX-512)
+- **Model**: `deepseek-r1-0528-ik` (same GGUF files as existing DeepSeek)
+- **Details**: See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md)
 
 **Success Metric**:
 - If ik_llama.cpp > 2.5 t/s: We should port their CPU kernels

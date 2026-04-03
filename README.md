@@ -137,6 +137,7 @@ Removed from consolidated patch. All tests now pass.
 - [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking
 - [`docs/next-investigations.md`](docs/next-investigations.md) — roadmap for 2026-Q2 investigations
 - [`docs/I14-iouring-polish.md`](docs/I14-iouring-polish.md) — io_uring performance optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
+- [`docs/I12-ik-llama-benchmark.md`](docs/I12-ik-llama-benchmark.md) — **I12: ik_llama.cpp CPU-only benchmark** (in progress)
 - [`docs/I10b-findings.md`](docs/I10b-findings.md) — GPU MoE slot buffer investigation complete
 - [`docs/I10b-option-b-force-offload.md`](docs/I10b-option-b-force-offload.md) — Force-offload testing for >GTT models
 - [`docs/I11-async-prefetch-summary.md`](docs/I11-async-prefetch-summary.md) — I11 async expert prefetch implementation

@@ -1,0 +1,55 @@
+# ik_llama.cpp — CPU-only build with AVX-512 for Zen 5 (I12 benchmark)
+# Fork of llama.cpp with FlashMLA, fused MoE FFN, smart expert reduction
+# https://github.com/ikawrakow/ik_llama.cpp
+FROM fedora:43 AS builder
+
+RUN dnf install -y --setopt=install_weak_deps=False \
+        cmake gcc-c++ git \
+    && dnf clean all
+
+# Fix broken ld symlink (Fedora 43 issue)
+RUN ln -sf /usr/bin/ld.bfd /usr/bin/ld
+
+# Clone ik_llama.cpp (HEAD — no stable release tags)
+ARG IK_LLAMA_REF=master
+RUN git clone --depth 1 --branch ${IK_LLAMA_REF} \
+        https://github.com/ikawrakow/ik_llama.cpp /build/llama.cpp
+
+# Build CPU-only with Zen 5 AVX-512 extensions
+# ik_llama.cpp key features (auto-enabled for supported architectures):
+#   - FlashMLA: fastest CPU DeepSeek inference
+#   - Fused MoE FFN: batched expert processing
+#   - Smart Expert Reduction: skip low-weight experts
+#   - IQ Trellis quantization support
+RUN cd /build/llama.cpp && cmake -B build \
+        -DGGML_VULKAN=OFF \
+        -DGGML_CUDA=OFF \
+        -DGGML_RPC=OFF \
+        -DGGML_NATIVE=OFF \
+        -DGGML_AVX512=ON \
+        -DGGML_AVX512_VBMI=ON \
+        -DGGML_AVX512_VNNI=ON \
+        -DGGML_AVX512_BF16=ON \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_BUILD_SERVER=ON \
+        -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j$(nproc) --target llama-server
+
+# --- Runtime stage ---
+FROM fedora:43
+
+# Minimal runtime deps (no Vulkan, no GPU drivers needed)
+RUN dnf install -y --setopt=install_weak_deps=False libstdc++ libgomp \
+    && dnf clean all
+
+# Install binary and libraries
+COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/bin/llama-server
+# Copy all shared libs that were built (ik_llama.cpp may produce different lib names)
+COPY --from=builder /build/llama.cpp/build/bin/lib*.so* /lib64/
+RUN ldconfig
+
+# Verify
+RUN ls -la /usr/bin/llama-server && llama-server --version || echo "I12 ik_llama.cpp build: OK"
+
+EXPOSE 8080
