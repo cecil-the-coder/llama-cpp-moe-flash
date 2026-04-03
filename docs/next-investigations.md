@@ -1,13 +1,14 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: I10b Option B COMPLETE, I17/I18 COMPLETE (2026-04-03). Force-offload GPU import ready for testing.
+**Status**: I10b Option B COMPLETE, I14 COMPLETE, I17/I18 COMPLETE (2026-04-03). io_uring polish optimizations implemented.
 
-**Working Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:53c5a3c`
+**Working Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:f74f3c3`
 
 ---
 
 ## ✅ Recently Completed
 
+- **I14** - io_uring polish optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
 - **I10b Option B** - Force-offload GPU import (GGUF → staging → GPU cache)
 - **I17** - Prometheus metrics infrastructure (HTTP server, 8 Grafana panels)
 - **I18** - Cache hit tracking fix (cross-layer expert sharing now counted)
@@ -18,9 +19,9 @@
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
+| **I14** - io_uring Polish | Medium | Low | ✅ **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
 | **I10b Option B** - Force-offload | High | Medium | ✅ **COMPLETE** | Ready to test with DeepSeek |
-| **I14** - io_uring Polish | Medium | Low | Not started | ⭐ **DO FIRST** |
-| **I12** - ik_llama.cpp Benchmark | High | Medium | Not started | Baseline check |
+| **I12** - ik_llama.cpp Benchmark | High | Medium | Not started | ⭐ **DO FIRST** |
 | **I11** - Dynamic Expert Import | High | High | Not started | Future work |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
 | **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 fix |

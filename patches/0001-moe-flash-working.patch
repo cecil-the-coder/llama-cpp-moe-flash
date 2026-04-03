@@ -952,10 +952,10 @@ index 0000000..a47f112
 +} // extern "C"
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
 new file mode 100644
-index 0000000..9665e2a
+index 0000000..c05b6e0
 --- /dev/null
 +++ b/src/llama-moe-flash.cpp
-@@ -0,0 +1,2085 @@
+@@ -0,0 +1,2110 @@
 +#include "llama-moe-flash.h"
 +#include "llama-moe-flash-metrics.h"
 +#include "llama-moe-flash-exporter.h"
@@ -1088,6 +1088,14 @@ index 0000000..9665e2a
 +    // Attempt 1: SQPOLL (needs CAP_SYS_NICE or root)
 +    params.flags = IORING_SETUP_SQPOLL;
 +    params.sq_thread_idle = 2000;
++    
++    // I14: IORING_SETUP_SINGLE_ISSUER - optimize for single submitter thread
++    // Available in kernel 6.0+, reduces kernel overhead by ~2-5%
++    #if defined(IORING_SETUP_SINGLE_ISSUER)
++    params.flags |= IORING_SETUP_SINGLE_ISSUER;
++    fprintf(stderr, "[I14] io_uring: enabling SINGLE_ISSUER optimization\n");
++    #endif
++    
 +    ret = io_uring_queue_init_params(32, &pf->ring, &params);
 +
 +    if (ret < 0) {
@@ -1127,6 +1135,23 @@ index 0000000..9665e2a
 +        pf->slots[i].expert_id = -1;
 +        pf->slots[i].layer = -1;
 +    }
++    
++    // I14: MADV_HUGEPAGE - enable transparent hugepages for staging pool
++    // Reduces TLB pressure by using 2MB pages instead of 4KB (512× reduction)
++    // Expected: 3-8% performance improvement for GTT access path
++    #if defined(MADV_HUGEPAGE)
++    {
++        int hugepage_success = 0;
++        for (int i = 0; i < n_slots; i++) {
++            int madv_ret = madvise(pf->slots[i].data, alloc_size, MADV_HUGEPAGE);
++            if (madv_ret == 0) {
++                hugepage_success++;
++            }
++        }
++        fprintf(stderr, "[I14] MADV_HUGEPAGE: %d/%d slots enabled (%zu MB total)\n",
++                hugepage_success, n_slots, (size_t)n_slots * alloc_size / (1024 * 1024));
++    }
++    #endif
 +
 +    // Register buffers for zero-copy fixed reads
 +    std::vector<struct iovec> iovs(n_slots);
