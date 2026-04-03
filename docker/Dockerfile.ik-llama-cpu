@@ -11,7 +11,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 RUN ln -sf /usr/bin/ld.bfd /usr/bin/ld
 
 # Clone ik_llama.cpp (HEAD — no stable release tags)
-ARG IK_LLAMA_REF=master
+ARG IK_LLAMA_REF=main
 RUN git clone --depth 1 --branch ${IK_LLAMA_REF} \
         https://github.com/ikawrakow/ik_llama.cpp /build/llama.cpp
 

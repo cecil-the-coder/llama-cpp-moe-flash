@@ -14,7 +14,7 @@ on:
     inputs:
       ik_llama_ref:
         description: 'ik_llama.cpp branch or commit to build'
-        default: 'master'
+        default: 'main'
         required: false
 
 env:
@@ -65,7 +65,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            IK_LLAMA_REF=${{ inputs.ik_llama_ref || 'master' }}
+            IK_LLAMA_REF=${{ inputs.ik_llama_ref || 'main' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
