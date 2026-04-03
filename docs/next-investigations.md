@@ -1,13 +1,14 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: I17/I18 COMPLETE (2026-04-03). Prometheus metrics with working cache hit tracking.
+**Status**: I10b Option B COMPLETE, I17/I18 COMPLETE (2026-04-03). Force-offload GPU import ready for testing.
 
-**Working Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:c791e75`
+**Working Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:53c5a3c`
 
 ---
 
 ## ✅ Recently Completed
 
+- **I10b Option B** - Force-offload GPU import (GGUF → staging → GPU cache)
 - **I17** - Prometheus metrics infrastructure (HTTP server, 8 Grafana panels)
 - **I18** - Cache hit tracking fix (cross-layer expert sharing now counted)
 
@@ -17,8 +18,8 @@
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
-| **I10b Option B** - Force-offload | High | Medium | Ready to test | ⭐ **DO FIRST** |
-| **I14** - io_uring Polish | Medium | Low | Not started | Quick win |
+| **I10b Option B** - Force-offload | High | Medium | ✅ **COMPLETE** | Ready to test with DeepSeek |
+| **I14** - io_uring Polish | Medium | Low | Not started | ⭐ **DO FIRST** |
 | **I12** - ik_llama.cpp Benchmark | High | Medium | Not started | Baseline check |
 | **I11** - Dynamic Expert Import | High | High | Not started | Future work |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
