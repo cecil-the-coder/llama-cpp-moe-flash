@@ -936,10 +936,10 @@ index 0000000..a47f112
 +} // extern "C"
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
 new file mode 100644
-index 0000000..8cde742
+index 0000000..dae6390
 --- /dev/null
 +++ b/src/llama-moe-flash.cpp
-@@ -0,0 +1,2059 @@
+@@ -0,0 +1,2061 @@
 +#include "llama-moe-flash.h"
 +#include "llama-moe-flash-metrics.h"
 +#include "llama-moe-flash-exporter.h"
@@ -2753,6 +2753,8 @@ index 0000000..8cde742
 +    }
 +    if (used_expert_ids.empty()) return;
 +    
++    int next_layer = current_layer + 1;
++    
 +    // I17: Track this request (layer 0 = new request)
 +    if (current_layer == 0) {
 +        ctx->metrics.requests_total.fetch_add(1);
@@ -2844,7 +2846,7 @@ index 0000000..8cde742
 +            ctx->metrics.bytes_requested.fetch_add(expert_size);
 +            
 +            // Only count as "loaded" if it's a cache miss
-+            if (!in_cache) {
++            if (!in_lru_cache) {
 +                ctx->metrics.bytes_loaded.fetch_add(expert_size);
 +            }
 +        }
