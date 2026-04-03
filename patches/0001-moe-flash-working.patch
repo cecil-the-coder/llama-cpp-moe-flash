@@ -335,10 +335,10 @@ index bc57df2..66e1152 100644
      return sched->n_splits;
 diff --git a/include/llama-moe-flash.h b/include/llama-moe-flash.h
 new file mode 100644
-index 0000000..db26801
+index 0000000..3a8953d
 --- /dev/null
 +++ b/include/llama-moe-flash.h
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,66 @@
 +#pragma once
 +
 +#include "llama.h"
@@ -390,6 +390,9 @@ index 0000000..db26801
 +// this triggers the pre-graph advisory. For "callback" mode, this is a no-op.
 +void llama_moe_flash_pre_graph(struct llama_moe_flash_context * ctx);
 +
++// I10b: Set the backend for GPU buffer operations (needed for force_offload)
++void llama_moe_flash_set_backend(struct llama_moe_flash_context * ctx, ggml_backend_t backend);
++
 +
 +// Check if async expert copy callback should be enabled.
 +// Returns true if LLAMA_FLASH_MOE_MODE=async_prefetch is set.
@@ -418,7 +421,7 @@ index 283823f..b41db29 100644
              llama-grammar.cpp
              llama-graph.cpp
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index ee2669c..c644f36 100644
+index ee2669c..ae2faa1 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,4 +1,5 @@
@@ -437,7 +440,20 @@ index ee2669c..c644f36 100644
      // Initialize backend samplers here so they are part of the sampling graph
      // before the reserve passes run later in this function. This avoids a later
      // re-reserve when graph nodes change.
-@@ -379,6 +383,11 @@ llama_context::~llama_context() {
+@@ -307,6 +311,12 @@ llama_context::llama_context(
+ 
+         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+ 
++        // I10b: Set backend for MoE flash GPU offload
++        if (moe_flash_ctx && !backend_ptrs.empty()) {
++            // Use the first backend (typically GPU) for expert buffer allocation
++            llama_moe_flash_set_backend(moe_flash_ctx, backend_ptrs[0]);
++        }
++
+         // TODO: move these checks to ggml_backend_sched
+         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+         bool pipeline_parallel =
+@@ -379,6 +389,11 @@ llama_context::~llama_context() {
              }
          }
      }
@@ -449,7 +465,7 @@ index ee2669c..c644f36 100644
      ggml_opt_free(opt_ctx);
  }
  
-@@ -1135,6 +1144,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+@@ -1135,6 +1150,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
          ggml_backend_sched_reset(sched.get());
          ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
  
@@ -936,10 +952,10 @@ index 0000000..a47f112
 +} // extern "C"
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
 new file mode 100644
-index 0000000..ee28f34
+index 0000000..9665e2a
 --- /dev/null
 +++ b/src/llama-moe-flash.cpp
-@@ -0,0 +1,2062 @@
+@@ -0,0 +1,2085 @@
 +#include "llama-moe-flash.h"
 +#include "llama-moe-flash-metrics.h"
 +#include "llama-moe-flash-exporter.h"
@@ -1522,6 +1538,9 @@ index 0000000..ee28f34
 +    bool            prefetch_iouring;  // use io_uring reads in callback
 +    bool            gguf_warmcache;    // read from GGUF for page cache warming
 +    bool            force_offload;     // I10b Option B: force GPU offload via slot buffer
++
++    // Backend for GPU buffer allocation (I10b force_offload)
++    ggml_backend_t backend = nullptr;
 +
 +    std::string experts_dir;
 +    std::vector<layer_entry> layers;
@@ -2616,6 +2635,15 @@ index 0000000..ee28f34
 +    }
 +}
 +
++// I10b: Set the backend for GPU buffer operations
++void llama_moe_flash_set_backend(struct llama_moe_flash_context * ctx, ggml_backend_t backend) {
++    if (ctx) {
++        ctx->backend = backend;
++        fprintf(stderr, "[I10b] Backend set for GPU offload: %s\n", 
++                backend ? ggml_backend_name(backend) : "null");
++    }
++}
++
 +
 +// ═════════════════════════════════════════════════════════════════════════════
 +// I11: Async Expert Prefetch Implementation
@@ -2751,6 +2779,17 @@ index 0000000..ee28f34
 +    int current_layer = parse_layer_id(node->name);
 +    if (current_layer < 0) return;
 +    
++    // Parse used_ids_bitset to get expert IDs
++    std::vector<int> used_expert_ids;
++    for (int i = 0; i < n_expert; i++) {
++        if (ggml_bitset_get(used_ids_bitset, i)) {
++            used_expert_ids.push_back(i);
++        }
++    }
++    if (used_expert_ids.empty()) return;
++    
++    int next_layer = current_layer + 1;
++    
 +    // I17: Track this request (layer 0 = new request)
 +    if (current_layer == 0) {
 +        ctx->metrics.requests_total.fetch_add(1);
@@ -2842,7 +2881,7 @@ index 0000000..ee28f34
 +            ctx->metrics.bytes_requested.fetch_add(expert_size);
 +            
 +            // Only count as "loaded" if it's a cache miss
-+            if (!in_cache) {
++            if (!in_lru_cache) {
 +                ctx->metrics.bytes_loaded.fetch_add(expert_size);
 +            }
 +        }
