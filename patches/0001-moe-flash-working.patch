@@ -1,15 +1,3 @@
-diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
-index 4323afe..56597ab 100644
---- a/ggml/CMakeLists.txt
-+++ b/ggml/CMakeLists.txt
-@@ -183,6 +183,7 @@ set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
- # ggml core
- set(GGML_SCHED_MAX_COPIES  "4" CACHE STRING "ggml: max input copies for pipeline parallelism")
- option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
-+option(GGML_IOURING                         "ggml: enable io_uring for async I/O"           OFF)
- option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
- 
- # 3rd party libs / backends
 diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
 index 9fd3f7f..25a3a63 100644
 --- a/ggml/include/ggml-backend.h
@@ -948,10 +936,10 @@ index 0000000..a47f112
 +} // extern "C"
 diff --git a/src/llama-moe-flash.cpp b/src/llama-moe-flash.cpp
 new file mode 100644
-index 0000000..28e54fc
+index 0000000..8cde742
 --- /dev/null
 +++ b/src/llama-moe-flash.cpp
-@@ -0,0 +1,2050 @@
+@@ -0,0 +1,2059 @@
 +#include "llama-moe-flash.h"
 +#include "llama-moe-flash-metrics.h"
 +#include "llama-moe-flash-exporter.h"
@@ -2755,6 +2743,15 @@ index 0000000..28e54fc
 +    // Parse current layer from node name
 +    int current_layer = parse_layer_id(node->name);
 +    if (current_layer < 0) return;
++    
++    // Parse used_ids_bitset to get expert IDs
++    std::vector<int> used_expert_ids;
++    for (int i = 0; i < n_expert; i++) {
++        if (ggml_bitset_get(used_ids_bitset, i)) {
++            used_expert_ids.push_back(i);
++        }
++    }
++    if (used_expert_ids.empty()) return;
 +    
 +    // I17: Track this request (layer 0 = new request)
 +    if (current_layer == 0) {
