@@ -21,6 +21,7 @@ RUN git clone --depth 1 --branch ${IK_LLAMA_REF} \
 #   - Fused MoE FFN: batched expert processing
 #   - Smart Expert Reduction: skip low-weight experts
 #   - IQ Trellis quantization support
+# Note: build all targets — ik_llama.cpp may use different target names than upstream
 RUN cd /build/llama.cpp && cmake -B build \
         -DGGML_VULKAN=OFF \
         -DGGML_CUDA=OFF \
@@ -34,7 +35,11 @@ RUN cd /build/llama.cpp && cmake -B build \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_SERVER=ON \
         -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build -j$(nproc) --target llama-server
+    && cmake --build build -j$(nproc)
+
+# Find the server binary (may be llama-server, llama-server, or in different paths)
+RUN find /build/llama.cpp/build -name 'llama-server' -type f -executable | head -1 && \
+    find /build/llama.cpp/build -name 'lib*.so*' -type f | head -20
 
 # --- Runtime stage ---
 FROM fedora:43
@@ -43,11 +48,14 @@ FROM fedora:43
 RUN dnf install -y --setopt=install_weak_deps=False libstdc++ libgomp \
     && dnf clean all
 
-# Install binary and libraries
-COPY --from=builder /build/llama.cpp/build/bin/llama-server /usr/bin/llama-server
-# Copy all shared libs that were built (ik_llama.cpp may produce different lib names)
-COPY --from=builder /build/llama.cpp/build/bin/lib*.so* /lib64/
-RUN ldconfig
+# Install binary — find it wherever ik_llama.cpp puts it
+COPY --from=builder /build/llama.cpp/build/bin/ /build-bin/
+RUN cp /build-bin/llama-server /usr/bin/llama-server 2>/dev/null || \
+    cp $(find /build-bin -name 'llama-server' -type f | head -1) /usr/bin/llama-server && \
+    cp /build-bin/lib*.so* /lib64/ 2>/dev/null || true && \
+    find /build-bin -name 'lib*.so*' -exec cp {} /lib64/ \; 2>/dev/null || true && \
+    ldconfig && \
+    rm -rf /build-bin
 
 # Verify
 RUN ls -la /usr/bin/llama-server && llama-server --version || echo "I12 ik_llama.cpp build: OK"
