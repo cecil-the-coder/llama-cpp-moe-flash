@@ -34,13 +34,12 @@ RUN cd /build/llama.cpp && cmake -B build \
         -DCMAKE_C_FLAGS="-march=x86-64-v4" \
         -DCMAKE_CXX_FLAGS="-march=x86-64-v4" \
         -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_BUILD_EXAMPLES=OFF \
-        -DLLAMA_BUILD_SERVER=ON \
         -DCMAKE_BUILD_TYPE=Release \
     && cmake --build build -j$(nproc)
 
-# Find the server binary (may be llama-server, llama-server, or in different paths)
-RUN find /build/llama.cpp/build -name 'llama-server' -type f -executable | head -1 && \
+# Debug: find all built executables and shared libs
+RUN find /build/llama.cpp/build -type f -executable -name 'llama*' -o -name 'server' | head -20 && \
+    echo "--- shared libs ---" && \
     find /build/llama.cpp/build -name 'lib*.so*' -type f | head -20
 
 # --- Runtime stage ---
@@ -50,14 +49,14 @@ FROM fedora:43
 RUN dnf install -y --setopt=install_weak_deps=False libstdc++ libgomp \
     && dnf clean all
 
-# Install binary — find it wherever ik_llama.cpp puts it
-COPY --from=builder /build/llama.cpp/build/bin/ /build-bin/
-RUN cp /build-bin/llama-server /usr/bin/llama-server 2>/dev/null || \
-    cp $(find /build-bin -name 'llama-server' -type f | head -1) /usr/bin/llama-server && \
-    cp /build-bin/lib*.so* /lib64/ 2>/dev/null || true && \
-    find /build-bin -name 'lib*.so*' -exec cp {} /lib64/ \; 2>/dev/null || true && \
+# Install binary — search the entire build tree for the server executable
+COPY --from=builder /build/llama.cpp/build/ /build-out/
+RUN SERVER=$(find /build-out -type f -executable \( -name 'llama-server' -o -name 'server' \) | head -1) && \
+    echo "Found server binary: $SERVER" && \
+    cp "$SERVER" /usr/bin/llama-server && \
+    find /build-out -name 'lib*.so*' -exec cp {} /lib64/ \; 2>/dev/null || true && \
     ldconfig && \
-    rm -rf /build-bin
+    rm -rf /build-out
 
 # Verify
 RUN ls -la /usr/bin/llama-server && llama-server --version || echo "I12 ik_llama.cpp build: OK"
