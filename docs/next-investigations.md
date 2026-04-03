@@ -1,8 +1,15 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: I10b COMPLETE (2026-03-31). Slot buffer code functional, 3× speedup for ≤GTT models.
+**Status**: I17/I18 COMPLETE (2026-04-03). Prometheus metrics with working cache hit tracking.
 
-**Working Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:ce76b8d`
+**Working Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:c791e75`
+
+---
+
+## ✅ Recently Completed
+
+- **I17** - Prometheus metrics infrastructure (HTTP server, 8 Grafana panels)
+- **I18** - Cache hit tracking fix (cross-layer expert sharing now counted)
 
 ---
 
@@ -10,12 +17,12 @@
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
-| **I14** - io_uring Polish | Medium | Low | Not started | ⭐ **DO FIRST** |
-| **I12** - ik_llama.cpp Benchmark | High | Medium | Not started | ⭐ **HIGH VALUE** |
-| **I11** - Dynamic Expert Import | High | High | Not started | ⭐ **ENABLE >GTT GPU** |
-| **I10b Option B** - Force-offload | High | Medium | Code ready | ⭐ **ACTIVATE SLOT BUFFER** |
+| **I10b Option B** - Force-offload | High | Medium | Ready to test | ⭐ **DO FIRST** |
+| **I14** - io_uring Polish | Medium | Low | Not started | Quick win |
+| **I12** - ik_llama.cpp Benchmark | High | Medium | Not started | Baseline check |
+| **I11** - Dynamic Expert Import | High | High | Not started | Future work |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
-| **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 quality fix |
+| **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 fix |
 
 ---
 
@@ -199,17 +206,18 @@ If we want all of the above:
 
 ## Recommended Sequence
 
-### Week 1: Quick Wins
-1. **I14** - io_uring polish (50 lines, 10-25% gain)
-2. **I12** - ik_llama.cpp benchmark (establish baseline)
+### Week 1: Slot Buffer Activation
+1. **I10b Option B** - Force-offload flag for q4km testing
+2. Validate slot buffer performance vs current 18 t/s
+3. If successful: extend to DeepSeek-R1-0528
 
-### Week 2: Activation
-3. **I10b Option B** - Force-offload flag for q4km (validate slot buffer)
-4. If successful: extend to DeepSeek
+### Week 2: Optimization
+4. **I14** - io_uring polish (50 lines, 10-25% gain)
+5. **I12** - ik_llama.cpp benchmark (establish baseline)
 
-### Week 3-4: DeepSeek GPU MoE
-5. **I11** - Dynamic expert import for >GTT models
-6. Integration testing with DeepSeek-R1-0528
+### Week 3-4: DeepSeek GPU MoE (if slot buffer works)
+6. **I11** - Dynamic expert import refinements
+7. Production testing with DeepSeek-R1-0528
 
 ---
 

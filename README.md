@@ -3,7 +3,19 @@
 Implementing "LLM in a Flash" style SSD-streaming inference for MoE models in llama.cpp,
 targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
-## ✅ Status Update (2026-04-01)
+## ✅ Status Update (2026-04-03)
+
+**I18 Cache Hit Tracking COMPLETE**: Fixed cache hit metrics to include cross-layer expert sharing.
+- Cache hit rate now properly reflects expert reuse between layers
+- Metrics work in all modes (prefetch, io_uring, cache)
+- See [`docs/I18-cache-hit-fix.md`](docs/I18-cache-hit-fix.md) for details
+- **Production image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:c791e75`
+
+**I17 Prometheus Metrics COMPLETE**: Full observability with Prometheus + Grafana.
+- HTTP metrics server on port 9090
+- 8-panel Grafana dashboard
+- Tracks requests, cache hits, I/O savings
+- See [`docs/I17-prometheus-complete.md`](docs/I17-prometheus-complete.md) for details
 
 **I11 Async Expert Prefetch COMPLETE**: Fully functional async prefetch with `posix_fadvise` is now working.
 - Callback triggers on every MoE layer execution
