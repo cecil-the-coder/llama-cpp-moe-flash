@@ -21,7 +21,7 @@
 |---------------|--------|--------|--------|----------------|
 | **I14** - io_uring Polish | Medium | Low | ✅ **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
 | **I10b Option B** - Force-offload | High | Medium | ✅ **COMPLETE** | Ready to test with DeepSeek |
-| **I12** - ik_llama.cpp Benchmark | High | Medium | 🚀 **DEPLOYED** | See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
+| **I12** - ik_llama.cpp Benchmark | High | Medium | ✅ **COMPLETE** | Vulkan 2x faster. See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
 | **I11** - Dynamic Expert Import | High | High | Not started | Future work |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
 | **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 fix |
@@ -62,21 +62,19 @@ madvise(staging_pool, size, MADV_HUGEPAGE | MADV_COLLAPSE);
 
 ---
 
-### 2. I12: ik_llama.cpp Benchmark — 🚀 DEPLOYED
+### 2. I12: ik_llama.cpp Benchmark — ✅ COMPLETE
 
-**Goal**: Establish CPU-only performance baseline for comparison.
+**Result**: Vulkan hybrid is 2x faster for ≤GTT models (20 vs 11 t/s). Comparable for >GTT (~1.5 t/s both).
 
-**Status**: Image + K8s deployment created. Awaiting CI build + Flux reconciliation.
+| Model | ik_llama.cpp | Stock Vulkan | moe-flash |
+|-------|-------------|-------------|-----------|
+| Qwen3-235B Q2_K (80 GB) | 11 t/s | 20.7 t/s | 20.5 t/s |
+| DeepSeek-R1 Q2_K (228 GB) | 1.5 t/s (no flash) | N/A | 1.8 t/s |
 
-**Deployment**:
-- **Image**: `ghcr.io/cecil-the-coder/ik-llama-cpu:latest` (built via CI)
-- **Backend**: `ik-llama-cpu` (CPU-only, no GPU mounts, AVX-512)
-- **Model**: `deepseek-r1-0528-ik` (same GGUF files as existing DeepSeek)
-- **Details**: See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md)
+**Key finding**: ik_llama.cpp FlashMLA crashes on DeepSeek Q2_K over mmap (NaN logits).
+Standard attention path works but isn't faster than our hybrid.
 
-**Success Metric**:
-- If ik_llama.cpp > 2.5 t/s: We should port their CPU kernels
-- If ik_llama.cpp < 1.5 t/s: Our hybrid approach is optimal
+**Details**: See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md)
 
 ---
 
