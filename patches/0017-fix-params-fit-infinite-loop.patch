@@ -1,35 +1,30 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Shadow <shadow@code-puppy.dev>
 Date: Fri, 04 Apr 2026 12:00:00 +0000
-Subject: [PATCH] Fix: add iteration limit to llama_params_fit binary search
+Subject: [PATCH] Disable llama_params_fit (hangs for MoE models)
 
-The binary search in llama_params_fit_impl (Step 4: MoE layer filling)
-can loop infinitely when the memory measurements don't converge for
-MoE models. Each iteration loads the full model from disk, so even
-a finite but large iteration count causes multi-minute hangs.
-
-Add a 32-iteration limit. If convergence isn't reached, use the
-last known good configuration. This is more than sufficient for
-the binary search to converge on well-behaved models.
+llama_params_fit binary search loads the full model on each iteration,
+hanging for 5-30 min on MoE models. Our auto-detect handles offload.
 
 ---
- src/llama.cpp | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
+ common/common.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
 
-diff --git a/src/llama.cpp b/src/llama.cpp
+diff --git a/common/common.cpp b/common/common.cpp
 index 1234567..abcdefg 100644
---- a/src/llama.cpp
-+++ b/src/llama.cpp
-@@ -626,7 +626,8 @@ static void llama_params_fit_impl(
-         if (mem_high[id] > targets[id]) {
-             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
-             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
--            while (delta > 1) {
-+            int fit_iter = 0;
-+            while (delta > 1 && fit_iter++ < 32) {
-                 uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
-                 step_size = std::max(step_size, uint32_t(1));
-                 step_size = std::min(step_size, delta - 1);
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1048,6 +1048,10 @@ common_init_result::common_init_result(common_params & params) :
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+
++    // Disable fitting — binary search hangs for MoE models (loads full model per iteration).
++    // Our auto-detect in llama_params_fit (patch 0001) handles GPU/CPU offload.
++    params.fit_params = false;
++
+     if (params.fit_params) {
+         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
+         llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
 --
 2.51.1
 
