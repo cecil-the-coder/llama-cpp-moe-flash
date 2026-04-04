@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shadow <shadow@code-puppy.dev>
+Date: Fri, 04 Apr 2026 03:00:00 +0000
+Subject: [PATCH] Fix: prevent inplace reuse of INPUT-marked tensors in gallocr
+
+The gallocr allocator checks GGML_TENSOR_FLAG_OUTPUT to prevent
+inplace buffer reuse for output tensors, but does NOT check
+GGML_TENSOR_FLAG_INPUT. This allows intermediate operations to
+overwrite input buffers that are still needed later in the graph.
+
+For MoE models, the argsort output (selected_experts / ffn_moe_topk)
+is marked as INPUT via ggml_set_input() but its buffer gets reused
+by downstream operations, corrupting expert IDs before MUL_MAT_ID
+can read them. This causes GGML_ASSERT(id >= 0 && id < n_expert)
+failures during expert copy.
+
+Fix: Add GGML_TENSOR_FLAG_INPUT to the inplace reuse check alongside
+the existing GGML_TENSOR_FLAG_OUTPUT check.
+
+---
+ ggml/src/ggml-alloc.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index 1234567..abcdefg 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -641,8 +641,8 @@ static void ggml_gallocr_allocate_node(struct ggml_gallocr * galloc, struct ggml
+                     continue;
+                 }
+
+-                // outputs cannot be reused
+-                if (parent->flags & GGML_TENSOR_FLAG_OUTPUT || (parent->view_src != NULL && parent->view_src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++                // outputs and inputs cannot be reused
++                if (parent->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT) || (parent->view_src != NULL && parent->view_src->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT))) {
+                     AT_PRINTF("not reusing parent %s for %s as it is an output\n", parent->name, node->name);
+                     continue;
+                 }
+--
+2.51.1
+

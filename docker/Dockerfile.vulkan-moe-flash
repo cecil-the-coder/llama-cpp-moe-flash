@@ -16,14 +16,16 @@ RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-04-04-I10b-vec-aliasing-fix
+ARG CACHE_BUST=2026-04-04-I10b-gallocr-input-fix
 COPY patches/0001-moe-flash-working.patch /build/
 COPY patches/0015-fix-moe-topk-buffer-aliasing.patch /build/
 COPY patches/0014-fix-vec-fusion-buffer-aliasing.patch /build/
+COPY patches/0016-fix-gallocr-input-inplace-reuse.patch /build/
 RUN cd /build/llama.cpp && \
     git apply /build/0001-moe-flash-working.patch && \
     git apply /build/0015-fix-moe-topk-buffer-aliasing.patch && \
-    git apply /build/0014-fix-vec-fusion-buffer-aliasing.patch
+    git apply /build/0014-fix-vec-fusion-buffer-aliasing.patch && \
+    git apply /build/0016-fix-gallocr-input-inplace-reuse.patch
 
 # Build with Vulkan + io_uring
 # Enable AVX512 + extensions for Strix Halo (Zen 5).
