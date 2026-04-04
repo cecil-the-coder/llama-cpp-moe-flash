@@ -3,9 +3,16 @@ From: Shadow <shadow@code-puppy.dev>
 Date: Tue, 31 Mar 2026 03:38:52 +0000
 Subject: [PATCH] Fix vec path fusion buffer aliasing bug
 
+Runtime detection of buffer aliasing in the vec path dispatch.
+When d_ids aliases with other buffers, skip the vec path (batch
+path fallback). Also detect fusion buffer aliasing with IDS.
+
+With patches 0015+0016 preventing aliasing at the allocator level,
+this should rarely fire — it's a safety net.
+
 ---
- ggml/src/ggml-vulkan/ggml-vulkan.cpp | 38 +++++++++++++++++++++++++++++
- 1 file changed, 38 insertions(+)
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 index e061d4b..b32e451 100644
@@ -43,20 +50,6 @@ index e061d4b..b32e451 100644
      // Loop over the batch dimension
      for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
          const vk_mat_vec_id_push_constants pc = {
-@@ -8619,6 +8644,13 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
-     ggml_tensor * dst = cgraph->nodes[node_idx];
-     ggml_tensor * src0 = dst->src[0];
-     ggml_tensor * src2 = dst->src[2];
-+    // I10b fix: Disable vec path for MoE expert tensors to avoid buffer aliasing issues
-+    // The gallocr may alias the expert indices buffer with other tensors, causing corruption
-+    if (src0->name && (strstr(src0->name, "ffn_gate_exps") || strstr(src0->name, "ffn_up_exps") || strstr(src0->name, "ffn_down_exps"))) {
-+        fprintf(stderr, "[VEC-FIX] Disabling vec path for MoE expert tensor: %s\n", src0->name);
-+        fflush(stderr);
-+        return false;
-+    }
-     return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
- }
-
 --
 2.51.1
 
