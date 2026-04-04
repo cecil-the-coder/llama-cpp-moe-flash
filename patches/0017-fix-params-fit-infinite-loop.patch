@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Shadow <shadow@code-puppy.dev>
+Date: Fri, 04 Apr 2026 12:00:00 +0000
+Subject: [PATCH] Fix: add iteration limit to llama_params_fit binary search
+
+The binary search in llama_params_fit_impl (Step 4: MoE layer filling)
+can loop infinitely when the memory measurements don't converge for
+MoE models. Each iteration loads the full model from disk, so even
+a finite but large iteration count causes multi-minute hangs.
+
+Add a 32-iteration limit. If convergence isn't reached, use the
+last known good configuration. This is more than sufficient for
+the binary search to converge on well-behaved models.
+
+---
+ src/llama.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 1234567..abcdefg 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -626,7 +626,8 @@ static void llama_params_fit_impl(
+         if (mem_high[id] > targets[id]) {
+             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
+             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
+-            while (delta > 1) {
++            int fit_iter = 0;
++            while (delta > 1 && fit_iter++ < 32) {
+                 uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
+                 step_size = std::max(step_size, uint32_t(1));
+                 step_size = std::min(step_size, delta - 1);
+--
+2.51.1
+
