@@ -4,8 +4,8 @@ Date: Tue, 31 Mar 2026 03:38:52 +0000
 Subject: [PATCH] Fix vec path fusion buffer aliasing bug
 
 ---
- ggml/src/ggml-vulkan/ggml-vulkan.cpp | 32 ++++++++++++++++++++++++++++
- 1 file changed, 32 insertions(+)
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 38 +++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 index e061d4b..b32e451 100644
@@ -14,7 +14,7 @@ index e061d4b..b32e451 100644
 @@ -8588,6 +8588,31 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
          fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
      }
- 
+
 +    // I10b fix: Check for buffer aliasing. When d_ids aliases with d_D or other
 +    // tensors, the expert IDs get corrupted before MUL_MAT_ID can read them.
 +    // Skip vec path entirely and use batch path (ggml_vk_mul_mat_id_q_f16)
@@ -40,10 +40,10 @@ index e061d4b..b32e451 100644
 +        d_F1 = d_D;
 +    }
 +
-     // I10b debug: log vec path entry to identify crash location
-     fprintf(stderr, "[VEC-DBG] mul_mat_vec_id src0=%s(buf=%p nbytes=%zu)"
-         " src1=%s(buf=%p) ids=%s(buf=%p nei0=%llu nei1=%llu)"
-@@ -8637,6 +8662,13 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
+     // Loop over the batch dimension
+     for (uint32_t expert_i1 = 0; expert_i1 < nei1; ++expert_i1) {
+         const vk_mat_vec_id_push_constants pc = {
+@@ -8619,6 +8644,13 @@ static bool ggml_vk_use_mul_mat_vec_id(const struct ggml_cgraph * cgraph, int no
      ggml_tensor * dst = cgraph->nodes[node_idx];
      ggml_tensor * src0 = dst->src[0];
      ggml_tensor * src2 = dst->src[2];
@@ -56,7 +56,7 @@ index e061d4b..b32e451 100644
 +    }
      return (src2->ne[1] <= 8) && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type));
  }
- 
--- 
+
+--
 2.51.1
 
