@@ -1,27 +1,29 @@
 From 0c30eaaf6d7d234cb34e3b5dfc016b2cfba48df0 Mon Sep 17 00:00:00 2001
 From: Shadow <shadow@code-puppy.dev>
 Date: Tue, 31 Mar 2026 11:46:49 +0000
-Subject: [PATCH] Fix: Mark MoE topk indices as input to prevent buffer
- aliasing
+Subject: [PATCH] Fix: Mark MoE topk indices as input+output to prevent buffer
+ aliasing and premature freeing
 
 ---
- src/llama-graph.cpp | 3 +++
- 1 file changed, 3 insertions(+)
+ src/llama-graph.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
 
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 6416b99..cfa48b7 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1317,6 +1317,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -1317,6 +1317,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
      cb(selected_experts->src[0], "ffn_moe_argsort", il);
      cb(selected_experts, "ffn_moe_topk", il);
-+    // I10b fix: Mark topk indices as input to prevent buffer aliasing
-+    // The gallocr may alias this buffer with other tensors, corrupting expert IDs
++    // I10b fix: Mark topk indices as input+output to prevent buffer aliasing
++    // and premature freeing. The expert copy callback reads these IDs after
++    // all graph nodes are done, so the buffer must survive the entire graph.
 +    ggml_set_input(selected_experts);
- 
++    ggml_set_output(selected_experts);
+
      if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
          // TODO: Use scalar div instead when/if implemented
--- 
+--
 2.51.1
 
