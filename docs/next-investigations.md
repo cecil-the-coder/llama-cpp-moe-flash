@@ -1,17 +1,19 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: I10b Option B COMPLETE, I14 COMPLETE, I17/I18 COMPLETE (2026-04-03). io_uring polish optimizations implemented.
+**Status**: I11 COMPLETE, I12 COMPLETE. DeepSeek coherent at 2.05 t/s. (2026-04-03)
 
-**Working Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:f74f3c3`
+**Production Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:7e64a82`
 
 ---
 
-## ✅ Recently Completed
+## Completed
 
+- **I11** - DeepSeek fix: force-offload host buffer guard, gallocr corruption fix, Flux YAML fix
+- **I12** - ik_llama.cpp benchmark: Vulkan 2x faster for in-GTT models
 - **I14** - io_uring polish optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
-- **I10b Option B** - Force-offload GPU import (GGUF → staging → GPU cache)
-- **I17** - Prometheus metrics infrastructure (HTTP server, 8 Grafana panels)
-- **I18** - Cache hit tracking fix (cross-layer expert sharing now counted)
+- **I10b** - GPU MoE expert matmul for in-GTT models (auto-detect)
+- **I17** - Prometheus metrics infrastructure
+- **I18** - Cache hit tracking fix
 
 ---
 
@@ -19,10 +21,10 @@
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
-| **I14** - io_uring Polish | Medium | Low | ✅ **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
-| **I10b Option B** - Force-offload | High | Medium | ✅ **COMPLETE** | Ready to test with DeepSeek |
-| **I12** - ik_llama.cpp Benchmark | High | Medium | ✅ **COMPLETE** | Vulkan 2x faster. See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
-| **I11** - Dynamic Expert Import | High | High | **Phase 1 complete** | Phase 2 blocked on shader |
+| **I11** - DeepSeek Fix | High | High | **COMPLETE** | 2.05 t/s coherent |
+| **I12** - ik_llama.cpp Benchmark | High | Medium | **COMPLETE** | See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
+| **I14** - io_uring Polish | Medium | Low | **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
+| **Slot buffer GPU matmul** | High | High | Future | Shader mod needed for >GTT GPU path |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
 | **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 fix |
 
@@ -62,14 +64,14 @@ madvise(staging_pool, size, MADV_HUGEPAGE | MADV_COLLAPSE);
 
 ---
 
-### 2. I12: ik_llama.cpp Benchmark — ✅ COMPLETE
+### 2. I12: ik_llama.cpp Benchmark — COMPLETE
 
-**Result**: Vulkan hybrid is 2x faster for ≤GTT models (20 vs 11 t/s). Comparable for >GTT (~1.5 t/s both).
+**Result**: Vulkan hybrid is 2x faster for in-GTT models. DeepSeek: moe-flash 2.05 t/s vs ik_llama 1.5 t/s.
 
 | Model | ik_llama.cpp | Stock Vulkan | moe-flash |
 |-------|-------------|-------------|-----------|
-| Qwen3-235B Q2_K (80 GB) | 11 t/s | 20.7 t/s | 20.5 t/s |
-| DeepSeek-R1 Q2_K (228 GB) | 1.5 t/s (no flash) | N/A | 1.8 t/s |
+| Qwen3-235B Q2_K (80 GB) | 11.5 t/s | 20.7 t/s | 20.0 t/s |
+| DeepSeek-R1 Q2_K (228 GB) | 1.5 t/s (no flash_attn) | N/A | 2.05 t/s |
 
 **Key finding**: ik_llama.cpp FlashMLA crashes on DeepSeek Q2_K over mmap (NaN logits).
 Standard attention path works but isn't faster than our hybrid.
@@ -78,56 +80,19 @@ Standard attention path works but isn't faster than our hybrid.
 
 ---
 
-### 3. I11: Dynamic Expert Import — Phase 1 Complete, Phase 2 Blocked
+### 3. Slot Buffer GPU Expert Matmul — Future Work
 
-**Goal**: Copy active experts to GPU on-demand for models exceeding GTT.
+**Goal**: Copy active experts to GPU on-demand for models exceeding GTT (e.g., DeepSeek 228 GB).
 
-**Phase 1 Results (2026-04-05)**:
-- Slot buffer infrastructure works: LRU cache, IDS rewrite, deferred writes, no crashes
-- Auto-detect: models ≤GTT get CPU_MOE cleared (full GPU, 21 t/s), models >GTT keep CPU_MOE + slot buffer
-- DeepSeek 228 GB: slot buffer activates but produces **garbage output** at 0.46 t/s
-- Fixed: conditional `ggml_set_input/output`, deferred IDS writes, stale data zero-fill
-- **Blocker**: Vulkan MUL_MAT_ID shader expects data at original expert_id offsets, not slot offsets
+**Current state**: Slot buffer patches (0015, 0016, 0019) are preserved in repo but not applied.
+The infrastructure works (LRU cache, IDS rewrite, deferred writes) but MUL_MAT_ID shader
+produces wrong results with slot-remapped IDS.
 
-**Phase 2 (blocked on shader)**:
-- Need to modify MUL_MAT_ID shader to add slot indirection in `pos_a` calculation
-- Alternative: different mapping strategy that preserves original expert ID indexing
+**Remaining work**: Modify MUL_MAT_ID shader to add slot indirection in `pos_a` calculation.
 
-**Patch stack (image e7a3884)**:
-- 0001, 0014-0017, 0019
-
-**Effort remaining**: 2-3 days (shader modification + testing)
-**Risk**: Medium (shader change affects all MUL_MAT_ID paths)
-**Reward**: **5x speedup for DeepSeek** (1.8 → ~10 t/s)
-
----
-
-### 4. I10b Option B: Force-offload for DeepSeek — Quick Win
-
-**Goal**: Activate existing slot buffer code for q4km/deepseek testing.
-
-**Current State**:
-- Slot buffer code present in ce76b8d
-- Disabled because `--cpu-moe` routes to CPU
-- Can be activated per-model for testing
-
-**Test Plan**:
-```yaml
-# For qwen3-235b-q4km (133 GB, fits in GTT normally)
-# Force CPU mode to test slot buffer:
-env:
-  - name: LLAMA_ARG_CPU_MOE
-    value: "1"
-  - name: LLAMA_FLASH_MOE_FORCE_OFFLOAD
-    value: "1"  # NEW: activate slot buffer GPU path
-```
-
-**Expected**:
-- Expert matmul runs on GPU via slot buffer
-- TPS: 6-7 t/s → 15-18 t/s (if slot buffer works as designed)
-
-**Effort**: 1 day (add flag, test)
-**Risk**: Low (opt-in flag, can disable)
+**Potential reward**: 5x speedup for DeepSeek (2.05 -> ~10 t/s).
+**Effort**: 2-3 days (shader modification + testing).
+**Risk**: Medium (shader change affects all MUL_MAT_ID paths).
 
 ---
 
@@ -167,63 +132,40 @@ env:
 ## Decision Framework
 
 ```
-If we want 10-25% improvement with low risk:
-    → DO I14 (io_uring polish) - 1-2 days
+Current state: All models producing coherent output. Performance validated.
 
-If we want to know if our architecture is optimal:
-    → DO I12 (ik_llama.cpp benchmark) - 1-2 days
+If we want 5× speedup for DeepSeek (2.05 → ~10 t/s):
+    → Slot buffer shader modification - 2-3 days, medium risk
 
-If we want 5× speedup for DeepSeek (our largest model):
-    → DO I11 + I10b Option B - 1 week
+If we want incremental improvements:
+    → I13 (BF16 CPU matmul) or I7 (context scaling) - low effort
 
-If we want all of the above:
-    → Parallel: I14 (1 person) + I12 (1 person) + I11 (2 people)
+If we want to explore new models:
+    → Deploy larger models and test with current stack
 ```
 
 ---
 
-## Recommended Sequence
+## Recommended Next Steps
 
-### Week 1: Slot Buffer Activation
-1. **I10b Option B** - Force-offload flag for q4km testing
-2. Validate slot buffer performance vs current 18 t/s
-3. If successful: extend to DeepSeek-R1-0528
+1. **Slot buffer shader mod** (highest impact): Modify MUL_MAT_ID to support
+   slot indirection. Patches 0015/0016/0019 provide the infrastructure.
+   Target: DeepSeek 2.05 -> ~10 t/s.
 
-### Week 2: Optimization
-4. **I14** - io_uring polish (50 lines, 10-25% gain)
-5. **I12** - ik_llama.cpp benchmark (establish baseline)
+2. **I13 - BF16 CPU matmul** (low effort): Test if BF16 AVX-512 outperforms
+   Q4_0 AVX2 for CPU expert matmul on Zen 5.
 
-### Week 3-4: DeepSeek GPU MoE (if slot buffer works)
-6. **I11** - Dynamic expert import refinements
-7. Production testing with DeepSeek-R1-0528
+3. **New model deployment**: Current stack handles 17-228 GB models. Test with
+   additional MoE architectures.
 
 ---
 
-## Documentation Updates Needed
+## Lessons Learned
 
-- [ ] Update README.md with I10b completion
-- [ ] Update architecture diagram
-- [ ] Add troubleshooting guide (patch 0006 lesson)
-- [ ] Create performance tuning guide
-
----
-
-## Open Questions
-
-1. **Is 18 t/s for q4km the ceiling, or can slot buffer help even ≤GTT models?**
-   - Test I10b Option B to find out
-
-2. **What's the actual cost of expert import on UMA?**
-   - Page-table remap should be ~zero, but `vkBindBufferMemory` has overhead
-   - Need benchmarking on gfx1151
-
-3. **Can we combine I11 streaming with I14 registered buffers?**
-   - Yes, and this is the optimal architecture
-   - Streaming: experts → staging pool (io_uring)
-   - Import: staging → GPU slots (page remap)
-   - Compute: GPU matmul on slots
+- Flux YAML validation is critical: a duplicate `value:` key silently blocks reconciliation
+- gallocr flag changes (`ggml_set_input/output`) have global side effects -- test all models
+- Force-offload guards must check buffer type, not just backend assignment
 
 ---
 
-*Last Updated*: 2026-04-05  
-*Next Review*: After I11 Phase 2 shader modification
+*Last Updated*: 2026-04-03

@@ -3,25 +3,22 @@
 Implementing "LLM in a Flash" style SSD-streaming inference for MoE models in llama.cpp,
 targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
-## ✅ Status Update (2026-04-05)
+## Status (2026-04-03)
 
-**I11 Dynamic Expert Import — Phase 1 Complete**:
-- Slot buffer infrastructure works: LRU cache, IDS rewrite, deferred writes, no crashes
-- Auto-detect: models ≤GTT get full GPU (21 t/s), models >GTT activate slot buffer
-- DeepSeek 228 GB: slot buffer activates but output incorrect (shader blocker)
-- Remaining blocker: MUL_MAT_ID shader needs slot indirection for remapped IDS
-- **Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:e7a3884`
+**Production image: `7e64a82`** -- DeepSeek fix complete, all models coherent.
 
-**I18 Cache Hit Tracking COMPLETE**: Fixed cache hit metrics to include cross-layer expert sharing.
-- See [`docs/I18-cache-hit-fix.md`](docs/I18-cache-hit-fix.md) for details
+Patches applied: 0001 (with force-offload host buffer guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
+Patches NOT applied: 0015, 0016, 0019 (slot buffer infrastructure -- kept in repo for future use).
 
-**I17 Prometheus Metrics COMPLETE**: Full observability with Prometheus + Grafana.
-- See [`docs/I17-prometheus-complete.md`](docs/I17-prometheus-complete.md) for details
+**Root causes found and fixed (I11)**:
+1. Force-offload in patch 0001 unconditionally pushed MUL_MAT_ID to GPU even when expert weights were on CPU (`--cpu-moe`). Fixed with `ggml_backend_buffer_is_host()` guard.
+2. Patches 0015/0016 (`ggml_set_input/output` on `selected_experts`) changed gallocr allocation and corrupted output for ALL models. Removed from build.
+3. Broken YAML in Qwen3 CRD (duplicate `value:` key) blocked Flux reconciliation for hours. Fixed.
 
-**I10b Investigation COMPLETE**: GPU MoE expert matmul with fixed-size slot buffer is **working**.
-- 3x speedup for models ≤ GTT (120 GB): 6 t/s → 18-20 t/s
-- Auto-detect logic routes models to optimal backend (GPU or CPU)
-- **Production image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:ce76b8d`
+**I12 benchmark (complete)**:
+- Stock Vulkan: 20.7 t/s (Qwen3-235B Q2_K)
+- moe-flash: 20.0 t/s (Qwen3), 2.05 t/s (DeepSeek)
+- ik_llama.cpp CPU-only: 11.5 t/s (Qwen3), 1.5 t/s (DeepSeek without flash_attn)
 
 ---
 
@@ -82,45 +79,30 @@ Per-token I/O for streaming (cold NVMe read, no page cache):
 generation), or with a much faster NVMe. With a warm cache these models are 1-5 tok/s
 territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB/s SSD.
 
-## Results (Updated 2026-04-05)
+## Results (Updated 2026-04-03)
 
 | Model | Size | RAM | Config | Gen t/s | Status |
 |---|---|---|---|---|---|
-| glm-4-7-flash | 17 GB | 125 GB | Full GPU (auto-detect) | **50.57** | ✅ I10b Option A |
-| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full GPU (auto-detect) | **21** | ✅ I11 auto-detect |
-| qwen3-235b-a22b-q4km | 133 GB | 125 GB | Full GPU (auto-detect) | **18.0** | ✅ I10b Option A |
-| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | mmap-wrap + CPU MoE | **1.8** | ✅ Working (CPU baseline) |
+| GLM-4-7-Flash | 17 GB | 125 GB | Full GPU (auto-detect) | **~50** | Coherent |
+| Qwen3-235B Q2_K | 80 GB | 125 GB | Full GPU (auto-detect) | **20.0** | Coherent |
+| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | CPU MoE path | **2.05** | Coherent |
 
-**I11 Progress**: Auto-detect clears CPU_MOE for ≤GTT models (21 t/s for Q2_K). Slot buffer
-for >GTT models (DeepSeek) activates but produces incorrect output — blocked on MUL_MAT_ID
-shader modification to support slot-remapped expert IDS.
-
-### I10b Investigation Summary
-
-**Option A: Full GPU Offload (≤GTT Models)** — ✅ WORKING
-- All models ≤ 120 GB automatically use full GPU (18-50 t/s)
-- No manual backend selection needed
-- Verified: glm-4-7-flash, qwen3-235b variants
-
-**Option B: Slot Buffer for >GTT Models** — 🔄 READY FOR ACTIVATION
-- Slot buffer code present in consolidated patch (0014-0015)
-- Currently disabled ( `--cpu-moe` keeps matmul on CPU)
-- Can be activated with `LLAMA_FLASH_MOE_FORCE_OFFLOAD=1` flag
-- Target: DeepSeek 228 GB → 6-10 t/s (vs current 1.8 t/s)
-
-**Root Cause**: Patch 0006 "defensive checks" were causing silent KV cache failures.
-Removed from consolidated patch. All tests now pass.
+Auto-detect clears CPU_MOE for models that fit in GTT (120 GB). DeepSeek uses
+CPU MoE path with mmap-wrap and partial prefetch.
 
 ---
 
-### Patch Status
+### Patch Status (image `7e64a82`)
 
 | Patch | Status | Purpose |
 |---|---|---|
-| 0001-0005 | ✅ Included | Core MoE flash, io_uring, TQ2 KV |
-| 0006 | ❌ REMOVED | Defensive checks were causing crashes |
-| 0007-0015 | ✅ Included | Debug logging, buffer fixes, slot buffer |
-| **Consolidated** | ✅ **ce76b8d** | Production-ready patch |
+| 0001 | Applied | Core MoE flash + force-offload host buffer guard |
+| 0014 | Applied | Vec-path runtime aliasing check (byte-range overlap) |
+| 0017 | Applied | Auto-detect CPU_MOE + disable upstream `llama_params_fit` |
+| 0015, 0016, 0019 | NOT applied | Slot buffer infrastructure (kept in repo for future use) |
+
+**Lesson learned**: Broken YAML in Flux CRDs (duplicate `value:` key) silently blocks
+reconciliation. Always validate CRD YAML before debugging backend issues.
 
 ## Documents
 

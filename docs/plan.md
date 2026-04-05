@@ -1,24 +1,22 @@
 # MoE Flash — Implementation Plan
 
-## Current State (Updated 2026-03-31)
+## Current State (Updated 2026-04-03)
 
-**Production image: `ce76b8d`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `7e64a82`** on shadow node (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+
+Patches applied: 0001 (with force-offload host buffer guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
 
 Single-backend architecture with auto-detect `--cpu-moe`:
-- All models use `moe-flash-cpumoe` backend (`CPU_MOE=1` default)
-- `llama_params_fit` checks if full model fits in device memory without the override
-- If it fits → clears override → full GPU (18-50 t/s) — **I10b Option A working!**
-- If not → keeps override → mmap-wrap with partial prefetch (1.8-6.3 t/s)
+- Models that fit in GTT (120 GB): auto-detect clears CPU_MOE, full GPU path
+- Models exceeding GTT: CPU MoE path with mmap-wrap and partial prefetch
 
 | Model | Size | TPS | Loading | Status |
 |---|---|---|---|---|
-| glm-4-7-flash | 17 GB | **50.57** | full GPU offload | ✅ I10b Option A |
-| qwen3-235b Q2_K | 80 GB | **20.21-20.77** | full GPU offload | ✅ I10b Option A |
-| qwen3-235b Q4_K_M | 133 GB | **18.0** | full GPU offload | ✅ I10b Option A |
-| deepseek-r1-0528 | 228 GB | 1.63→**1.8** | mmap experts + partial prefetch | ✅ Working |
+| GLM-4-7-Flash | 17 GB | **~50** | full GPU offload | Coherent |
+| Qwen3-235B Q2_K | 80 GB | **20.0** | full GPU offload | Coherent |
+| DeepSeek-R1-0528 Q2_K | 228 GB | **2.05** | mmap experts + CPU MoE | Coherent |
 
-**Key Achievement**: I10b investigation COMPLETE. Slot buffer code is correct and functional.
-3× speedup for ≤GTT models via automatic GPU offload.
+**I12 benchmark**: Stock Vulkan 20.7 t/s, moe-flash 20.0 t/s, ik_llama.cpp CPU-only 11.5 t/s (Qwen3).
 
 ---
 
@@ -418,48 +416,41 @@ Result: Vec path works correctly, zero false positives.
 
 **Status**: ✅ COMPLETE — vec path working, no aliasing, coherent output
 
-### I11. Dynamic Expert Import via Slot Buffer — TIER 1
+### I11. Dynamic Expert Import / DeepSeek Fix — COMPLETE
 
 **Source**: Vulkan spec, local codebase analysis, I10b slot buffer infrastructure
 
-#### I11 Dynamic Expert Import — Phase 1 Results (2026-04-05)
-
-**Slot buffer infrastructure works**: LRU cache, IDS rewrite, deferred writes,
-no crashes. The core machinery is functional.
-
-**Auto-detect behavior**:
-- Models ≤ GTT: CPU_MOE cleared automatically → full GPU path (21 t/s)
-- Models > GTT: CPU_MOE kept + slot buffer enabled for GPU expert matmul
-
-**DeepSeek 228 GB result**: Slot buffer activates but produces garbage output
-at 0.46 t/s. The infrastructure runs without crashes but output is incorrect.
+#### Final Results (2026-04-03, image `7e64a82`)
 
 **Root causes found and fixed**:
-1. `ggml_set_input/output` on `selected_experts` corrupts gallocr for normal
-   models → made conditional on `LLAMA_MOE_SLOT_BUFFER=1`
-2. Deferred IDS write prevents overwrite by input copy loop → implemented
-   (deferred_ids_writes vector, flushed after all input copies)
-3. Zero-fill eliminated stale data as cause → confirmed not the issue
+1. **Force-offload host buffer guard**: Patch 0001 unconditionally pushed MUL_MAT_ID
+   to GPU even when expert weights were on CPU (`--cpu-moe`). Fixed with
+   `ggml_backend_buffer_is_host()` guard -- only force-offload when experts are
+   actually on GPU.
+2. **gallocr corruption from ggml_set_input/output**: Patches 0015/0016 set
+   INPUT/OUTPUT flags on `selected_experts`, which changed gallocr allocation
+   and corrupted output for ALL models (not just slot buffer models). Removed
+   from production build entirely.
+3. **Flux YAML**: Duplicate `value:` key in Qwen3 CRD blocked Flux reconciliation
+   for hours, making backend image updates invisible. Fixed.
 
-**Remaining blocker**: Vulkan MUL_MAT_ID shader produces wrong results with
-slot-remapped IDS. The shader expects expert data at original `expert_id`
-offsets, not remapped slot offsets. The slot buffer places expert data at
-slots 0..N but the shader indexes by original expert ID (0..255 for DeepSeek).
-
-**Options for Phase 2**:
-- Shader modification to add slot indirection in `pos_a` calculation
-- Shrink `ne[2]` on copy tensor (blocked: breaks graph shape inference)
-- Different approach to expert-to-slot mapping
-
-**Current patch stack (image e7a3884)**:
-- 0001: Core MoE flash (expert copy, slot buffer, prefetch, metrics)
+**Production patch stack** (image `7e64a82`):
+- 0001: Core MoE flash + force-offload host buffer guard
 - 0014: Vec-path runtime aliasing check (byte-range overlap)
-- 0015: Conditional `ggml_set_input/output` (only when `LLAMA_MOE_SLOT_BUFFER=1`)
-- 0016: gallocr respects INPUT flag in inplace reuse
-- 0017: Disable upstream `-fit` + auto-detect CPU_MOE + set `LLAMA_MOE_SLOT_BUFFER` for >GTT
-- 0019: `force_slot_buffer` flag in scheduler struct, env var activation
+- 0017: Auto-detect CPU_MOE + disable upstream `llama_params_fit`
 
-**Status**: Phase 1 complete, Phase 2 blocked on shader modification
+**Not applied** (kept in repo for future slot buffer work):
+- 0015, 0016, 0019: Slot buffer infrastructure
+
+**Performance**:
+- Qwen3-235B Q2_K (80 GB): 20 t/s, coherent, auto-detect clears CPU_MOE
+- DeepSeek-R1-0528 Q2_K (228 GB): 2.05 t/s, coherent, CPU MoE path
+- GLM-4-7-Flash (17 GB): ~50 t/s, full GPU
+
+**Slot buffer for >GTT GPU expert matmul remains future work** -- patches preserved
+in repo. The MUL_MAT_ID shader still needs slot indirection for remapped IDS.
+
+**Status**: COMPLETE
 
 ### I12. ik_llama.cpp Benchmark — TIER 1
 
@@ -544,7 +535,7 @@ Confirmed on both Strix Halo (shadow) and Strix Point (local):
 ## Architecture
 
 ```
-Single backend: moe-flash-cpumoe (CPU_MOE=1, image 6c04589)
+Single backend: moe-flash-cpumoe (CPU_MOE=1, image 7e64a82)
 
 llama_params_fit auto-detect:
   ├── Model fits in device memory? → Clear CPU_MOE override
