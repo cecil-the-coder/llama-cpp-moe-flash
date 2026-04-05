@@ -5,19 +5,20 @@ targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
 ## Status (2026-04-03)
 
-**Production image: `7e64a82`** -- DeepSeek fix complete, all models coherent.
+**Production image: `d54393c`** on b8664 -- Two-tier expert GPU cache, all models coherent.
 
-Patches applied: 0001 (with force-offload host buffer guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
-Patches NOT applied: 0015, 0016, 0019 (slot buffer infrastructure -- kept in repo for future use).
+Patches applied: 0001 (with stable cache key + force-offload guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
 
-**Root causes found and fixed (I11)**:
-1. Force-offload in patch 0001 unconditionally pushed MUL_MAT_ID to GPU even when expert weights were on CPU (`--cpu-moe`). Fixed with `ggml_backend_buffer_is_host()` guard.
-2. Patches 0015/0016 (`ggml_set_input/output` on `selected_experts`) changed gallocr allocation and corrupted output for ALL models. Removed from build.
-3. Broken YAML in Qwen3 CRD (duplicate `value:` key) blocked Flux reconciliation for hours. Fixed.
+**Two-tier expert GPU cache (I11)**:
+- Expert cache key changed from `input_cpy` (tensor struct, changes each token) to `input->data` (source weight pointer, stable across tokens)
+- GPU buffer contents persist across tokens (Vulkan reset is no-op, gallocr offsets deterministic)
+- Cache warmup: ~5 tokens to ~80% hit rate, ~32 tokens for ~100%
+- Zero additional memory -- uses existing gallocr buffer allocation
+- Flash-moe DISABLED for DeepSeek: standard CPU->GPU copy path with expert cache outperforms async prefetch (3.9 vs 2.3 t/s)
 
 **I12 benchmark (complete)**:
 - Stock Vulkan: 20.7 t/s (Qwen3-235B Q2_K)
-- moe-flash: 20.0 t/s (Qwen3), 2.05 t/s (DeepSeek)
+- moe-flash: 20.0 t/s (Qwen3), 3.9 t/s (DeepSeek with expert GPU cache)
 - ik_llama.cpp CPU-only: 11.5 t/s (Qwen3), 1.5 t/s (DeepSeek without flash_attn)
 
 ---
@@ -85,24 +86,24 @@ territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB
 |---|---|---|---|---|---|
 | GLM-4-7-Flash | 17 GB | 125 GB | Full GPU (auto-detect) | **~50** | Coherent |
 | Qwen3-235B Q2_K | 80 GB | 125 GB | Full GPU (auto-detect) | **20.0** | Coherent |
-| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | CPU MoE path | **2.05** | Coherent |
+| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | CPU MoE + expert GPU cache | **3.9** | Coherent (2.2x over 1.8 baseline) |
 
 Auto-detect clears CPU_MOE for models that fit in GTT (120 GB). DeepSeek uses
-CPU MoE path with mmap-wrap and partial prefetch.
+CPU MoE path with expert GPU cache (flash-moe disabled -- cache outperforms async prefetch).
 
 ---
 
-### Patch Status (image `7e64a82`)
+### Patch Status (image `d54393c` on b8664)
 
 | Patch | Status | Purpose |
 |---|---|---|
-| 0001 | Applied | Core MoE flash + force-offload host buffer guard |
+| 0001 | Applied | Core MoE flash + stable cache key + force-offload guard |
 | 0014 | Applied | Vec-path runtime aliasing check (byte-range overlap) |
 | 0017 | Applied | Auto-detect CPU_MOE + disable upstream `llama_params_fit` |
-| 0015, 0016, 0019 | NOT applied | Slot buffer infrastructure (kept in repo for future use) |
 
-**Lesson learned**: Broken YAML in Flux CRDs (duplicate `value:` key) silently blocks
-reconciliation. Always validate CRD YAML before debugging backend issues.
+**Key finding**: flash-moe async_prefetch bypasses the scheduler's expert copy path
+(disk -> GPU via io_uring). The expert GPU cache only works on the standard CPU -> GPU
+copy path. Disabling flash-moe and using the cache is faster (3.9 vs 2.3 t/s).
 
 ## Documents
 

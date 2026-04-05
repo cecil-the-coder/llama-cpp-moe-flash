@@ -1,14 +1,14 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: I11 COMPLETE, I12 COMPLETE. DeepSeek coherent at 2.05 t/s. (2026-04-03)
+**Status**: I11 COMPLETE (two-tier expert GPU cache), I12 COMPLETE. DeepSeek 3.9 t/s (2.2x baseline). (2026-04-03)
 
-**Production Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:7e64a82`
+**Production Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:d54393c` (b8664)
 
 ---
 
 ## Completed
 
-- **I11** - DeepSeek fix: force-offload host buffer guard, gallocr corruption fix, Flux YAML fix
+- **I11** - Two-tier expert GPU cache: DeepSeek 3.9 t/s (2.2x baseline), stable cache key, flash-moe disabled
 - **I12** - ik_llama.cpp benchmark: Vulkan 2x faster for in-GTT models
 - **I14** - io_uring polish optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
 - **I10b** - GPU MoE expert matmul for in-GTT models (auto-detect)
@@ -21,7 +21,7 @@
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
-| **I11** - DeepSeek Fix | High | High | **COMPLETE** | 2.05 t/s coherent |
+| **I11** - Expert GPU Cache | High | High | **COMPLETE** | 3.9 t/s (2.2x baseline) |
 | **I12** - ik_llama.cpp Benchmark | High | Medium | **COMPLETE** | See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
 | **I14** - io_uring Polish | Medium | Low | **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
 | **Slot buffer GPU matmul** | High | High | Future | Shader mod needed for >GTT GPU path |
@@ -71,7 +71,7 @@ madvise(staging_pool, size, MADV_HUGEPAGE | MADV_COLLAPSE);
 | Model | ik_llama.cpp | Stock Vulkan | moe-flash |
 |-------|-------------|-------------|-----------|
 | Qwen3-235B Q2_K (80 GB) | 11.5 t/s | 20.7 t/s | 20.0 t/s |
-| DeepSeek-R1 Q2_K (228 GB) | 1.5 t/s (no flash_attn) | N/A | 2.05 t/s |
+| DeepSeek-R1 Q2_K (228 GB) | 1.5 t/s (no flash_attn) | N/A | 3.9 t/s (expert GPU cache) |
 
 **Key finding**: ik_llama.cpp FlashMLA crashes on DeepSeek Q2_K over mmap (NaN logits).
 Standard attention path works but isn't faster than our hybrid.
@@ -80,19 +80,19 @@ Standard attention path works but isn't faster than our hybrid.
 
 ---
 
-### 3. Slot Buffer GPU Expert Matmul — Future Work
+### 3. Remaining Optimizations for DeepSeek (3.9 t/s -> higher)
 
-**Goal**: Copy active experts to GPU on-demand for models exceeding GTT (e.g., DeepSeek 228 GB).
+**Graph split reduction**: Current 284 graph splits could be reduced to ~61 by batching
+gate/up/down per layer. Potential 2-3x improvement from reduced dispatch overhead.
 
-**Current state**: Slot buffer patches (0015, 0016, 0019) are preserved in repo but not applied.
-The infrastructure works (LRU cache, IDS rewrite, deferred writes) but MUL_MAT_ID shader
-produces wrong results with slot-remapped IDS.
+**Cold miss prefetch**: Combine flash-moe async prefetch with expert cache for cold misses.
+Currently mutually exclusive -- flash-moe bypasses the scheduler's expert copy path entirely.
 
-**Remaining work**: Modify MUL_MAT_ID shader to add slot indirection in `pos_a` calculation.
+**Thread count tuning**: DeepSeek CPU_MOE path may benefit from different thread count
+than the current default. Zen 5 UMA shares memory bandwidth between CPU and GPU.
 
-**Potential reward**: 5x speedup for DeepSeek (2.05 -> ~10 t/s).
-**Effort**: 2-3 days (shader modification + testing).
-**Risk**: Medium (shader change affects all MUL_MAT_ID paths).
+**Slot buffer GPU matmul** (future): Shader mod for >GTT GPU expert matmul.
+Patches 0015/0016/0019 preserved in repo. Potential further speedup but higher risk.
 
 ---
 
@@ -132,10 +132,12 @@ produces wrong results with slot-remapped IDS.
 ## Decision Framework
 
 ```
-Current state: All models producing coherent output. Performance validated.
+Current state: Expert GPU cache delivers 3.9 t/s (2.2x baseline). All models coherent.
 
-If we want 5× speedup for DeepSeek (2.05 → ~10 t/s):
-    → Slot buffer shader modification - 2-3 days, medium risk
+If we want further DeepSeek speedup (3.9 → ~8-12 t/s):
+    → Graph split reduction (284 → ~61) - highest leverage, 2-3x potential
+    → Thread count tuning - low effort
+    → Cold miss prefetch (combine flash-moe + cache) - medium effort
 
 If we want incremental improvements:
     → I13 (BF16 CPU matmul) or I7 (context scaling) - low effort
@@ -148,15 +150,16 @@ If we want to explore new models:
 
 ## Recommended Next Steps
 
-1. **Slot buffer shader mod** (highest impact): Modify MUL_MAT_ID to support
-   slot indirection. Patches 0015/0016/0019 provide the infrastructure.
-   Target: DeepSeek 2.05 -> ~10 t/s.
+1. **Graph split reduction** (highest impact): Batch gate/up/down per layer to reduce
+   284 splits to ~61. Target: DeepSeek 3.9 -> ~8-12 t/s.
 
-2. **I13 - BF16 CPU matmul** (low effort): Test if BF16 AVX-512 outperforms
+2. **Thread count tuning** (low effort): Sweep thread counts for DeepSeek CPU_MOE path.
+
+3. **Cold miss prefetch** (medium effort): Combine flash-moe async prefetch with expert
+   cache for cold misses during warmup phase.
+
+4. **I13 - BF16 CPU matmul** (low effort): Test if BF16 AVX-512 outperforms
    Q4_0 AVX2 for CPU expert matmul on Zen 5.
-
-3. **New model deployment**: Current stack handles 17-228 GB models. Test with
-   additional MoE architectures.
 
 ---
 
