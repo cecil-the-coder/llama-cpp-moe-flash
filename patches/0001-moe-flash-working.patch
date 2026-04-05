@@ -112,12 +112,13 @@ index bc57df2..66e1152 100644
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-@@ -1450,6 +1467,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1450,6 +1467,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
 +    // Expert cache: track which experts are already in GPU copy tensor
-+    static std::unordered_map<const ggml_tensor *, std::vector<ggml_bitset_t>> expert_cache;
++    // Two-tier expert cache: keyed by source weight data pointer (stable across tokens)
++    static std::unordered_map<const void *, std::vector<ggml_bitset_t>> expert_cache;
 +
 +    // I10b: Slot buffer cache for oversized MoE expert tensors.
 +    // Maps expert IDs to fixed slots in a shrunk GPU buffer.
@@ -135,10 +136,19 @@ index bc57df2..66e1152 100644
 +    // sharing the same IDS tensor must use the original expert IDs for slot assignment.
 +    static std::unordered_map<const ggml_tensor *, std::vector<int32_t>> original_ids_cache;
 +
++    // Invalidate expert cache when graph shape changes (prefill vs generation)
++    static int prev_n_nodes = 0;
++    if (sched->graph.n_nodes != prev_n_nodes) {
++        expert_cache.clear();
++        slot_caches.clear();
++        original_ids_cache.clear();
++        prev_n_nodes = sched->graph.n_nodes;
++    }
++
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1505,11 +1541,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1505,11 +1551,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -178,7 +188,7 @@ index bc57df2..66e1152 100644
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,46 +1586,114 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1596,117 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -272,7 +282,10 @@ index bc57df2..66e1152 100644
 +                            ids_gpu, ids.data(), 0, ids.size() * sizeof(int32_t));
 +                    } else {
 +                        // Normal mode: full-size copy tensor, use bitset cache
-+                        auto & cached_ids = expert_cache[input_cpy];
++                        // Key by input->data (stable source weight pointer) instead of
++                        // input_cpy (recreated each token). GPU buffer contents persist
++                        // across tokens (Vulkan reset is no-op, gallocr offsets deterministic).
++                        auto & cached_ids = expert_cache[input->data];
 +                        if (cached_ids.empty()) {
 +                            cached_ids.resize(ggml_bitset_size(n_expert));
 +                        }
@@ -322,7 +335,7 @@ index bc57df2..66e1152 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1828,6 +1960,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1828,6 +1970,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
