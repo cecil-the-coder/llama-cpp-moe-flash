@@ -3,35 +3,25 @@
 Implementing "LLM in a Flash" style SSD-streaming inference for MoE models in llama.cpp,
 targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
-## ✅ Status Update (2026-04-03)
+## ✅ Status Update (2026-04-05)
+
+**I11 Dynamic Expert Import — Phase 1 Complete**:
+- Slot buffer infrastructure works: LRU cache, IDS rewrite, deferred writes, no crashes
+- Auto-detect: models ≤GTT get full GPU (21 t/s), models >GTT activate slot buffer
+- DeepSeek 228 GB: slot buffer activates but output incorrect (shader blocker)
+- Remaining blocker: MUL_MAT_ID shader needs slot indirection for remapped IDS
+- **Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:e7a3884`
 
 **I18 Cache Hit Tracking COMPLETE**: Fixed cache hit metrics to include cross-layer expert sharing.
-- Cache hit rate now properly reflects expert reuse between layers
-- Metrics work in all modes (prefetch, io_uring, cache)
 - See [`docs/I18-cache-hit-fix.md`](docs/I18-cache-hit-fix.md) for details
-- **Production image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:c791e75`
 
 **I17 Prometheus Metrics COMPLETE**: Full observability with Prometheus + Grafana.
-- HTTP metrics server on port 9090
-- 8-panel Grafana dashboard
-- Tracks requests, cache hits, I/O savings
 - See [`docs/I17-prometheus-complete.md`](docs/I17-prometheus-complete.md) for details
 
-**I11 Async Expert Prefetch COMPLETE**: Fully functional async prefetch with `posix_fadvise` is now working.
-- Callback triggers on every MoE layer execution
-- Automatically prefetches next layer's experts to page cache
-- 3 GGUF shards detected and mapped for prefetching
-- See [`docs/I11-async-prefetch-summary.md`](docs/I11-async-prefetch-summary.md) for details
-- **Production image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:86982b0`
-
 **I10b Investigation COMPLETE**: GPU MoE expert matmul with fixed-size slot buffer is **working**.
-- 3× speedup for models ≤ GTT (120 GB): 6 t/s → 18-20 t/s
+- 3x speedup for models ≤ GTT (120 GB): 6 t/s → 18-20 t/s
 - Auto-detect logic routes models to optimal backend (GPU or CPU)
-- Slot buffer code ready for >GTT models (future activation)
 - **Production image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:ce76b8d`
-
-**Key Finding**: "Defensive" patches (0006) were causing crashes, not the slot buffer code itself.
-Consolidated patch (0001-0015 without 0006) is stable and production-ready.
 
 ---
 
@@ -92,17 +82,18 @@ Per-token I/O for streaming (cold NVMe read, no page cache):
 generation), or with a much faster NVMe. With a warm cache these models are 1-5 tok/s
 territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB/s SSD.
 
-## Results (Updated 2026-03-31)
+## Results (Updated 2026-04-05)
 
 | Model | Size | RAM | Config | Gen t/s | Status |
 |---|---|---|---|---|---|
 | glm-4-7-flash | 17 GB | 125 GB | Full GPU (auto-detect) | **50.57** | ✅ I10b Option A |
-| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full GPU (vec path) | **22.68-23.00** | ✅ I10b patches 0014-0017 |
+| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full GPU (auto-detect) | **21** | ✅ I11 auto-detect |
 | qwen3-235b-a22b-q4km | 133 GB | 125 GB | Full GPU (auto-detect) | **18.0** | ✅ I10b Option A |
-| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | mmap-wrap + CPU MoE | **1.37-1.8** | ✅ Working |
+| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | mmap-wrap + CPU MoE | **1.8** | ✅ Working (CPU baseline) |
 
-**I10b Achievement**: Auto-detect `llama_params_fit` now clears `CPU_MOE` for models ≤ 120 GB GTT,
-enabling 3× faster GPU expert matmul. Models exceeding GTT use stable mmap-wrap fallback.
+**I11 Progress**: Auto-detect clears CPU_MOE for ≤GTT models (21 t/s for Q2_K). Slot buffer
+for >GTT models (DeepSeek) activates but produces incorrect output — blocked on MUL_MAT_ID
+shader modification to support slot-remapped expert IDS.
 
 ### I10b Investigation Summary
 

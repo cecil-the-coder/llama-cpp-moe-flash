@@ -418,27 +418,48 @@ Result: Vec path works correctly, zero false positives.
 
 **Status**: ✅ COMPLETE — vec path working, no aliasing, coherent output
 
-### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
+### I11. Dynamic Expert Import via Slot Buffer — TIER 1
 
-**Source**: Vulkan spec, local codebase analysis
+**Source**: Vulkan spec, local codebase analysis, I10b slot buffer infrastructure
 
-Current `buffer_from_host_ptr` imports the entire model at once. For models
-exceeding GTT, import all experts at once → OOM. Instead: pre-allocate N Vulkan
-buffer slots, dynamically import active experts per token.
+#### I11 Dynamic Expert Import — Phase 1 Results (2026-04-05)
 
-**Prerequisite**: Requires pinned (`ggml_vk_host_malloc`) memory, not mmap'd
-file pages. RADV cannot import mmap'd pages without GPU page fault (confirmed
-in F4). So this needs the staging pool approach from `docs/design.md`:
-`io_uring` reads expert into pinned staging buffer → import staging buffer as
-Vulkan buffer → GPU matmul.
+**Slot buffer infrastructure works**: LRU cache, IDS rewrite, deferred writes,
+no crashes. The core machinery is functional.
 
-**On UMA**: The import is a page-table remap only. No data movement. The
-overhead is `vkAllocateMemory` + `vkBindBufferMemory` per expert swap.
+**Auto-detect behavior**:
+- Models ≤ GTT: CPU_MOE cleared automatically → full GPU path (21 t/s)
+- Models > GTT: CPU_MOE kept + slot buffer enabled for GPU expert matmul
 
-**Blocker**: Each import creates a new VkDeviceMemory. Frequent alloc/free
-may fragment or stall. Need to benchmark import latency on gfx1151.
+**DeepSeek 228 GB result**: Slot buffer activates but produces garbage output
+at 0.46 t/s. The infrastructure runs without crashes but output is incorrect.
 
-**Status**: not started (depends on staging pool from I14)
+**Root causes found and fixed**:
+1. `ggml_set_input/output` on `selected_experts` corrupts gallocr for normal
+   models → made conditional on `LLAMA_MOE_SLOT_BUFFER=1`
+2. Deferred IDS write prevents overwrite by input copy loop → implemented
+   (deferred_ids_writes vector, flushed after all input copies)
+3. Zero-fill eliminated stale data as cause → confirmed not the issue
+
+**Remaining blocker**: Vulkan MUL_MAT_ID shader produces wrong results with
+slot-remapped IDS. The shader expects expert data at original `expert_id`
+offsets, not remapped slot offsets. The slot buffer places expert data at
+slots 0..N but the shader indexes by original expert ID (0..255 for DeepSeek).
+
+**Options for Phase 2**:
+- Shader modification to add slot indirection in `pos_a` calculation
+- Shrink `ne[2]` on copy tensor (blocked: breaks graph shape inference)
+- Different approach to expert-to-slot mapping
+
+**Current patch stack (image e7a3884)**:
+- 0001: Core MoE flash (expert copy, slot buffer, prefetch, metrics)
+- 0014: Vec-path runtime aliasing check (byte-range overlap)
+- 0015: Conditional `ggml_set_input/output` (only when `LLAMA_MOE_SLOT_BUFFER=1`)
+- 0016: gallocr respects INPUT flag in inplace reuse
+- 0017: Disable upstream `-fit` + auto-detect CPU_MOE + set `LLAMA_MOE_SLOT_BUFFER` for >GTT
+- 0019: `force_slot_buffer` flag in scheduler struct, env var activation
+
+**Status**: Phase 1 complete, Phase 2 blocked on shader modification
 
 ### I12. ik_llama.cpp Benchmark — TIER 1
 

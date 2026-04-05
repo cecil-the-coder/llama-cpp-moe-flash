@@ -22,7 +22,7 @@
 | **I14** - io_uring Polish | Medium | Low | ✅ **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
 | **I10b Option B** - Force-offload | High | Medium | ✅ **COMPLETE** | Ready to test with DeepSeek |
 | **I12** - ik_llama.cpp Benchmark | High | Medium | ✅ **COMPLETE** | Vulkan 2x faster. See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
-| **I11** - Dynamic Expert Import | High | High | Not started | Future work |
+| **I11** - Dynamic Expert Import | High | High | **Phase 1 complete** | Phase 2 blocked on shader |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
 | **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 fix |
 
@@ -78,39 +78,27 @@ Standard attention path works but isn't faster than our hybrid.
 
 ---
 
-### 3. I11: Dynamic Expert Import — Enable GPU MoE for >GTT Models
+### 3. I11: Dynamic Expert Import — Phase 1 Complete, Phase 2 Blocked
 
 **Goal**: Copy active experts to GPU on-demand for models exceeding GTT.
 
-**The Problem**:
-- DeepSeek 228 GB > 120 GB GTT limit
-- Current: `--cpu-moe` keeps all expert matmul on CPU (1.8 t/s)
-- Target: Copy only active experts (K=8 per layer) to GPU → 6-10 t/s
+**Phase 1 Results (2026-04-05)**:
+- Slot buffer infrastructure works: LRU cache, IDS rewrite, deferred writes, no crashes
+- Auto-detect: models ≤GTT get CPU_MOE cleared (full GPU, 21 t/s), models >GTT keep CPU_MOE + slot buffer
+- DeepSeek 228 GB: slot buffer activates but produces **garbage output** at 0.46 t/s
+- Fixed: conditional `ggml_set_input/output`, deferred IDS writes, stale data zero-fill
+- **Blocker**: Vulkan MUL_MAT_ID shader expects data at original expert_id offsets, not slot offsets
 
-**The Solution**:
-```cpp
-// Pre-allocate N Vulkan buffer slots (32 slots × expert_size)
-// For each token:
-//   1. Read routing IDs (which 8 experts needed)
-//   2. For each needed expert:
-//      - Check slot table (LRU cache)
-//      - If miss: io_uring read → pinned staging → import to slot
-//      - On UMA: "import" is page-table remap (zero copy!)
-//   3. GPU MUL_MAT_ID on slot buffer
-```
+**Phase 2 (blocked on shader)**:
+- Need to modify MUL_MAT_ID shader to add slot indirection in `pos_a` calculation
+- Alternative: different mapping strategy that preserves original expert ID indexing
 
-**Implementation**:
-- Reuse slot buffer code from I10b (already in patch 0014-0015)
-- Add `LLAMA_FLASH_MOE_FORCE_OFFLOAD=1` flag
-- Modify `ggml_backend_sched` to route MUL_MAT_ID to GPU
+**Patch stack (image e7a3884)**:
+- 0001, 0014-0017, 0019
 
-**Effort**: 3-5 days
-**Risk**: Medium (touches scheduler, needs testing)
-**Reward**: **5× speedup for DeepSeek** (1.8 → 10 t/s)
-
-**Prerequisites**:
-- I14 (staging pool with registered buffers)
-- Slot buffer code (I10b - ✅ already done)
+**Effort remaining**: 2-3 days (shader modification + testing)
+**Risk**: Medium (shader change affects all MUL_MAT_ID paths)
+**Reward**: **5x speedup for DeepSeek** (1.8 → ~10 t/s)
 
 ---
 
@@ -237,5 +225,5 @@ If we want all of the above:
 
 ---
 
-*Last Updated*: 2026-03-31  
-*Next Review*: After I14 completion (target: 2026-04-07)
+*Last Updated*: 2026-04-05  
+*Next Review*: After I11 Phase 2 shader modification
