@@ -62,7 +62,7 @@ index 2650237..5a54cd4 100644
  if (MATH_LIBRARY)
      if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index bc57df2..66e1152 100644
+index bc57df2..0c86f9f 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,7 @@
@@ -110,7 +110,7 @@ index bc57df2..66e1152 100644
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-@@ -1450,6 +1467,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1450,6 +1467,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -133,13 +133,24 @@ index bc57df2..66e1152 100644
 +    // sharing the same IDS tensor must use the original expert IDs for slot assignment.
 +    static std::unordered_map<const ggml_tensor *, std::vector<int32_t>> original_ids_cache;
 +
++    // Deferred IDS rewrites: slot buffer mode rewrites IDS with slot indices,
++    // but the IDS tensor may be overwritten by a later input copy (the IDS tensor
++    // is also a split input that gets copied from CPU to GPU). We defer the IDS
++    // write to after all input copies are done.
++    struct deferred_ids_write {
++        ggml_backend_t backend;
++        ggml_tensor * ids_gpu;
++        std::vector<int32_t> rewritten_ids;
++    };
++    std::vector<deferred_ids_write> deferred_ids_writes;
++
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1505,63 +1541,186 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1505,63 +1552,188 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
-
+ 
 +                    // I10b: Slot remap mode — when expert tensor exceeds maxStorageBufferRange
 +                    // (4 GiB), copy active experts into low slots (0..K-1) and rewrite IDS
 +                    // with slot indices. Tensor shape stays ne[2]=n_expert (graph correctness)
@@ -166,7 +177,7 @@ index bc57df2..66e1152 100644
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                          ggml_backend_synchronize(ids_backend);
-
+ 
 +                        if (slot_remap_mode) {
 +                            fprintf(stderr, "[I11-DEBUG] Activating slot remap mode, caching original IDS\n");
 +                            original_ids_cache[ids_tensor] = ids;
@@ -188,12 +199,7 @@ index bc57df2..66e1152 100644
                          }
  
                          prev_ids_tensor = ids_tensor;
-+
-+                        fprintf(stderr, "[I11-DEBUG] callback_expert_copy=%p, About to call\n", (void*)sched->callback_expert_copy);
-+                        if (sched->callback_expert_copy) {
-+                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
-+                        }
-                     }
+-                    }
  
 -                    // group consecutive experts and copy them together
 -                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -201,6 +207,29 @@ index bc57df2..66e1152 100644
 -                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
 -                        const size_t padding = std::min<size_t>(expert_size, 512);
 -                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+-
+-                        ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
+-                    };
+-
+-                    int id = 0;
+-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+-                        id++;
++                        fprintf(stderr, "[I11-DEBUG] callback_expert_copy=%p, About to call\n", (void*)sched->callback_expert_copy);
++                        if (sched->callback_expert_copy) {
++                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
++                        }
+                     }
+-                    int32_t first_id = id;
+-                    int32_t last_id = first_id;
+ 
+-                    for (++id; id < n_expert; ++id) {
+-                        if (!ggml_bitset_get(used_ids.data(), id)) {
+-                            continue;
 +                    if (slot_remap_mode) {
 +                        const int n_slots = GGML_MOE_SLOT_BUFFER_SLOTS;
 +
@@ -210,9 +239,12 @@ index bc57df2..66e1152 100644
 +                            sc.expert_to_slot.assign(n_expert, -1);
 +                            sc.slot_to_expert.assign(n_slots, -1);
 +                            sc.slot_lru.assign(n_slots, 0);
-+                        }
+                         }
 +                        sc.clock++;
-+
+ 
+-                        if (id == last_id + 1) {
+-                            last_id = id;
+-                            continue;
 +                        for (int id = 0; id < n_expert; ++id) {
 +                            if (!ggml_bitset_get(used_ids.data(), id)) continue;
 +
@@ -220,7 +252,7 @@ index bc57df2..66e1152 100644
 +                                sc.slot_lru[sc.expert_to_slot[id]] = sc.clock;
 +                                continue;
 +                            }
- 
++
 +                            int slot = -1;
 +                            for (int s = 0; s < n_slots; s++) {
 +                                if (sc.slot_to_expert[s] == -1) { slot = s; break; }
@@ -283,35 +315,21 @@ index bc57df2..66e1152 100644
 +                            }
 +                            ids[i] = sc.expert_to_slot[eid];
 +                        }
-+                        fprintf(stderr, "[I11-DEBUG] Rewrote %zu IDS entries, writing to GPU\n", ids.size());
++                        fprintf(stderr, "[I11-DEBUG] Rewrote %zu IDS entries, deferring write to after input copies\n", ids.size());
 +
-+                        // Write rewritten IDS to GPU
++                        // Defer the IDS write to after all input copies complete.
++                        // The IDS tensor (selected_experts) is also a split input
++                        // that gets copied from CPU->GPU later in the input loop,
++                        // which would overwrite our rewritten slot indices.
 +                        ggml_tensor * ids_gpu = node->src[2];
-                         ggml_backend_tensor_set_async(split_backend,
--                            input_cpy,
--                            (const uint8_t *)input->data + expert_offset, expert_offset,
--                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
--                            // this is necessary for MMQ in the CUDA backend
--                            expert_size_copy + padding_end);
--                    };
--
--                    int id = 0;
--                    while (!ggml_bitset_get(used_ids.data(), id)) {
--                        id++;
--                    }
--                    int32_t first_id = id;
--                    int32_t last_id = first_id;
-+                            ids_gpu, ids.data(), 0, ids.size() * sizeof(int32_t));
++                        deferred_ids_writes.push_back({split_backend, ids_gpu, ids});
 +                    } else {
 +                        // Normal mode: full-size copy tensor, use bitset cache
 +                        auto & cached_ids = expert_cache[input_cpy];
 +                        if (cached_ids.empty()) {
 +                            cached_ids.resize(ggml_bitset_size(n_expert));
 +                        }
- 
--                    for (++id; id < n_expert; ++id) {
--                        if (!ggml_bitset_get(used_ids.data(), id)) {
--                            continue;
++
 +                        // DEBUG: Count used experts and cache stats
 +                        int used_count = 0, cache_hits = 0, cache_misses = 0;
 +                        for (int id = 0; id < n_expert; ++id) {
@@ -322,11 +340,8 @@ index bc57df2..66e1152 100644
 +                            } else {
 +                                cache_misses++;
 +                            }
-                         }
- 
--                        if (id == last_id + 1) {
--                            last_id = id;
--                            continue;
++                        }
++
 +                        if (cache_misses > 0) {
 +                            fprintf(stderr, "[I11-DEBUG-NORM] n_expert=%d, used=%d, hits=%d, misses=%d, bytes_per_expert=%zu, total_copy=%zu KB\n",
 +                                    n_expert, used_count, cache_hits, cache_misses, expert_size, (cache_misses * expert_size) / 1024);
@@ -354,7 +369,29 @@ index bc57df2..66e1152 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1828,6 +1987,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1578,6 +1750,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // Flush deferred IDS rewrites: write slot indices to GPU AFTER all
++        // input copies are done, so they aren't overwritten by the regular
++        // IDS tensor copy (selected_experts is also a split input).
++        for (auto & diw : deferred_ids_writes) {
++            fprintf(stderr, "[I11-DEBUG] Flushing deferred IDS write: tensor=%s, size=%zu\n",
++                    diw.ids_gpu->name, diw.rewritten_ids.size());
++            ggml_backend_tensor_set_async(diw.backend,
++                diw.ids_gpu, diw.rewritten_ids.data(), 0,
++                diw.rewritten_ids.size() * sizeof(int32_t));
++        }
++        if (!deferred_ids_writes.empty()) {
++            ggml_backend_synchronize(split_backend);
++        }
++        deferred_ids_writes.clear();
++
+         if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
+             ggml_backend_synchronize(split_backend);
+         }
+@@ -1828,6 +2015,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
