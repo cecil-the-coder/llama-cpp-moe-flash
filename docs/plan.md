@@ -400,11 +400,23 @@ which specific split/tensor triggers the fault.
 5. `VK_EXT_shader_64bit_indexing` not available on RADV/GFX1151
 6. Crash only occurs in vec path (bs=1 generation), not batch path (bs=20 prefill)
 
-**Next step**: Deploy image with patch 0007 debug logging to shadow node,
-trigger a generation request, collect last `[MOE-DBG]`/`[VEC-DBG]` lines before
-crash, identify bad tensor/buffer pointer, fix root cause.
+**I10b Vec-Path Fix (2026-04-05)**: ROOT CAUSE FOUND AND FIXED.
 
-**Status**: GPU SIGSEGV during generation — root cause unknown, debug logging deployed
+The original aliasing check (`d_ids.buffer == d_D.buffer`) compared Vulkan
+pool handles, not actual memory ranges. Since the suballocator places many
+tensors in the same VkBuffer pool, this produced false positives on EVERY
+MoE operation, forcing the slower batch path.
+
+Patches applied (image `4c65a2f`):
+- **0015**: `ggml_set_input + ggml_set_output` on `selected_experts`
+- **0016**: gallocr respects INPUT flag in inplace reuse check
+- **0014**: Runtime overlap check using `[offset, offset+size)` byte ranges
+- **0017**: Disable upstream `llama_params_fit` (hangs for MoE models)
+
+Result: Vec path works correctly, zero false positives.
+**Qwen3-235B Q2_K: 23 t/s** (up from 20.7 baseline, +11%).
+
+**Status**: ✅ COMPLETE — vec path working, no aliasing, coherent output
 
 ### I11. Dynamic Expert Import via VK_EXT_external_memory_host — TIER 1
 

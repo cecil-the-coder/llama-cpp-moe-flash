@@ -97,7 +97,7 @@ territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB
 | Model | Size | RAM | Config | Gen t/s | Status |
 |---|---|---|---|---|---|
 | glm-4-7-flash | 17 GB | 125 GB | Full GPU (auto-detect) | **50.57** | ✅ I10b Option A |
-| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full GPU (auto-detect) | **20.21-20.77** | ✅ I10b Option A |
+| qwen3-235b-a22b Q2_K | 80 GB | 125 GB | Full GPU (vec path) | **22.68-23.00** | ✅ I10b patches 0014-0017 |
 | qwen3-235b-a22b-q4km | 133 GB | 125 GB | Full GPU (auto-detect) | **18.0** | ✅ I10b Option A |
 | DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | mmap-wrap + CPU MoE | **1.37-1.8** | ✅ Working |
 
@@ -137,7 +137,7 @@ Removed from consolidated patch. All tests now pass.
 - [`docs/plan.md`](docs/plan.md) — implementation plan and task tracking
 - [`docs/next-investigations.md`](docs/next-investigations.md) — roadmap for 2026-Q2 investigations
 - [`docs/I14-iouring-polish.md`](docs/I14-iouring-polish.md) — io_uring performance optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
-- [`docs/I12-ik-llama-benchmark.md`](docs/I12-ik-llama-benchmark.md) — **I12: ik_llama.cpp CPU-only benchmark** (in progress)
+- [`docs/I12-ik-llama-benchmark.md`](docs/I12-ik-llama-benchmark.md) — I12: ik_llama.cpp CPU-only benchmark (complete)
 - [`docs/I10b-findings.md`](docs/I10b-findings.md) — GPU MoE slot buffer investigation complete
 - [`docs/I10b-option-b-force-offload.md`](docs/I10b-option-b-force-offload.md) — Force-offload testing for >GTT models
 - [`docs/I11-async-prefetch-summary.md`](docs/I11-async-prefetch-summary.md) — I11 async expert prefetch implementation
