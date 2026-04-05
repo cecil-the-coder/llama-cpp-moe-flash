@@ -147,7 +147,7 @@ index bc57df2..0c86f9f 100644
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1505,63 +1552,188 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1505,63 +1552,191 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -241,6 +241,9 @@ index bc57df2..0c86f9f 100644
 +                            sc.slot_lru.assign(n_slots, 0);
                          }
 +                        sc.clock++;
++
++                        // Zero the GPU copy tensor to prevent stale data in unused slots
++                        ggml_backend_tensor_memset(input_cpy, 0, 0, ggml_nbytes(input_cpy));
  
 -                        if (id == last_id + 1) {
 -                            last_id = id;
@@ -369,7 +372,7 @@ index bc57df2..0c86f9f 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1578,6 +1750,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1578,6 +1753,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -391,7 +394,7 @@ index bc57df2..0c86f9f 100644
          if (sched->events[split_backend_id][sched->cur_copy] == NULL) {
              ggml_backend_synchronize(split_backend);
          }
-@@ -1828,6 +2015,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1828,6 +2018,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
