@@ -1,18 +1,16 @@
 diff --git a/common/common.cpp b/common/common.cpp
-index 0a5ac4f..246992f 100644
+index 0a5ac4f..20dfb41 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1099,7 +1099,9 @@ common_init_result::common_init_result(common_params & params) :
-                 params.tensor_buft_overrides.clear();
-                 mparams = common_model_params_to_llama(params);
+@@ -1101,6 +1101,8 @@ common_init_result::common_init_result(common_params & params) :
              } else if (total_mb > 0) {
--                LOG_INF("%s: model %lld MB exceeds GTT %lld MB, keeping CPU_MOE\n",
-+                LOG_INF("%s: model %lld MB exceeds GTT %lld MB, keeping CPU_MOE + enabling slot buffer\n",
+                 LOG_INF("%s: model %lld MB exceeds GTT %lld MB, keeping CPU_MOE\n",
+                     __func__, (long long)total_mb, (long long)gtt_mb);
 +                // I11: Enable slot buffer mode for GPU expert matmul with small buffer
 +                setenv("LLAMA_MOE_SLOT_BUFFER", "1", 1);
-                     __func__, (long long)total_mb, (long long)gtt_mb);
              }
          }
+     }
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index 66e1152..0ea170e 100644
 --- a/ggml/src/ggml-backend.cpp
