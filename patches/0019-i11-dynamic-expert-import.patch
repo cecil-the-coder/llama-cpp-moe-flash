@@ -12,7 +12,7 @@ index 0a5ac4f..20dfb41 100644
          }
      }
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 66e1152..0ea170e 100644
+index 0ddb708..d5aa381 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -740,6 +740,9 @@ struct ggml_backend_sched {
@@ -25,16 +25,7 @@ index 66e1152..0ea170e 100644
  };
  
  #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
-@@ -1548,7 +1551,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
-                     // The descriptor binding is clamped to maxStorageBufferRange by the Vulkan
-                     // backend; the shader early-exits for experts with 0 token count.
-                     #define GGML_MOE_SLOT_BUFFER_SLOTS 32
--                    const bool slot_remap_mode = (size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024;
-+                    const bool slot_remap_mode = ((size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024) || sched->force_slot_buffer;
-                     // DEBUG: Log slot buffer condition
-                     fprintf(stderr, "[I11-DEBUG] MUL_MAT_ID: tensor=%s, n_expert=%ld, expert_size=%zu, total=%zu MB, slot_remap_mode=%d\n",
-                             input->name, (long)n_expert, expert_size, ((size_t)n_expert * expert_size) / (1024*1024), slot_remap_mode);
-@@ -1827,6 +1830,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+@@ -1885,6 +1888,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
  
      sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
      sched->op_offload = op_offload;
