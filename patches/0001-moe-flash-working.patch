@@ -176,7 +176,7 @@ index bc57df2..66e1152 100644
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,46 +1586,114 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1586,140 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -244,9 +244,35 @@ index bc57df2..66e1152 100644
 +                        }
 +
 +                        // Rewrite IDS: replace expert IDs with slot indices
++                        // Handle any experts not yet assigned a slot (defensive)
 +                        for (size_t i = 0; i < ids.size(); i++) {
 +                            int32_t eid = ids[i];
-+                            GGML_ASSERT(eid >= 0 && eid < n_expert && sc.expert_to_slot[eid] >= 0);
++                            if (eid < 0 || eid >= n_expert) continue; // skip invalid
++                            if (sc.expert_to_slot[eid] < 0) {
++                                // Expert not in slot cache — assign on the fly
++                                // Find LRU slot
++                                int slot = 0;
++                                int64_t min_lru = sc.slot_lru[0];
++                                for (int s = 1; s < sc.n_slots; s++) {
++                                    if (sc.slot_lru[s] < min_lru) {
++                                        min_lru = sc.slot_lru[s];
++                                        slot = s;
++                                    }
++                                }
++                                // Evict old expert
++                                int old = sc.slot_to_expert[slot];
++                                if (old >= 0) sc.expert_to_slot[old] = -1;
++                                // Assign new
++                                sc.expert_to_slot[eid] = slot;
++                                sc.slot_to_expert[slot] = eid;
++                                sc.slot_lru[slot] = sc.clock++;
++                                // Copy expert data
++                                const size_t src_off = (size_t)eid * expert_size;
++                                const size_t dst_off = (size_t)slot * expert_size;
++                                fprintf(stderr, "[I11-DEBUG] Late-assign expert %d -> slot %d\n", eid, slot);
++                                ggml_backend_tensor_set_async(split_backend, input_cpy,
++                                    (const uint8_t *)input->data + src_off, dst_off, expert_size);
++                            }
 +                            ids[i] = sc.expert_to_slot[eid];
 +                        }
 +                        fprintf(stderr, "[I11-DEBUG] Rewrote %zu IDS entries, writing to GPU\n", ids.size());
@@ -320,7 +346,7 @@ index bc57df2..66e1152 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1828,6 +1960,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1828,6 +1986,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
