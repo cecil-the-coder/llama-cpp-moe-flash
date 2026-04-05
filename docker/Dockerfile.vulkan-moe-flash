@@ -11,12 +11,12 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 RUN ln -sf /usr/bin/ld.bfd /usr/bin/ld
 
 # Clone llama.cpp at the matching version and apply patch
-ARG LLAMA_CPP_TAG=b8298
+ARG LLAMA_CPP_TAG=b8664
 RUN git clone --depth 1 --branch ${LLAMA_CPP_TAG} \
         https://github.com/ggml-org/llama.cpp /build/llama.cpp
 
 # Cache buster: change this value to force full rebuild
-ARG CACHE_BUST=2026-04-05-fix-force-offload-cpumoe
+ARG CACHE_BUST=2026-04-03-rebase-b8664
 COPY patches/0001-moe-flash-working.patch /build/
 COPY patches/0014-fix-vec-fusion-buffer-aliasing.patch /build/
 COPY patches/0017-disable-fit-auto-detect-cpu-moe.patch /build/
