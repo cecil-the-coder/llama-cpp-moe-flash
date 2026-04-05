@@ -136,10 +136,10 @@ index bc57df2..66e1152 100644
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1505,11 +1541,39 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1505,63 +1541,186 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
- 
+
 +                    // I10b: Slot remap mode — when expert tensor exceeds maxStorageBufferRange
 +                    // (4 GiB), copy active experts into low slots (0..K-1) and rewrite IDS
 +                    // with slot indices. Tensor shape stays ne[2]=n_expert (graph correctness)
@@ -166,7 +166,7 @@ index bc57df2..66e1152 100644
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                          ggml_backend_synchronize(ids_backend);
- 
+
 +                        if (slot_remap_mode) {
 +                            fprintf(stderr, "[I11-DEBUG] Activating slot remap mode, caching original IDS\n");
 +                            original_ids_cache[ids_tensor] = ids;
@@ -176,7 +176,15 @@ index bc57df2..66e1152 100644
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,46 +1586,140 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+-                                GGML_ASSERT(id >= 0 && id < n_expert);
+-                                ggml_bitset_set(used_ids.data(), id);
++                                if (id >= 0 && id < n_expert) {
++                                    ggml_bitset_set(used_ids.data(), id);
++                                }
+                             }
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -346,7 +354,7 @@ index bc57df2..66e1152 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1828,6 +1986,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1828,6 +1987,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
