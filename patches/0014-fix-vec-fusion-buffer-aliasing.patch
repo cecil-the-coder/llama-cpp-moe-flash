@@ -1,45 +1,41 @@
 From e55006a32ef94cb952562854b1f3193330bd5b9c Mon Sep 17 00:00:00 2001
 From: Shadow <shadow@code-puppy.dev>
 Date: Tue, 31 Mar 2026 03:38:52 +0000
-Subject: [PATCH] Fix vec path fusion buffer aliasing bug
-
-Runtime detection of buffer aliasing in the vec path dispatch.
-When d_ids aliases with other buffers, skip the vec path (batch
-path fallback). Also detect fusion buffer aliasing with IDS.
-
-With patches 0015+0016 preventing aliasing at the allocator level,
-this should rarely fire — it's a safety net.
+Subject: [PATCH] Fix vec path buffer aliasing with proper range overlap check
 
 ---
- ggml/src/ggml-vulkan/ggml-vulkan.cpp | 25 +++++++++++++++++++++++++
- 1 file changed, 25 insertions(+)
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
 
 diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 index e061d4b..b32e451 100644
 --- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
 +++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-@@ -8588,6 +8588,31 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+@@ -8588,6 +8588,34 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
          fusion_flags |= MAT_VEC_FUSION_FLAGS_SCALE1;
      }
 
-+    // I10b fix: Check for buffer aliasing. When d_ids aliases with d_D or other
-+    // tensors, the expert IDs get corrupted before MUL_MAT_ID can read them.
-+    // Skip vec path entirely and use batch path (ggml_vk_mul_mat_id_q_f16)
-+    // which has different buffer allocation patterns that avoid this issue.
-+    if (d_ids.buffer == d_D.buffer || d_ids.buffer == d_X.buffer || d_ids.buffer == d_Y.buffer) {
-+        fprintf(stderr, "[VEC-FIX] Buffer aliasing detected (ids=%p, dst=%p, x=%p, y=%p), skipping vec path\n",
-+            (void*)d_ids.buffer.get(), (void*)d_D.buffer.get(),
-+            (void*)d_X.buffer.get(), (void*)d_Y.buffer.get());
++    // I10b: Check for actual memory range overlap between IDS and other tensors.
++    // Vulkan suballocator puts many tensors in the same VkBuffer pool, so
++    // comparing buffer handles alone produces false positives. Check byte ranges.
++    auto ranges_overlap = [](const vk_subbuffer & a, const vk_subbuffer & b) -> bool {
++        if (a.buffer != b.buffer) return false;
++        uint64_t a_end = a.offset + a.size;
++        uint64_t b_end = b.offset + b.size;
++        return a.offset < b_end && b.offset < a_end;
++    };
++
++    if (ranges_overlap(d_ids, d_D) || ranges_overlap(d_ids, d_X) || ranges_overlap(d_ids, d_Y)) {
++        fprintf(stderr, "[VEC-FIX] Memory overlap: ids=[%lu+%lu] dst=[%lu+%lu], skip vec\n",
++            (unsigned long)d_ids.offset, (unsigned long)d_ids.size,
++            (unsigned long)d_D.offset, (unsigned long)d_D.size);
 +        fflush(stderr);
-+        // Return early without doing anything - this will cause the graph to
-+        // fall back to the batch path for this node
 +        return;
 +    }
 +
-+    // I10b fix: Check for buffer aliasing between fusion buffer and IDS buffer.
-+    // When d_F0 aliases with d_ids, the shader reads expert IDs as scale values.
-+    if (ctx->num_additional_fused_ops > 0 && d_F0.buffer == d_ids.buffer) {
-+        fprintf(stderr, "[VEC-FIX] Disabling fusion: d_F0 aliases with d_ids\n");
++    // Check fusion buffer overlap with IDS
++    if (ctx->num_additional_fused_ops > 0 && ranges_overlap(d_F0, d_ids)) {
++        fprintf(stderr, "[VEC-FIX] Disabling fusion: d_F0 overlaps d_ids\n");
 +        fflush(stderr);
 +        fusion_flags = 0;
 +        ctx->num_additional_fused_ops = 0;
