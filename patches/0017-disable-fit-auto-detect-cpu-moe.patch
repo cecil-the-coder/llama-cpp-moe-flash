@@ -1,0 +1,68 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index cc423d3..0a5ac4f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1048,6 +1048,63 @@ common_init_result::common_init_result(common_params & params) :
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+ 
++    // Disable upstream fitting — binary search hangs for MoE models.
++    params.fit_params = false;
++
++    // Auto-detect: clear CPU_MOE override when model fits in GTT.
++    if (mparams.tensor_buft_overrides != NULL) {
++        bool has_cpu_moe = false;
++        for (const auto * p = mparams.tensor_buft_overrides; p->pattern != nullptr; p++) {
++            if (strstr(p->pattern, "ffn_") && strstr(p->pattern, "exps")) {
++                has_cpu_moe = true;
++                break;
++            }
++        }
++        if (has_cpu_moe) {
++            int64_t gtt_mb = 120000;
++            const char * gtt_env = getenv("LLAMA_FLASH_MOE_GTT_MB");
++            if (gtt_env) gtt_mb = atoll(gtt_env);
++
++            int64_t total_bytes = 0;
++            const std::string & mp = params.model.path;
++            try {
++                size_t sp = mp.find("-00001-of-");
++                if (sp != std::string::npos) {
++                    size_t of_pos = sp + 10;
++                    size_t dot_pos = mp.find('.', of_pos);
++                    int n_shards = std::stoi(mp.substr(of_pos, dot_pos - of_pos));
++                    for (int i = 1; i <= n_shards; i++) {
++                        std::string shard = mp;
++                        char num[16];
++                        snprintf(num, sizeof(num), "%05d", i);
++                        shard.replace(sp + 1, 5, num);
++                        if (std::filesystem::exists(shard)) {
++                            total_bytes += std::filesystem::file_size(shard);
++                        }
++                    }
++                } else {
++                    if (std::filesystem::exists(mp)) {
++                        total_bytes = std::filesystem::file_size(mp);
++                    }
++                }
++            } catch (...) {
++                total_bytes = 0;
++            }
++
++            int64_t total_mb = total_bytes / (1024 * 1024);
++            int64_t margin_mb = 8192;
++            if (total_mb > 0 && total_mb + margin_mb < gtt_mb) {
++                LOG_INF("%s: model %lld MB fits in GTT %lld MB, clearing CPU_MOE\n",
++                    __func__, (long long)total_mb, (long long)gtt_mb);
++                params.tensor_buft_overrides.clear();
++                mparams = common_model_params_to_llama(params);
++            } else if (total_mb > 0) {
++                LOG_INF("%s: model %lld MB exceeds GTT %lld MB, keeping CPU_MOE\n",
++                    __func__, (long long)total_mb, (long long)gtt_mb);
++            }
++        }
++    }
++
+     if (params.fit_params) {
+         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
+         llama_params_fit(params.model.path.c_str(), &mparams, &cparams,
