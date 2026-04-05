@@ -1,0 +1,53 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 0a5ac4f..246992f 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1099,7 +1099,9 @@ common_init_result::common_init_result(common_params & params) :
+                 params.tensor_buft_overrides.clear();
+                 mparams = common_model_params_to_llama(params);
+             } else if (total_mb > 0) {
+-                LOG_INF("%s: model %lld MB exceeds GTT %lld MB, keeping CPU_MOE\n",
++                LOG_INF("%s: model %lld MB exceeds GTT %lld MB, keeping CPU_MOE + enabling slot buffer\n",
++                // I11: Enable slot buffer mode for GPU expert matmul with small buffer
++                setenv("LLAMA_MOE_SLOT_BUFFER", "1", 1);
+                     __func__, (long long)total_mb, (long long)gtt_mb);
+             }
+         }
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 66e1152..0ea170e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -740,6 +740,9 @@ struct ggml_backend_sched {
+     int debug_realloc;
+     int debug_graph_size;
+     int debug_prev_graph_size;
++
++    // I11: Force slot buffer mode for >GTT models
++    bool force_slot_buffer;
+ };
+ 
+ #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+@@ -1548,7 +1551,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     // The descriptor binding is clamped to maxStorageBufferRange by the Vulkan
+                     // backend; the shader early-exits for experts with 0 token count.
+                     #define GGML_MOE_SLOT_BUFFER_SLOTS 32
+-                    const bool slot_remap_mode = (size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024;
++                    const bool slot_remap_mode = ((size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024) || sched->force_slot_buffer;
+                     // DEBUG: Log slot buffer condition
+                     fprintf(stderr, "[I11-DEBUG] MUL_MAT_ID: tensor=%s, n_expert=%ld, expert_size=%zu, total=%zu MB, slot_remap_mode=%d\n",
+                             input->name, (long)n_expert, expert_size, ((size_t)n_expert * expert_size) / (1024*1024), slot_remap_mode);
+@@ -1827,6 +1830,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ 
+     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
+     sched->op_offload = op_offload;
++    sched->force_slot_buffer = false;
++
++    // I11: Auto-activate slot buffer from env var (set by auto-detect for >GTT models)
++    const char * slot_env = getenv("LLAMA_MOE_SLOT_BUFFER");
++    if (slot_env && strcmp(slot_env, "1") == 0) {
++        sched->force_slot_buffer = true;
++        fprintf(stderr, "[I11] Slot buffer mode enabled for >GTT model\n");
++    }
+ 
+     ggml_backend_sched_reset(sched);
+ 
