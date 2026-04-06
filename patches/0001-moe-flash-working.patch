@@ -256,7 +256,7 @@ index 22c6569..77df25d 100644
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,46 +1645,150 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1645,154 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -275,6 +275,10 @@ index 22c6569..77df25d 100644
 -                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 +                    if (slot_remap_mode) {
 +                        const int n_slots = GGML_MOE_SLOT_BUFFER_SLOTS;
++
++                        // Flush pending async operations before allocating/writing to
++                        // persistent slot buffer. Prevents Vulkan queue overflow.
++                        ggml_backend_synchronize(split_backend);
 +
 +                        // Lazy-allocate persistent GPU slot buffer for this weight tensor
 +                        auto & slot_buf = persistent_slot_buffers[input->data];
@@ -436,7 +440,7 @@ index 22c6569..77df25d 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1579,4 +1800,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1579,4 +1810,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          }
 
 +        // Apply persistent slot buffer overrides: set ne[2]=N_SLOTS before dispatch
@@ -449,7 +453,7 @@ index 22c6569..77df25d 100644
 +
          if (!sched->callback_eval) {
              enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-@@ -1618,4 +1847,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1618,4 +1857,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          }
 
 +        // Restore slot buffer overrides so graph builder sees original ne[2]
@@ -461,7 +465,7 @@ index 22c6569..77df25d 100644
 +
          // record the event of this copy
          if (split->n_inputs > 0) {
-@@ -1824,6 +2063,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1824,6 +2073,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
