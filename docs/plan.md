@@ -2,9 +2,9 @@
 
 ## Current State (Updated 2026-04-03)
 
-**Production image: `d54393c`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `74a5930`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
 
-Patches applied: 0001 (with stable cache key + force-offload guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
+Patches applied: 0001 (core MoE flash + expert cache stable key + sync skip + force-offload guard), 0014 (vec-path byte-range overlap check), 0017 (disable upstream -fit + auto-detect CPU_MOE).
 
 Single-backend architecture with auto-detect `--cpu-moe`:
 - Models that fit in GTT (120 GB): auto-detect clears CPU_MOE, full GPU path
@@ -14,7 +14,7 @@ Single-backend architecture with auto-detect `--cpu-moe`:
 |---|---|---|---|---|
 | GLM-4-7-Flash | 17 GB | **~50** | full GPU offload | Coherent |
 | Qwen3-235B Q2_K | 80 GB | **20.0** | full GPU offload (no expert cache needed) | Coherent |
-| DeepSeek-R1-0528 Q2_K | 228 GB | **3.9** | mmap experts + expert GPU cache | Coherent (2.2x baseline) |
+| DeepSeek-R1-0528 Q2_K | 228 GB | **4.1** | mmap experts + expert GPU cache + sync skip | Coherent (2.3x baseline) |
 
 **I12 benchmark**: Stock Vulkan 20.7 t/s, moe-flash 20.0 t/s, ik_llama.cpp CPU-only 11.5 t/s (Qwen3).
 
@@ -427,7 +427,7 @@ Root causes found and fixed:
 2. gallocr corruption from ggml_set_input/output (patches 0015/0016 removed)
 3. Flux YAML duplicate key
 
-#### Phase 2: Expert GPU Cache (image `d54393c` on b8664)
+#### Phase 2: Expert GPU Cache + Sync Skip (image `74a5930` on b8664)
 
 **Cache mechanism**:
 - Changed `expert_cache` key from `input_cpy` (tensor struct, changes each token) to `input->data` (source weight pointer, stable)
@@ -437,15 +437,22 @@ Root causes found and fixed:
 
 **Key finding**: flash-moe `async_prefetch` bypasses the scheduler's expert copy path
 entirely (disk -> GPU via io_uring). The expert GPU cache only works on the standard
-CPU -> GPU copy path. Disabling flash-moe and using the cache is faster (3.9 vs 2.3 t/s).
+CPU -> GPU copy path. Disabling flash-moe and using the cache is faster (4.1 vs 2.3 t/s).
 
-**Production patch stack** (image `d54393c`):
-- 0001: Core MoE flash + stable cache key + force-offload guard
-- 0014: Vec-path runtime aliasing check (byte-range overlap)
-- 0017: Auto-detect CPU_MOE + disable upstream `llama_params_fit`
+**Optimizations applied in 74a5930**:
+1. Expert GPU cache (stable cache key: `input->data` instead of `input_cpy`)
+2. Sync skip for fully-cached expert tensors (skip IDS read + expert copy + synchronization)
+3. b8664 rebase (Vulkan improvements)
+4. Auto-detect CPU_MOE (clears for models that fit in GTT)
+5. Flash-moe DISABLED for DeepSeek (expert cache outperforms async prefetch)
+
+**Production patch stack** (image `74a5930`):
+- 0001: Core MoE flash + expert cache (stable key) + sync skip + force-offload guard
+- 0014: Vec-path runtime byte-range overlap check
+- 0017: Disable upstream -fit + auto-detect CPU_MOE
 
 **Performance**:
-- DeepSeek-R1-0528 Q2_K (228 GB): **3.9 t/s** steady-state (peak 4.7), **2.2x over 1.8 t/s baseline**
+- DeepSeek-R1-0528 Q2_K (228 GB): **4.1 t/s** steady-state (peak 4.7), **2.3x over 1.8 t/s baseline**
 - Qwen3-235B Q2_K (80 GB): 20 t/s, unchanged (auto-detect, no expert cache needed)
 - GLM-4-7-Flash (17 GB): ~50 t/s, full GPU
 - Flash-moe DISABLED for DeepSeek (expert GPU cache outperforms async prefetch)
@@ -540,7 +547,7 @@ Confirmed on both Strix Halo (shadow) and Strix Point (local):
 ## Architecture
 
 ```
-Single backend: moe-flash-cpumoe (CPU_MOE=1, image d54393c)
+Single backend: moe-flash-cpumoe (CPU_MOE=1, image 74a5930)
 
 llama_params_fit auto-detect:
   ├── Model fits in device memory? → Clear CPU_MOE override
@@ -550,8 +557,9 @@ llama_params_fit auto-detect:
       ├── Model ≤ RAM? → Pinned alloc (ggml_vk_host_malloc + copy)
       └── Model > RAM? → mmap-wrap (demand-paged)
                           + Expert GPU cache (stable key, ~100% hit after 32 tokens)
+                          + Sync skip for fully-cached expert tensors
                           + Partial prefetch (MADV_WILLNEED, up to MemAvail - 8G)
-                          + MADV_RANDOM + MADV_HUGEPAGE → 3.9 t/s (DeepSeek)
+                          + MADV_RANDOM + MADV_HUGEPAGE → 4.1 t/s (DeepSeek)
 ```
 
 ## Completed Phases

@@ -5,20 +5,21 @@ targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
 ## Status (2026-04-03)
 
-**Production image: `d54393c`** on b8664 -- Two-tier expert GPU cache, all models coherent.
+**Production image: `74a5930`** on b8664 -- Expert GPU cache + sync skip, all models coherent.
 
-Patches applied: 0001 (with stable cache key + force-offload guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
+Patches applied: 0001 (core MoE flash + expert cache stable key + sync skip + force-offload guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
 
-**Two-tier expert GPU cache (I11)**:
-- Expert cache key changed from `input_cpy` (tensor struct, changes each token) to `input->data` (source weight pointer, stable across tokens)
+**Expert GPU cache + sync skip (I11)**:
+- Expert cache key: `input->data` (source weight pointer, stable across tokens)
 - GPU buffer contents persist across tokens (Vulkan reset is no-op, gallocr offsets deterministic)
+- Sync skip: fully-cached expert tensors skip IDS read, expert copy, and all synchronization (~50-100us saved per MoE split)
 - Cache warmup: ~5 tokens to ~80% hit rate, ~32 tokens for ~100%
 - Zero additional memory -- uses existing gallocr buffer allocation
-- Flash-moe DISABLED for DeepSeek: standard CPU->GPU copy path with expert cache outperforms async prefetch (3.9 vs 2.3 t/s)
+- Flash-moe DISABLED for DeepSeek: standard CPU->GPU copy path with expert cache outperforms async prefetch (4.1 vs 2.3 t/s)
 
 **I12 benchmark (complete)**:
 - Stock Vulkan: 20.7 t/s (Qwen3-235B Q2_K)
-- moe-flash: 20.0 t/s (Qwen3), 3.9 t/s (DeepSeek with expert GPU cache)
+- moe-flash: 20.0 t/s (Qwen3), 4.1 t/s (DeepSeek with expert GPU cache + sync skip)
 - ik_llama.cpp CPU-only: 11.5 t/s (Qwen3), 1.5 t/s (DeepSeek without flash_attn)
 
 ---
@@ -86,24 +87,24 @@ territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB
 |---|---|---|---|---|---|
 | GLM-4-7-Flash | 17 GB | 125 GB | Full GPU (auto-detect) | **~50** | Coherent |
 | Qwen3-235B Q2_K | 80 GB | 125 GB | Full GPU (auto-detect) | **20.0** | Coherent |
-| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | CPU MoE + expert GPU cache | **3.9** | Coherent (2.2x over 1.8 baseline) |
+| DeepSeek-R1-0528 Q2_K | 228 GB | 125 GB | CPU MoE + expert GPU cache + sync skip | **4.1** | Coherent (2.3x over 1.8 baseline) |
 
 Auto-detect clears CPU_MOE for models that fit in GTT (120 GB). DeepSeek uses
-CPU MoE path with expert GPU cache (flash-moe disabled -- cache outperforms async prefetch).
+CPU MoE path with expert GPU cache + sync skip (flash-moe disabled -- cache outperforms async prefetch).
 
 ---
 
-### Patch Status (image `d54393c` on b8664)
+### Patch Status (image `74a5930` on b8664)
 
 | Patch | Status | Purpose |
 |---|---|---|
-| 0001 | Applied | Core MoE flash + stable cache key + force-offload guard |
-| 0014 | Applied | Vec-path runtime aliasing check (byte-range overlap) |
-| 0017 | Applied | Auto-detect CPU_MOE + disable upstream `llama_params_fit` |
+| 0001 | Applied | Core MoE flash + expert cache (stable key) + sync skip + force-offload guard |
+| 0014 | Applied | Vec-path runtime byte-range overlap check |
+| 0017 | Applied | Disable upstream -fit + auto-detect CPU_MOE |
 
 **Key finding**: flash-moe async_prefetch bypasses the scheduler's expert copy path
 (disk -> GPU via io_uring). The expert GPU cache only works on the standard CPU -> GPU
-copy path. Disabling flash-moe and using the cache is faster (3.9 vs 2.3 t/s).
+copy path. Disabling flash-moe and using the cache is faster (4.1 vs 2.3 t/s).
 
 ## Documents
 
