@@ -149,7 +149,7 @@ index 22c6569..77df25d 100644
 +        std::vector<int64_t> slot_lru;        // [n_slots] → timestamp
 +        int64_t clock = 0;
 +    };
-+    static std::unordered_map<const ggml_tensor *, moe_slot_cache> slot_caches;
++    static std::unordered_map<const void *, moe_slot_cache> slot_caches;
 +
 +    // I10b: Cache original (unrewritten) IDS values per ids_tensor.
 +    // When slot buffer mode rewrites IDS with slot indices, other projections
@@ -302,7 +302,7 @@ index 22c6569..77df25d 100644
 +
 +                        slot_overrides.push_back(ovr);
 +
-+                        auto & sc = slot_caches[input_cpy];
++                        auto & sc = slot_caches[input->data];
 +                        if (sc.n_slots == 0) {
 +                            sc.n_slots = n_slots;
 +                            sc.expert_to_slot.assign(n_expert, -1);
