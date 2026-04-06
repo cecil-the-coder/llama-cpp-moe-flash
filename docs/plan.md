@@ -497,12 +497,18 @@ Pool stats: `layer_hits=0, layer_misses=30926, evictions=30911, expert_hit_rate=
 only preserves layers 79-93. Token 2 starts at layer 0, immediately evicting layer 79.
 No layer survives across tokens regardless of pool size < 94.
 
-**Key insight**: Pool-based caching fundamentally cannot help with 94 MoE layers and
-sequential execution. Would need P=94 (~141 GB) to cache everything, which exceeds
-available RAM. The only viable path for GPU MoE with >GTT models is upstream #20757
-(two-tier GPU+RAM cache with proper shader support).
+**Pool investigation concluded**: Pool-based caching fundamentally cannot help with 94 MoE
+layers and sequential execution. Would need P=94 (~141 GB of full-expert buffers) to cache
+everything — exceeds available RAM.
 
-**Status**: COMPLETE — per-layer grouping verified, no performance improvement
+**Viable remaining path: Slot remapping (N_SLOTS=32)**. Instead of caching full 128-expert
+buffers, allocate 32-slot compact buffers per projection (~376 MB/layer). With P=94 layers
+that's ~35 GB — feasible on 128 GB RAM. Shader analysis of `mul_mm.comp`, `mul_mat_vec_base.glsl`,
+and `count_experts.comp` confirms correctness with `ne[2]=32` and slot-remapped IDS. Previous
+I10b/I11 failures were from gallocr corruption (ggml_set_input/output), not shader issues.
+The ne[2] override now happens on persistent pool tensors outside gallocr.
+
+**Status**: COMPLETE — pool approach exhausted, slot remapping identified as next step
 
 ### I12. ik_llama.cpp Benchmark — TIER 1
 

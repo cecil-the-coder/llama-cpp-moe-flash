@@ -51,7 +51,8 @@ not graph splits -- it is the CPU compute for expert weights.
 
 ### What would actually help
 
-1. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul for >GTT models with shader support. Expected 10-15 t/s.
+1. **Slot remapping (N_SLOTS=32)**: Override `ne[2]=32` on persistent pool tensors, rewrite IDS to slot indices. Shader analysis confirms correctness. ~35 GB for P=94 (all layers cached) fits in 128 GB RAM. Expected 10-15 t/s.
+2. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul with shader support. 14 t/s PoC.
 3. **Better CPU kernels**: ik_llama.cpp's FlashMLA + fused MoE FFN, or Intel AMX support. Could give 3-5x CPU speedup.
 4. **Rebase to newer llama.cpp**: As upstream MoE work lands (expert caching, better CPU kernels).
 5. **Hardware**: Faster NVMe (Gen5), more RAM, or a system with AMX support.
@@ -139,9 +140,16 @@ Force-offload with per-projection pool is slower than CPU MoE due to 0% cache hi
 | 0014 | Applied | Vec-path runtime byte-range overlap check |
 | 0017 | Applied | Disable upstream -fit + auto-detect CPU_MOE |
 
-**Key finding**: Buffer pool has 0% hit rate regardless of grouping strategy. Per-projection
-(282 tensors, 9 entries) and per-layer (94 layers, 15 entries) both fail because sequential
-execution defeats LRU. Force-offload (1.4 t/s) is slower than CPU MoE (6-7 t/s).
+**Pool investigation concluded**: Pool caching fundamentally cannot help with sequential
+layer execution. 94 MoE layers x 3 projections = 282 entries needing ~141 GB of buffers to
+cache all layers. No feasible pool size achieves cross-token hits. CPU MoE (4-7 t/s) remains
+the production config for >GTT models.
+
+**Remaining viable path**: Slot remapping with N_SLOTS=32 reduces buffer memory from 141 GB
+to ~35 GB (P=94) or ~5.6 GB (P=15). Requires teaching the Vulkan MUL_MAT_ID shader to use
+remapped expert IDs via `ne[2]=32` override on pool tensors (outside gallocr). Shader analysis
+confirms feasibility: batch path uses `gl_WorkGroupID.z` (0..n_as-1), vec path reads from IDS
+tensor, count_experts dispatches `n_as` workgroups. All correct with slot-remapped IDS.
 
 ## Documents
 

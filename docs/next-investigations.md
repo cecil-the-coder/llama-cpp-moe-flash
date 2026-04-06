@@ -1,6 +1,6 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: Per-layer buffer pool grouping tested (363a6d9). Still 0% hit rate — 94 layers with 15 pool entries means no cross-token survival. Force-offload stuck at 1.4 t/s. (2026-04-03)
+**Status**: Pool investigation concluded. Pool caching cannot work with sequential layer execution — needs P=94 (~141 GB) to cache all layers. Slot remapping (N_SLOTS=32) is the only viable path to GPU MoE for >GTT models. Shader analysis confirms feasibility. (2026-04-03)
 
 **Production Image**: latest main on b8664
 
@@ -22,7 +22,7 @@ gate/up/down of the SAME layer all have different keys and evict each other.
 - I/O optimizations (io_uring, posix_fadvise, registered buffers, hugepages) -- no measurable benefit
 - Expert GPU cache + sync skip -- already at ~100% hit rate after 32 tokens
 - Flash-moe async prefetch -- slower than cached path for DeepSeek (2.3 vs 4.1 t/s)
-- Slot buffer for GPU expert matmul -- shader can't handle remapped IDS, 3 attempts failed
+- Slot buffer for GPU expert matmul -- previous attempts failed from gallocr corruption, NOT shader issues. Shader analysis confirms slot remapping is feasible with ne[2]=32 on pool tensors.
 - Graph split reduction -- splits are from CPU<->GPU backend transitions, not optimizable
 - Per-projection buffer pool -- 0% hit rate, 282 tensors overwhelm 9 entries
 - Per-layer buffer pool grouping -- still 0% hit rate, 94 layers > 15 pool entries, LRU doesn't help with sequential execution
@@ -44,11 +44,11 @@ gate/up/down of the SAME layer all have different keys and evict each other.
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
+| **Slot remapping (N_SLOTS=32)** | Very High | High | Ready to implement | Shader analysis confirms feasibility; ~35 GB for P=94 |
 | **Per-layer pool grouping** | None | Medium | Complete | 0% hit rate: 94 layers > 15 entries, sequential execution defeats LRU |
 | **Upstream rebase tracking** | High | Low | Ongoing | Track #20757, new llama.cpp releases |
 | **CPU kernel improvement** | High | High | Not started | Port ik_llama.cpp fused MoE FFN or wait for AMX |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Test if BF16 AVX-512 beats Q4_0 AVX2 |
-| **Slot buffer shader mod** | High | Very High | De-prioritized | Wait for upstream #20757 |
 | **I7** - Context Scaling | Low | Low | Not started | Not the bottleneck |
 | **I8** - Batch Size Tuning | Low | Low | Not started | Minor |
 
@@ -56,15 +56,41 @@ gate/up/down of the SAME layer all have different keys and evict each other.
 
 ## TIER 1: Recommended Next Steps
 
-### 0. Per-Layer Buffer Pool Grouping (COMPLETE — no improvement)
+### 0. Slot Remapping with N_SLOTS=32 (READY TO IMPLEMENT)
 
-**Goal**: Fix the 0% cache hit rate by grouping gate/up/down projections into layer-level pool entries.
+**Goal**: GPU MoE for >GTT models by remapping expert IDs to a compact 32-slot buffer.
 
-**Implementation** (image `363a6d9`): Layer pool entries with 3 projection sub-entries. Same-layer detection via IDS tensor pointer. Pool size = `GGML_MOE_POOL_LAYERS` (default 15).
+**Why pool caching failed**: 94 layers x 3 projections = 282 entries needing ~141 GB. Sequential execution (layer 0,1,...,93) defeats LRU. Per-layer grouping (15 entries) still 0% hit rate.
 
-**Result**: Still 0% hit rate. With 94 MoE layers and 15 pool entries, the sequential execution pattern (layer 0,1,...,93) means the last 15 layers survive from one token but get immediately evicted when the next token starts at layer 0. Q4_K_M still 1.4 t/s.
+**Slot remapping approach**:
+1. Allocate persistent pool buffer: 32 slots x expert_size per projection (~376 MB/layer)
+2. Copy 8 used experts to LRU slots 0..31 in persistent buffer
+3. Override `ne[2]=32` on pool tensor (outside gallocr, no graph corruption)
+4. Rewrite IDS tensor: expert_id -> slot_idx
+5. Dispatch MUL_MAT_ID with n_as=32
 
-**Key insight**: Pool-based caching fundamentally cannot work with sequential layer execution unless P >= N_layers (94). That would require ~141 GB of GPU buffers — more than available RAM. The only viable path for GPU MoE on >GTT models is upstream #20757 (two-tier cache with shader support).
+**Shader analysis confirms correctness**:
+- **Batch path** (`mul_mm.comp`): `expert_idx = gl_WorkGroupID.z` (0..n_as-1), `pos_a = expert_idx * batch_stride_a`. With n_as=32, only 32 workgroups dispatched. CORRECT.
+- **Vec path** (`mul_mat_vec_base.glsl`): `expert_id = data_ids[...]`, `a_offset = expert_id * batch_stride_a`. With slot-remapped IDS (values 0..31), accesses slots. CORRECT.
+- **Count experts** (`count_experts.comp`): `expert_id = gl_WorkGroupID.x` (0..n_as-1), counts `data_a[...] == expert_id`. With n_as=32, counts slots. CORRECT.
+- **Expert count buffer**: `sizeof(uint32_t) * n_as = 128 bytes`. CORRECT.
+- **Output shape**: MUL_MAT_ID output shape from ne01/IDS, NOT ne[2]. No corruption.
+- **supports_op**: No ne[2] checks that would reject n_as=32. CONFIRMED.
+
+**Previous failures were NOT shader issues**: The I11 SIGSEGV came from gallocr corruption when `ggml_set_input/output` was applied to graph tensors. The ne[2] override now happens on persistent pool tensors OUTSIDE gallocr.
+
+**Memory budget (P=94, all layers cached)**:
+- Per layer: 32 x (3.4 MB gate + 3.4 MB up + 5 MB down) = ~376 MB
+- Total: 94 x 376 MB = ~35 GB GPU buffers (UMA = RAM)
+- System: 35 GB pool + 10 GB attention + 2 GB KV + 1 GB compute = ~48 GB
+- Remaining: ~80 GB for mmap page cache. FEASIBLE on 128 GB.
+
+**Effort**: High (pool tensor management, IDS rewrite, ne[2] override plumbing)
+**Impact**: Very High (expected 10-15 t/s, 3x current CPU MoE)
+
+### 0b. Per-Layer Buffer Pool Grouping (COMPLETE — no improvement)
+
+**Result**: 0% hit rate. 94 layers > 15 pool entries, sequential execution defeats LRU.
 
 ### 1. Track Upstream llama.cpp MoE Work
 
@@ -94,13 +120,13 @@ gate/up/down of the SAME layer all have different keys and evict each other.
 
 ## TIER 2: De-prioritized
 
-### Slot Buffer Shader Modification
+### Slot Buffer Shader Modification (SUPERSEDED by Slot Remapping above)
 
-**Why de-prioritized**: Three attempts failed (I10b). The MUL_MAT_ID shader uses expert IDs
-for data addressing throughout -- remapping IDS requires deep shader modification that
-conflicts with graph shape inference, KV cache setup, and shared IDS tensors across
-gate/up/down projections. Upstream #20757 is better positioned to solve this correctly
-because it can modify the shader, scheduler, and allocator together.
+**Previous assessment was wrong**: The shader does NOT need modification. Detailed analysis
+of `mul_mm.comp`, `mul_mat_vec_base.glsl`, and `count_experts.comp` confirms that with
+`ne[2]=32` and slot-remapped IDS values (0..31), the existing shaders produce correct results.
+The previous failures came from gallocr corruption (ggml_set_input/output on graph tensors),
+not from shader incompatibility. Moved to TIER 1 as "Slot Remapping".
 
 ### Graph Split Reduction
 
@@ -129,7 +155,8 @@ If yes:
     → Focus on deploying more <=GTT models (these are production-ready)
 
 If no:
-    → Upstream #20757 is the only realistic path to 10+ t/s on this hardware
+    → Slot remapping (N_SLOTS=32): shader-verified, ~35 GB feasible, expected 10-15 t/s
+    → Upstream #20757 as alternative if slot remapping hits unforeseen issues
     → CPU kernel improvements (I13, fused MoE) might reach 8-12 t/s
     → Hardware with Intel AMX would reach 28 t/s (KTransformers benchmark)
 ```
