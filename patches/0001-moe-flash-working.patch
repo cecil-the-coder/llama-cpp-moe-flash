@@ -86,17 +86,14 @@ index 22c6569..77df25d 100644
      char * context_buffer;
      size_t context_buffer_size;
  
-@@ -834,6 +841,20 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -834,6 +841,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                          return b;
                      }
                  }
-+                // I10b: Force-offload MUL_MAT_ID to GPU when expert tensor fits
-+                // within maxStorageBufferRange (~4 GiB). Bypasses offload_op which
-+                // rejects bs=1 (ne[2]=1 < min_batch_size=32). Only activates when
-+                // supports_op passes AND expert weights are NOT on CPU (--cpu-moe).
-+                // With --cpu-moe, expert weights are intentionally on CPU host buffer
-+                // and should NOT be force-offloaded to GPU.
-+                if (tensor->op == GGML_OP_MUL_MAT_ID && !ggml_backend_buffer_is_host(src->buffer)) {
++                // Force-offload MUL_MAT_ID to GPU. Expert weights may be on CPU
++                // (--cpu-moe) but the persistent slot buffer handles GPU-side copies
++                // via slot_remap_mode. Bypasses offload_op which rejects bs=1.
++                if (tensor->op == GGML_OP_MUL_MAT_ID) {
 +                    for (int b = 0; b < src_backend_id; b++) {
 +                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
 +                            SET_CAUSE(tensor, "1.moe");
@@ -202,7 +199,7 @@ index 22c6569..77df25d 100644
 +                    // The descriptor binding is clamped to maxStorageBufferRange by the Vulkan
 +                    // backend; the shader early-exits for experts with 0 token count.
 +                    #define GGML_MOE_SLOT_BUFFER_SLOTS 32
-+                    const bool slot_remap_mode = (size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024;
++                    const bool slot_remap_mode = ((size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024) || ggml_backend_buffer_is_host(input->buffer);
 +                    // DEBUG: Log slot buffer condition
 +                    fprintf(stderr, "[I11-DEBUG] MUL_MAT_ID: tensor=%s, n_expert=%ld, expert_size=%zu, total=%zu MB, slot_remap_mode=%d\n",
 +                            input->name, (long)n_expert, expert_size, ((size_t)n_expert * expert_size) / (1024*1024), slot_remap_mode);
