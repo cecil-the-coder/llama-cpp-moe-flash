@@ -130,7 +130,7 @@ index 22c6569..fbe5373 100644
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-@@ -1450,7 +1477,54 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1450,7 +1477,80 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -231,16 +231,54 @@ index 22c6569..fbe5373 100644
                      if (ids_tensor != prev_ids_tensor) {
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-@@ -1522,46 +1600,86 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1600,137 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
- 
+
                          prev_ids_tensor = ids_tensor;
 +
 +                        if (sched->callback_expert_copy) {
 +                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
 +                        }
                      }
- 
+
+-                    // group consecutive experts and copy them together
+-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+-                        const size_t expert_offset = first_id * expert_size;
+-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+-                        const size_t padding = std::min<size_t>(expert_size, 512);
+-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+-
+-                        ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
+-                    };
+-
+-                    int id = 0;
+-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+-                        id++;
+-                    }
+-                    int32_t first_id = id;
+-                    int32_t last_id = first_id;
+-
+-                    for (++id; id < n_expert; ++id) {
+-                        if (!ggml_bitset_get(used_ids.data(), id)) {
+-                            continue;
+-                        }
+-
+-                        if (id == last_id + 1) {
+-                            last_id = id;
+-                            continue;
+-                        }
+-
+-                        copy_experts(first_id, last_id);
+-
+-                        first_id = id;
+-                        last_id = id;
+-                    }
+-                    copy_experts(first_id, last_id);
 +                    // --- Per-layer GPU buffer pool lookup ---
 +                    // Step 1: Find or create layer entry using IDS tensor grouping
 +                    layer_pool_entry * layer_entry = nullptr;
