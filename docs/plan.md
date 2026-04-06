@@ -465,6 +465,27 @@ CPU -> GPU copy path. Disabling flash-moe and using the cache is faster (4.1 vs 
 
 **Status**: COMPLETE
 
+#### Phase 3: Persistent Buffer Pool (current main)
+
+**Mechanism**: Per-projection GPU buffer pool with LRU eviction. Each pool entry holds
+one buffer keyed by `input->data` (weight tensor data pointer). Pool lives outside
+gallocr so buffers persist across tokens.
+
+**Finding: 0% cache hit rate.** The pool has 9 entries (default `GGML_MOE_POOL_ENTRIES=9`)
+but there are 282 unique weight tensors (94 MoE layers x 3 projections: gate, up, down).
+Each projection has a different `input->data` key, so within-layer sharing is impossible.
+Every projection evicts a different projection's entry.
+
+**Force-offload result**: Qwen3-235B Q4_K_M at **1.4 t/s** — slower than CPU MoE at 6-7 t/s.
+The overhead is dominated by expert copy bandwidth: 8 experts x 3 projections x 94 layers
+x 3.5 MB = 7.9 GB per token at ~15 GB/s = 527 ms (74% of the 714 ms token time).
+
+**Next step**: Per-layer pool grouping. Group gate/up/down into layer-level entries,
+reducing unique entries from 282 to 94. With 15 layer entries (~22.5 GB), 16% of layers
+persist cross-token. Expected to improve force-offload from 1.4 to ~2-3 t/s.
+
+**Status**: IN PROGRESS — per-layer grouping implementation
+
 ### I12. ik_llama.cpp Benchmark — TIER 1
 
 **Source**: [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)

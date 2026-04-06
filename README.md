@@ -5,9 +5,9 @@ targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
 ## Status (2026-04-03)
 
-**Production image: `4cb7bef`** on b8664 -- Expert GPU cache + sync skip, all models coherent.
+**Production image: latest main** on b8664 -- Persistent buffer pool + force-offload.
 
-Patches applied: 0001 (core MoE flash + expert cache stable key + sync skip + force-offload guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
+Patches applied: 0001 (core MoE flash + persistent buffer pool + sync skip + force-offload guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
 
 ### What works well (models that fit in GTT)
 
@@ -19,8 +19,13 @@ clears CPU_MOE, no special configuration needed. These are production-ready.
 
 ### What's improved but still limited (models exceeding GTT)
 
-DeepSeek-R1-0528 Q2_K (228 GB): **4.1 t/s** steady-state (was 1.8 t/s baseline, 2.3x improvement).
-The improvement comes from: b8664 Vulkan improvements + NVMe page cache warmup + expert GPU cache + sync skip.
+- DeepSeek-R1-0528 Q2_K (228 GB): **~4 t/s** with CPU MoE (can't test force-offload -- 128 GB RAM too small for 228 GB model copy buffers)
+- Qwen3-235B Q4_K_M (133 GB): **1.4 t/s** with force-offload (slower than CPU MoE ~6-7 t/s)
+
+**Force-offload finding:** The persistent buffer pool has **0% cache hit rate** with
+the current per-projection design. 282 unique weight tensors (94 layers x 3 projections:
+gate/up/down) overwhelm the 9-entry pool. Within-layer sharing doesn't work because
+gate, up, and down are different tensors with different `input->data` keys.
 
 **The real bottleneck is CPU MoE matmul.** With `--cpu-moe`, expert matrix multiplications
 run on CPU (AVX-512 on Zen 5). This is inherently slower than GPU compute. For comparison,
@@ -30,6 +35,10 @@ not graph splits -- it is the CPU compute for expert weights.
 
 ### What didn't work as hoped
 
+- **Per-projection buffer pool**: 9 pool entries for 282 unique tensors = 0% hit rate.
+  Every projection evicts the previous one. Need per-layer grouping (282 -> 94 entries).
+- **Force-offload at 1.4 t/s**: Slower than CPU MoE (6-7 t/s) due to pool thrashing.
+  Expert copy bandwidth dominates: 8 experts x 3 projections x 94 layers x 3.5 MB = 7.9 GB/token.
 - **I11 slot buffer / dynamic expert import**: Infrastructure built but the Vulkan
   MUL_MAT_ID shader can't handle slot-remapped expert IDS. Patches 0015/0016/0019
   removed from production. Upstream #20757 (two-tier cache) is the right solution.
@@ -41,10 +50,12 @@ not graph splits -- it is the CPU compute for expert weights.
 
 ### What would actually help
 
-1. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul for >GTT models with shader support. Expected 10-15 t/s.
-2. **Better CPU kernels**: ik_llama.cpp's FlashMLA + fused MoE FFN, or Intel AMX support. Could give 3-5x CPU speedup.
-3. **Rebase to newer llama.cpp**: As upstream MoE work lands (expert caching, better CPU kernels).
-4. **Hardware**: Faster NVMe (Gen5), more RAM, or a system with AMX support.
+1. **Per-layer buffer pool grouping**: Group gate/up/down into layer-level pool entries.
+   With 15 layer entries (~22.5 GB), cache 16% of layers cross-token. Expected ~2 t/s improvement on force-offload.
+2. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul for >GTT models with shader support. Expected 10-15 t/s.
+3. **Better CPU kernels**: ik_llama.cpp's FlashMLA + fused MoE FFN, or Intel AMX support. Could give 3-5x CPU speedup.
+4. **Rebase to newer llama.cpp**: As upstream MoE work lands (expert caching, better CPU kernels).
+5. **Hardware**: Faster NVMe (Gen5), more RAM, or a system with AMX support.
 
 ---
 
@@ -111,25 +122,27 @@ territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB
 |---|---|---|---|---|---|
 | GLM-4-7-Flash | 17 GB | Yes | Full GPU (auto-detect) | **~50** | Production-ready |
 | Qwen3-235B Q2_K | 80 GB | Yes | Full GPU (auto-detect) | **20.0** | Production-ready |
-| DeepSeek-R1-0528 Q2_K | 228 GB | No | CPU MoE + expert GPU cache | **4.1** | Coherent, CPU-bottlenecked |
+| Qwen3-235B Q4_K_M | 133 GB | No | Force-offload (persistent pool) | **1.4** | Pool thrashing (0% hit) |
+| Qwen3-235B Q4_K_M | 133 GB | No | CPU MoE | **~6-7** | Coherent, CPU-bottlenecked |
+| DeepSeek-R1-0528 Q2_K | 228 GB | No | CPU MoE + expert GPU cache | **~4** | Coherent, CPU-bottlenecked |
 
 **Key insight**: Models that fit in GTT (<=120 GB) are production-ready at full GPU speed.
 Models exceeding GTT are bottlenecked by CPU expert matmul, not by I/O or memory copies.
+Force-offload with per-projection pool is slower than CPU MoE due to 0% cache hit rate.
 
 ---
 
-### Patch Status (image `4cb7bef` on b8664)
+### Patch Status (latest main on b8664)
 
 | Patch | Status | Purpose |
 |---|---|---|
-| 0001 | Applied | Core MoE flash + expert cache (stable key) + sync skip + force-offload guard |
+| 0001 | Applied | Core MoE flash + persistent buffer pool + sync skip + force-offload guard |
 | 0014 | Applied | Vec-path runtime byte-range overlap check |
 | 0017 | Applied | Disable upstream -fit + auto-detect CPU_MOE |
 
-**Key finding**: The CPU MoE matmul is the dominant bottleneck for >GTT models.
-Flash-moe async prefetch was disabled because the expert GPU cache on the standard
-CPU -> GPU copy path is faster (4.1 vs 2.3 t/s). Further I/O or copy optimizations
-have diminishing returns -- the compute itself is the limiting factor.
+**Key finding**: The persistent buffer pool has 0% hit rate with 9 entries and 282
+unique weight tensors. Force-offload (1.4 t/s) is slower than CPU MoE (6-7 t/s).
+Next step: per-layer pool grouping to reduce unique entries from 282 to 94.
 
 ## Documents
 

@@ -1,8 +1,8 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: All active investigations complete. DeepSeek 4.1 t/s (2.3x baseline), CPU MoE matmul is the bottleneck. (2026-04-03)
+**Status**: Per-layer buffer pool grouping in progress. Persistent buffer pool has 0% hit rate with per-projection design (282 tensors, 9 entries). Force-offload 1.4 t/s < CPU MoE 6-7 t/s. (2026-04-03)
 
-**Production Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:4cb7bef` (b8664)
+**Production Image**: latest main on b8664
 
 ---
 
@@ -10,9 +10,13 @@
 
 **Models that fit in GTT (<=120 GB)**: Production-ready. 20-50 t/s, full GPU, no issues.
 
-**Models exceeding GTT (>120 GB)**: 4.1 t/s on DeepSeek-R1-0528 (228 GB). The bottleneck
-is CPU expert matmul (AVX-512 on Zen 5). KTransformers achieves 28 t/s with Intel AMX --
-7x faster expert matmul. No amount of I/O, copy, or prefetch optimization will close this gap.
+**Models exceeding GTT (>120 GB)**:
+- Qwen3-235B Q4_K_M (133 GB): 1.4 t/s force-offload, ~6-7 t/s CPU MoE
+- DeepSeek-R1-0528 Q2_K (228 GB): ~4 t/s CPU MoE (can't test force-offload -- 128 GB RAM too small)
+
+**Persistent buffer pool finding**: 0% cache hit rate. 282 unique weight tensors
+(94 layers x 3 projections) with only 9 pool entries. Per-projection keying means
+gate/up/down of the SAME layer all have different keys and evict each other.
 
 **What we've exhausted**:
 - I/O optimizations (io_uring, posix_fadvise, registered buffers, hugepages) -- no measurable benefit
@@ -20,6 +24,9 @@ is CPU expert matmul (AVX-512 on Zen 5). KTransformers achieves 28 t/s with Inte
 - Flash-moe async prefetch -- slower than cached path for DeepSeek (2.3 vs 4.1 t/s)
 - Slot buffer for GPU expert matmul -- shader can't handle remapped IDS, 3 attempts failed
 - Graph split reduction -- splits are from CPU<->GPU backend transitions, not optimizable
+- Per-projection buffer pool -- 0% hit rate, 282 tensors overwhelm 9 entries
+
+**Active work**: Per-layer buffer pool grouping (reduce 282 entries to 94 layer entries)
 
 ---
 
@@ -38,6 +45,7 @@ is CPU expert matmul (AVX-512 on Zen 5). KTransformers achieves 28 t/s with Inte
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
+| **Per-layer pool grouping** | Medium | Medium | In progress | Group gate/up/down, reduce 282->94 entries |
 | **Upstream rebase tracking** | High | Low | Ongoing | Track #20757, new llama.cpp releases |
 | **CPU kernel improvement** | High | High | Not started | Port ik_llama.cpp fused MoE FFN or wait for AMX |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Test if BF16 AVX-512 beats Q4_0 AVX2 |
@@ -48,6 +56,21 @@ is CPU expert matmul (AVX-512 on Zen 5). KTransformers achieves 28 t/s with Inte
 ---
 
 ## TIER 1: Recommended Next Steps
+
+### 0. Per-Layer Buffer Pool Grouping (IN PROGRESS)
+
+**Goal**: Fix the 0% cache hit rate by grouping gate/up/down projections into layer-level pool entries.
+
+**Problem**: Current pool keys by `input->data` (per-projection). 282 unique tensors with 9 entries = every projection evicts another. No caching benefit.
+
+**Solution**: A "layer pool entry" contains 3 projection sub-entries (gate, up, down). Detect same-layer by matching IDS tensor pointer (`ids_tensor == prev_ids_tensor` -- gate/up/down share the same selected_experts within a layer). Pool size = `GGML_MOE_POOL_LAYERS` (default 15).
+
+**Memory**: 15 layers x 3 projections x ~500 MB = ~22.5 GB. Feasible on 128 GB RAM.
+
+**Expected benefit**: 15/94 layers cached cross-token = 16% hit rate. Expert copies drop from 7.9 GB to ~6.6 GB per token. Expected ~2-3 t/s on force-offload (up from 1.4 t/s).
+
+**Effort**: Medium (pool data structure change in the patch)
+**Impact**: Medium (partial caching, not transformative)
 
 ### 1. Track Upstream llama.cpp MoE Work
 
