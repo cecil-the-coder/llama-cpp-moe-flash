@@ -86,7 +86,7 @@ index 22c6569..77df25d 100644
      char * context_buffer;
      size_t context_buffer_size;
  
-@@ -834,6 +841,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -834,6 +841,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                          return b;
                      }
                  }
@@ -96,6 +96,11 @@ index 22c6569..77df25d 100644
 +                if (tensor->op == GGML_OP_MUL_MAT_ID) {
 +                    for (int b = 0; b < src_backend_id; b++) {
 +                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
++                            static int moe_log_count = 0;
++                            if (moe_log_count++ < 20) {
++                                fprintf(stderr, "[MOE-OFFLOAD] %s -> backend %d (src_backend=%d, host=%d)\n",
++                                        tensor->name, b, src_backend_id, ggml_backend_buffer_is_host(src->buffer));
++                            }
 +                            SET_CAUSE(tensor, "1.moe");
 +                            return b;
 +                        }
