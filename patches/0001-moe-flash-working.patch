@@ -135,41 +135,67 @@ index 22c6569..fbe5373 100644
      std::vector<ggml_bitset_t> used_ids;
  
 +    // Persistent GPU buffer pool for MoE expert caching.
-+    // Buffers live outside gallocr so they persist across tokens.
-+    struct pool_entry {
++    // Organized by LAYER: each layer entry holds 3 projection sub-entries (gate/up/down).
++    // Same-layer detection uses IDS tensor pointer (gate/up/down share selected_experts).
++    struct proj_sub {
 +        ggml_backend_buffer_t buffer = nullptr;
 +        void * base_ptr = nullptr;
 +        size_t alloc_size = 0;
-+        const void * weight_key = nullptr;  // input->data
++        const void * weight_key = nullptr;  // input->data for this projection
 +        std::vector<ggml_bitset_t> cached_experts;
++    };
++
++    struct layer_pool_entry {
++        proj_sub projections[3];  // gate, up, down
 +        int64_t last_used = 0;
++        int proj_count = 0;       // how many projections filled (0-3)
++        const ggml_tensor * ids_key = nullptr;  // IDS tensor for layer identification
 +    };
 +
 +    static struct {
-+        std::vector<pool_entry> entries;
++        std::vector<layer_pool_entry> entries;
 +        int64_t clock = 0;
 +        bool initialized = false;
++        int64_t layer_hits = 0;
++        int64_t layer_misses = 0;
++        int64_t layer_evictions = 0;
++        int64_t expert_hits = 0;
++        int64_t expert_misses = 0;
 +    } pool;
 +
 +    static int prev_graph_nodes = 0;
 +
++    // Track current layer's pool entry for same-IDS grouping
++    static const ggml_tensor * current_layer_ids = nullptr;
++    static layer_pool_entry * current_layer_entry = nullptr;
++
 +    // Invalidate pool on graph shape change (prefill vs generation)
 +    if (sched->graph.n_nodes != prev_graph_nodes) {
-+        for (auto & e : pool.entries) {
-+            e.weight_key = nullptr;
-+            e.cached_experts.clear();
++        for (auto & le : pool.entries) {
++            for (int p = 0; p < 3; p++) {
++                le.projections[p].weight_key = nullptr;
++                le.projections[p].cached_experts.clear();
++            }
++            le.proj_count = 0;
++            le.ids_key = nullptr;
 +        }
++        current_layer_ids = nullptr;
++        current_layer_entry = nullptr;
 +        prev_graph_nodes = sched->graph.n_nodes;
 +    }
 +
 +    // Initialize pool on first use
 +    if (!pool.initialized) {
-+        int pool_size = 9;  // default: 3 layers × 3 projections
-+        const char * env = getenv("GGML_MOE_POOL_ENTRIES");
-+        if (env) pool_size = atoi(env);
-+        pool.entries.resize(pool_size);
++        int pool_layers = 15;  // default: 15 layers (~22.5 GB for Q4_K_M)
++        const char * env = getenv("GGML_MOE_POOL_LAYERS");
++        if (env) pool_layers = atoi(env);
++        // Also support old env var for backward compat
++        const char * env_old = getenv("GGML_MOE_POOL_ENTRIES");
++        if (env_old) pool_layers = (atoi(env_old) + 2) / 3;  // convert entries to layers
++        pool.entries.resize(pool_layers);
 +        pool.initialized = true;
-+        fprintf(stderr, "[MOE-POOL] Initialized with %d entries\n", pool_size);
++        fprintf(stderr, "[MOE-POOL] Initialized with %d layer entries (3 projections each = %d buffers)\n",
++                pool_layers, pool_layers * 3);
 +    }
 +
 +    // Track tensor overrides for pool buffers so we can restore after graph compute.
@@ -215,75 +241,93 @@ index 22c6569..fbe5373 100644
 +                        }
                      }
  
--                    // group consecutive experts and copy them together
--                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
--                        const size_t expert_offset = first_id * expert_size;
--                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
--                        const size_t padding = std::min<size_t>(expert_size, 512);
--                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
--
--                        ggml_backend_tensor_set_async(split_backend,
--                            input_cpy,
--                            (const uint8_t *)input->data + expert_offset, expert_offset,
--                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
--                            // this is necessary for MMQ in the CUDA backend
--                            expert_size_copy + padding_end);
--                    };
--
--                    int id = 0;
--                    while (!ggml_bitset_get(used_ids.data(), id)) {
--                        id++;
-+                    // --- Persistent GPU buffer pool lookup ---
-+                    pool_entry * entry = nullptr;
-+                    for (auto & e : pool.entries) {
-+                        if (e.weight_key == input->data) {
-+                            entry = &e;
-+                            entry->last_used = ++pool.clock;
++                    // --- Per-layer GPU buffer pool lookup ---
++                    // Step 1: Find or create layer entry using IDS tensor grouping
++                    layer_pool_entry * layer_entry = nullptr;
++
++                    // Same IDS tensor = same MoE layer (gate/up/down share selected_experts)
++                    if (ids_tensor == current_layer_ids && current_layer_entry) {
++                        layer_entry = current_layer_entry;
++                        layer_entry->last_used = ++pool.clock;
++                    } else {
++                        // New layer — search pool for existing entry with this IDS
++                        for (auto & le : pool.entries) {
++                            if (le.ids_key == ids_tensor && le.proj_count > 0) {
++                                layer_entry = &le;
++                                layer_entry->last_used = ++pool.clock;
++                                break;
++                            }
++                        }
++
++                        // Pool miss: find LRU layer entry or unallocated slot
++                        if (!layer_entry) {
++                            layer_entry = &pool.entries[0];
++                            for (auto & le : pool.entries) {
++                                if (le.proj_count == 0) { layer_entry = &le; break; }
++                                if (le.last_used < layer_entry->last_used) layer_entry = &le;
++                            }
++
++                            // Evict old layer entry if occupied
++                            if (layer_entry->proj_count > 0) {
++                                pool.layer_evictions++;
++                                for (int p = 0; p < 3; p++) {
++                                    layer_entry->projections[p].weight_key = nullptr;
++                                    layer_entry->projections[p].cached_experts.clear();
++                                }
++                            }
++                            layer_entry->ids_key = ids_tensor;
++                            layer_entry->proj_count = 0;
++                            layer_entry->last_used = ++pool.clock;
++                            pool.layer_misses++;
++                        } else {
++                            pool.layer_hits++;
++                        }
++
++                        current_layer_ids = ids_tensor;
++                        current_layer_entry = layer_entry;
++                    }
++
++                    // Step 2: Find projection sub-entry within layer
++                    proj_sub * psub = nullptr;
++                    for (int p = 0; p < layer_entry->proj_count; p++) {
++                        if (layer_entry->projections[p].weight_key == input->data) {
++                            psub = &layer_entry->projections[p];
 +                            break;
 +                        }
-                     }
--                    int32_t first_id = id;
--                    int32_t last_id = first_id;
- 
--                    for (++id; id < n_expert; ++id) {
--                        if (!ggml_bitset_get(used_ids.data(), id)) {
--                            continue;
-+                    // Pool miss: find LRU entry or unallocated slot
-+                    if (!entry) {
-+                        entry = &pool.entries[0];
-+                        for (auto & e : pool.entries) {
-+                            if (!e.buffer) { entry = &e; break; }  // prefer unallocated
-+                            if (e.last_used < entry->last_used) entry = &e;
-                         }
- 
--                        if (id == last_id + 1) {
--                            last_id = id;
--                            continue;
++                    }
++
++                    // New projection in this layer
++                    if (!psub) {
++                        if (layer_entry->proj_count < 3) {
++                            psub = &layer_entry->projections[layer_entry->proj_count++];
++                        } else {
++                            // All 3 slots used but different key — reuse slot 2 (rare edge case)
++                            psub = &layer_entry->projections[2];
++                            psub->cached_experts.clear();
++                        }
++                        psub->weight_key = input->data;
++                        psub->cached_experts.clear();
++                        psub->cached_experts.resize(ggml_bitset_size(n_expert), 0);
++
 +                        // Synchronize before allocation to prevent Vulkan DeviceLost
 +                        ggml_backend_synchronize(split_backend);
 +
 +                        // Allocate or reuse buffer
 +                        size_t needed = (size_t)n_expert * expert_size;
-+                        if (!entry->buffer || entry->alloc_size < needed) {
-+                            if (entry->buffer) ggml_backend_buffer_free(entry->buffer);
++                        if (!psub->buffer || psub->alloc_size < needed) {
++                            if (psub->buffer) ggml_backend_buffer_free(psub->buffer);
 +                            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
-+                            entry->buffer = ggml_backend_buft_alloc_buffer(buft, needed);
-+                            entry->base_ptr = ggml_backend_buffer_get_base(entry->buffer);
-+                            entry->alloc_size = needed;
-+                            fprintf(stderr, "[MOE-POOL] Allocated %zu MB buffer for %s\n",
-+                                    needed / (1024*1024), input->name);
-                         }
- 
--                        copy_experts(first_id, last_id);
-+                        entry->weight_key = input->data;
-+                        entry->cached_experts.clear();
-+                        entry->cached_experts.resize(ggml_bitset_size(n_expert), 0);
-+                        entry->last_used = ++pool.clock;
++                            psub->buffer = ggml_backend_buft_alloc_buffer(buft, needed);
++                            psub->base_ptr = ggml_backend_buffer_get_base(psub->buffer);
++                            psub->alloc_size = needed;
++                            fprintf(stderr, "[MOE-POOL] Allocated %zu MB buffer for %s (layer entry proj %d)\n",
++                                    needed / (1024*1024), input->name, layer_entry->proj_count - 1);
++                        }
 +                    }
 +
 +                    // Ensure cached_experts bitset is sized
-+                    if (entry->cached_experts.size() < (size_t)ggml_bitset_size(n_expert)) {
-+                        entry->cached_experts.resize(ggml_bitset_size(n_expert), 0);
++                    if (psub->cached_experts.size() < (size_t)ggml_bitset_size(n_expert)) {
++                        psub->cached_experts.resize(ggml_bitset_size(n_expert), 0);
 +                    }
 +
 +                    // Override input_cpy to point at pool buffer
@@ -291,34 +335,37 @@ index 22c6569..fbe5373 100644
 +                    ovr.tensor = input_cpy;
 +                    ovr.orig_buffer = input_cpy->buffer;
 +                    ovr.orig_data = input_cpy->data;
-+                    input_cpy->data = entry->base_ptr;
-+                    input_cpy->buffer = entry->buffer;
++                    input_cpy->data = psub->base_ptr;
++                    input_cpy->buffer = psub->buffer;
 +                    pool_overrides.push_back(ovr);
 +
 +                    // Copy only uncached experts
 +                    int hits = 0, misses = 0;
 +                    for (int64_t id = 0; id < n_expert; ++id) {
 +                        if (!ggml_bitset_get(used_ids.data(), id)) continue;
-+                        if (ggml_bitset_get(entry->cached_experts.data(), id)) {
++                        if (ggml_bitset_get(psub->cached_experts.data(), id)) {
 +                            hits++;
++                            pool.expert_hits++;
 +                            continue;
 +                        }
 +                        misses++;
++                        pool.expert_misses++;
 +                        const size_t offset = (size_t)id * expert_size;
 +                        const size_t pad = (id < n_expert - 1) ? std::min<size_t>(expert_size, 512) : 0;
 +                        ggml_backend_tensor_set_async(split_backend, input_cpy,
 +                            (const uint8_t *)input->data + offset, offset, expert_size + pad);
-+                        ggml_bitset_set(entry->cached_experts.data(), id);
++                        ggml_bitset_set(psub->cached_experts.data(), id);
 +                    }
- 
--                        first_id = id;
--                        last_id = id;
++
 +                    static int pool_log_count = 0;
 +                    if (pool_log_count++ < 200 || misses > 0) {
-+                        fprintf(stderr, "[MOE-POOL] %s: hits=%d misses=%d (pool clock=%ld)\n",
-+                                input->name, hits, misses, (long)pool.clock);
-                     }
--                    copy_experts(first_id, last_id);
++                        fprintf(stderr, "[MOE-POOL] %s: hits=%d misses=%d (layer_hits=%ld layer_misses=%ld evictions=%ld expert_hit_rate=%.1f%%)\n",
++                                input->name, hits, misses,
++                                (long)pool.layer_hits, (long)pool.layer_misses, (long)pool.layer_evictions,
++                                pool.expert_hits + pool.expert_misses > 0
++                                    ? 100.0 * pool.expert_hits / (pool.expert_hits + pool.expert_misses)
++                                    : 0.0);
++                    }
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
