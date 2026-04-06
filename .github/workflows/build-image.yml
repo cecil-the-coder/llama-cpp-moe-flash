@@ -16,7 +16,7 @@ on:
     inputs:
       llama_cpp_tag:
         description: 'llama.cpp tag to build against'
-        default: 'b8298'
+        default: 'b8664'
         required: false
 
 env:
@@ -67,7 +67,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            LLAMA_CPP_TAG=${{ inputs.llama_cpp_tag || 'b8298' }}
+            LLAMA_CPP_TAG=${{ inputs.llama_cpp_tag || 'b8664' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
