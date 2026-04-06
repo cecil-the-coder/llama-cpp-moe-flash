@@ -2,18 +2,21 @@
 
 ## Current State (Updated 2026-04-03)
 
-**Production image: `4cb7bef`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `a9e911e`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+
+**MILESTONE: First-ever correct GPU MoE output with slot remapping.**
 
 Patches applied: 0001 (core MoE flash + expert cache stable key + sync skip + force-offload guard), 0014 (vec-path byte-range overlap check), 0017 (disable upstream -fit + auto-detect CPU_MOE).
 
 Single-backend architecture with auto-detect `--cpu-moe`:
 - Models that fit in GTT (120 GB): auto-detect clears CPU_MOE, full GPU path
-- Models exceeding GTT: CPU MoE path with expert GPU cache
+- Models exceeding GTT: GPU MoE via slot remapping (32 slots, LRU eviction)
 
 | Model | Size | TPS | Loading | Status |
 |---|---|---|---|---|
 | GLM-4-7-Flash | 17 GB | **~50** | full GPU offload | Coherent |
-| Qwen3-235B Q2_K | 80 GB | **20.0** | full GPU offload (no expert cache needed) | Coherent |
+| Qwen3-235B Q2_K | 80 GB | **19.2** | full GPU offload (regression pass) | Coherent |
+| Qwen3-235B Q4_K_M | 133 GB | **3.5-4.1** | GPU MoE via slot remapping (32 slots, 74.9% hit) | **MILESTONE: correct output** |
 | DeepSeek-R1-0528 Q2_K | 228 GB | **4.1** | mmap experts + expert GPU cache + sync skip | Coherent (2.3x baseline) |
 
 **I12 benchmark**: Stock Vulkan 20.7 t/s, moe-flash 20.0 t/s, ik_llama.cpp CPU-only 11.5 t/s (Qwen3).
@@ -414,7 +417,31 @@ Patches applied (image `4c65a2f`):
 Result: Vec path works correctly, zero false positives.
 **Qwen3-235B Q2_K: 23 t/s** (up from 20.7 baseline, +11%).
 
-**Status**: ✅ COMPLETE — vec path working, no aliasing, coherent output
+**I10b Slot Remapping Breakthrough (2026-04-03)**: FIRST CORRECT GPU MoE OUTPUT.
+
+Image `a9e911e` on b8664. Qwen3 Q4_K_M (133 GB, >GTT): **3.5-4.1 t/s** with
+GPU MoE via slot remapping. Was 1.5 t/s with always-copy force-offload.
+
+**What works:**
+- `ne[2]=32` override flows correctly to `n_as=32` in all three shaders (batch, vec, count_experts)
+- Persistent pool outside gallocr -- buffers survive across tokens
+- LRU slot eviction -- 32 slots with bidirectional mapping
+- IDS rewrite with deferred write -- prevents overwrite by input copy loop
+- Original IDS cache -- prevents gate/up/down cross-contamination
+- No shader modifications needed
+
+**Performance analysis:**
+- Expert hit rate: **74.9%** with 32 slots for 128 experts (K=8)
+- 25% cache miss rate -> ~560 expert copies per token at ~3.5 MB each = ~2 GB
+- At 15 GB/s UMA bandwidth: ~133ms copy overhead per token
+- GPU compute: ~100ms per token
+- Total: ~233ms -> ~4.3 t/s theoretical (matches measured 3.5-4.1)
+
+**Regression pass:** Qwen3 Q2_K (80 GB, <=GTT): **19.2 t/s** full GPU. PASS.
+
+**Remaining work:** Hit rate optimization (more slots, prediction, imatrix pre-seeding).
+
+**Status**: ✅ COMPLETE — slot remapping produces correct GPU MoE output
 
 ### I11. Two-Tier Expert GPU Cache — COMPLETE
 
@@ -626,14 +653,14 @@ llama_params_fit auto-detect:
 4. **Disabling flash-moe for cached path**: Counter-intuitive but correct. The expert GPU cache only works on the standard CPU->GPU copy path. Flash-moe's async prefetch bypasses this entirely.
 
 ### What didn't work
-1. **Slot buffer / expert ID remapping (I10b)**: Three separate attempts. Changing `ne[2]` breaks graph shape inference. Keeping `ne[2]` intact but remapping IDS fails because the MUL_MAT_ID shader uses expert IDs for data addressing throughout. Would need deep shader modification that upstream #20757 is better positioned to solve.
+1. **Slot buffer / expert ID remapping (I10b)**: Early attempts failed from gallocr corruption (ggml_set_input/output) and ne[2] breaking graph shape inference. **Eventually solved** by moving ne[2]=32 override to persistent pool tensors outside gallocr, with LRU slot eviction, deferred IDS write, and original IDS cache. Image `a9e911e`: 3.5-4.1 t/s with 74.9% hit rate.
 2. **Graph split reduction**: Assumed splits came from expert weight copying. Actually come from CPU<->GPU backend transitions for attention vs MoE layers. Fundamental to the hybrid compute model, not an optimization target.
 3. **Flash-moe async prefetch for >GTT**: Reads expert weights from disk each token via io_uring instead of using cached GPU buffers. Net slower (2.3 vs 4.1 t/s) because it defeats the expert GPU cache.
 4. **Prediction-based expert prefetch (F2, I5)**: Scheduler expert copy callback never fires with `--cpu-moe` because all expert data stays on CPU -- no cross-backend copy to trigger the callback.
 5. **io_uring optimizations**: No measurable benefit over posix_fadvise. Both just hint the kernel to readahead. The bottleneck is compute, not I/O syscall overhead.
 
 ### Key technical insight
-For models exceeding GTT on this hardware, the performance ceiling is set by CPU expert matmul speed (AVX-512 on Zen 5). All I/O, copy, prefetch, and caching optimizations have been exhausted or shown to be irrelevant. The path to higher performance for >GTT models is either better CPU kernels (AMX, fused MoE FFN) or getting expert matmul back on GPU (upstream two-tier cache #20757).
+Slot remapping with `ne[2]=32` on persistent pool tensors outside gallocr successfully gets expert matmul back on GPU for >GTT models (3.5-4.1 t/s on Qwen3 Q4_K_M). The remaining bottleneck is the 25% cache miss rate driving ~2 GB of expert copies per token. The path to higher performance is now hit rate optimization: more slots (64/128), cross-layer expert prediction, or imatrix-based pre-seeding.
 
 ---
 
