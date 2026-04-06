@@ -62,7 +62,7 @@ index 7885330..57c591a 100644
  if (MATH_LIBRARY)
      if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 22c6569..ad83c38 100644
+index 22c6569..c7de9a9 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,7 @@
@@ -109,20 +109,19 @@ index 22c6569..ad83c38 100644
              }
              SET_CAUSE(tensor, "1.wgt%d", i);
              return src_backend_id;
-@@ -1189,8 +1212,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+@@ -1189,10 +1212,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                      // check if a weight is on a different and incompatible backend
                      // by starting a new split, the memory of the previously offloaded weights can be reused
                      if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
 -                        int src_backend_id = tensor_backend_id(src);
 +                        const int src_backend_id = tensor_backend_id(src);
                          if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-+                            // NOTE: moe_cache_warm split-merging disabled — merging all MoE
-+                            // layers into one split overflows GGML_SCHED_MAX_SPLIT_INPUTS (30).
-+                            // Expert copy caching in compute_splits handles the perf win instead.
                              need_new_split = true;
                              break;
                          }
-@@ -1265,6 +1291,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     }
+                     // check if the split has too many inputs
+@@ -1265,6 +1288,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                          for (int c = 0; c < sched->n_copies; c++) {
                              struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
                              ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
@@ -130,7 +129,7 @@ index 22c6569..ad83c38 100644
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-@@ -1442,6 +1469,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+@@ -1442,6 +1466,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
      return true;
  }
  
@@ -150,7 +149,7 @@ index 22c6569..ad83c38 100644
  static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
      GGML_ASSERT(sched);
      struct ggml_backend_sched_split * splits = sched->splits;
-@@ -1450,7 +1490,117 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1450,7 +1487,117 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -268,7 +267,31 @@ index 22c6569..ad83c38 100644
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
          ggml_backend_t split_backend = sched->backends[split_backend_id];
-@@ -1489,7 +1639,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1478,18 +1625,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 }
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+-                ggml_tensor * node = split->graph.nodes[0];
++                // With merged MoE splits, multiple MUL_MAT_ID nodes share one split,
++                // so check ALL nodes (not just nodes[0]) for a matching weight input.
++                ggml_tensor * node = nullptr;
+                 if (split->graph.n_nodes > 0 &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-                    ggml_backend_buffer_is_host(input->buffer) && (
+-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+-                    )) {
++                    ggml_backend_buffer_is_host(input->buffer)) {
++                    for (int ni = 0; ni < split->graph.n_nodes; ni++) {
++                        ggml_tensor * candidate = split->graph.nodes[ni];
++                        if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] == input_cpy) {
++                            node = candidate;
++                            break;
++                        }
++                    }
++                }
++                if (node != nullptr) {
+ 
                      const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                      const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
  
@@ -278,7 +301,7 @@ index 22c6569..ad83c38 100644
  
                      // get the ids
                      ggml_tensor * ids_tensor = node->src[2];
-@@ -1505,6 +1656,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1505,6 +1661,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -288,7 +311,7 @@ index 22c6569..ad83c38 100644
                      if (ids_tensor != prev_ids_tensor) {
                          ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                          ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
-@@ -1522,46 +1676,208 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1681,208 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -474,14 +497,14 @@ index 22c6569..ad83c38 100644
 +                            if (old >= 0) psub->expert_to_slot[old] = -1;
 +                            pool.slot_evictions++;
 +                        }
- 
--                        first_id = id;
--                        last_id = id;
++
 +                        // Assign and copy expert to slot
 +                        psub->expert_to_slot[id] = slot;
 +                        psub->slot_to_expert[slot] = id;
 +                        psub->slot_lru[slot] = ++psub->slot_clock;
-+
+ 
+-                        first_id = id;
+-                        last_id = id;
 +                        const size_t src_offset = (size_t)id * expert_size;
 +                        const size_t dst_offset = (size_t)slot * expert_size;
 +                        ggml_backend_tensor_set_async(split_backend, input_cpy,
@@ -526,7 +549,7 @@ index 22c6569..ad83c38 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1578,6 +1894,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1578,6 +1899,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -542,7 +565,7 @@ index 22c6569..ad83c38 100644
          if (!sched->callback_eval) {
              enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
              if (ec != GGML_STATUS_SUCCESS) {
-@@ -1617,6 +1942,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1617,6 +1947,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
              }
          }
  
@@ -556,7 +579,7 @@ index 22c6569..ad83c38 100644
          // record the event of this copy
          if (split->n_inputs > 0) {
              if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-@@ -1824,6 +2156,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1824,6 +2161,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
