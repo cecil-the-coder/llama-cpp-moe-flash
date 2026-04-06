@@ -2,7 +2,7 @@
 
 ## Current State (Updated 2026-04-03)
 
-**Production image: `74a5930`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `4cb7bef`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
 
 Patches applied: 0001 (core MoE flash + expert cache stable key + sync skip + force-offload guard), 0014 (vec-path byte-range overlap check), 0017 (disable upstream -fit + auto-detect CPU_MOE).
 
@@ -64,7 +64,7 @@ Single-backend architecture with auto-detect `--cpu-moe`:
 
 | System | Approach | vs Ours |
 |---|---|---|
-| **KTransformers** | AMX-optimized CPU expert kernels | 28 t/s DeepSeek vs our 3.9 — **7× faster** expert matmul |
+| **KTransformers** | AMX-optimized CPU expert kernels | 28 t/s DeepSeek vs our 4.1 — **7× faster** expert matmul |
 | **Fate** | Cross-layer gate prediction (97% accuracy) | Targeted prefetch vs our blind background sweep |
 | **HOBBIT** | Mixed-precision: cache-miss experts at lower quant | Reduces I/O for cold experts |
 | **flash-moe** | pread() + GCD on Apple Silicon | 4.4 t/s on 397B/48GB MacBook |
@@ -457,10 +457,11 @@ CPU -> GPU copy path. Disabling flash-moe and using the cache is faster (4.1 vs 
 - GLM-4-7-Flash (17 GB): ~50 t/s, full GPU
 - Flash-moe DISABLED for DeepSeek (expert GPU cache outperforms async prefetch)
 
-**Remaining optimizations**:
-1. Reduce 284 graph splits to ~61 (batch gate/up/down per layer) -- potential 2-3x
-2. Combine flash-moe prefetch with expert cache for cold misses
-3. Thread count tuning for DeepSeek CPU_MOE path
+**Honest assessment of remaining optimizations**:
+1. ~~Reduce 284 graph splits~~ -- splits come from CPU<->GPU backend transitions, not expert copying. Can't be reduced without changing the scheduler's hybrid compute model.
+2. ~~Combine flash-moe prefetch with expert cache~~ -- mutually exclusive paths; flash-moe bypasses the scheduler's expert copy entirely.
+3. Thread count tuning -- minor, already optimal at 16 threads from I1.
+4. **The real bottleneck is CPU MoE matmul speed.** AVX-512 on Zen 5 is 7x slower than AMX on Intel for expert matmul. No amount of I/O or copy optimization changes this.
 
 **Status**: COMPLETE
 
@@ -547,7 +548,7 @@ Confirmed on both Strix Halo (shadow) and Strix Point (local):
 ## Architecture
 
 ```
-Single backend: moe-flash-cpumoe (CPU_MOE=1, image 74a5930)
+Single backend: moe-flash-cpumoe (CPU_MOE=1, image 4cb7bef)
 
 llama_params_fit auto-detect:
   ├── Model fits in device memory? → Clear CPU_MOE override
@@ -570,6 +571,26 @@ llama_params_fit auto-detect:
 - **Phase 3**: Vulkan integration (host buffer fix, hybrid alloc, prefetch, madvise)
 - **Phase 4**: Integration with inference-budget-controller
 - **Phase 5**: Auto-detect `--cpu-moe` + single-backend deployment
+
+## Lessons Learned (2026-04-03)
+
+### What worked
+1. **Auto-detect CPU_MOE**: Single image handles all model sizes. Models <=GTT get full GPU, >GTT get CPU MoE. No manual configuration needed.
+2. **Expert GPU cache with stable key**: Using `input->data` (source weight pointer) instead of `input_cpy` (tensor struct) as cache key. GPU buffers persist across tokens because Vulkan reset is a no-op and gallocr offsets are deterministic. Zero extra memory.
+3. **mmap-wrap for >RAM models**: Stock `--cpu-moe` mallocs expert tensors and OOMs for 228 GB on 125 GB RAM. Wrapping mmap as CPU buffer enables demand paging from NVMe.
+4. **Disabling flash-moe for cached path**: Counter-intuitive but correct. The expert GPU cache only works on the standard CPU->GPU copy path. Flash-moe's async prefetch bypasses this entirely.
+
+### What didn't work
+1. **Slot buffer / expert ID remapping (I10b)**: Three separate attempts. Changing `ne[2]` breaks graph shape inference. Keeping `ne[2]` intact but remapping IDS fails because the MUL_MAT_ID shader uses expert IDs for data addressing throughout. Would need deep shader modification that upstream #20757 is better positioned to solve.
+2. **Graph split reduction**: Assumed splits came from expert weight copying. Actually come from CPU<->GPU backend transitions for attention vs MoE layers. Fundamental to the hybrid compute model, not an optimization target.
+3. **Flash-moe async prefetch for >GTT**: Reads expert weights from disk each token via io_uring instead of using cached GPU buffers. Net slower (2.3 vs 4.1 t/s) because it defeats the expert GPU cache.
+4. **Prediction-based expert prefetch (F2, I5)**: Scheduler expert copy callback never fires with `--cpu-moe` because all expert data stays on CPU -- no cross-backend copy to trigger the callback.
+5. **io_uring optimizations**: No measurable benefit over posix_fadvise. Both just hint the kernel to readahead. The bottleneck is compute, not I/O syscall overhead.
+
+### Key technical insight
+For models exceeding GTT on this hardware, the performance ceiling is set by CPU expert matmul speed (AVX-512 on Zen 5). All I/O, copy, prefetch, and caching optimizations have been exhausted or shown to be irrelevant. The path to higher performance for >GTT models is either better CPU kernels (AMX, fused MoE FFN) or getting expert matmul back on GPU (upstream two-tier cache #20757).
+
+---
 
 ## CI/CD
 

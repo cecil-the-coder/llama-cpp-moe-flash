@@ -1,17 +1,34 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: I11 COMPLETE (expert GPU cache + sync skip), I12 COMPLETE. DeepSeek 4.1 t/s (2.3x baseline). (2026-04-03)
+**Status**: All active investigations complete. DeepSeek 4.1 t/s (2.3x baseline), CPU MoE matmul is the bottleneck. (2026-04-03)
 
-**Production Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:74a5930` (b8664)
+**Production Image**: `ghcr.io/cecil-the-coder/llama-cpp-moe-flash:4cb7bef` (b8664)
 
 ---
 
-## Completed
+## Current State: Honest Assessment
 
-- **I11** - Expert GPU cache + sync skip: DeepSeek 4.1 t/s (2.3x baseline), stable cache key, sync skip, flash-moe disabled
+**Models that fit in GTT (<=120 GB)**: Production-ready. 20-50 t/s, full GPU, no issues.
+
+**Models exceeding GTT (>120 GB)**: 4.1 t/s on DeepSeek-R1-0528 (228 GB). The bottleneck
+is CPU expert matmul (AVX-512 on Zen 5). KTransformers achieves 28 t/s with Intel AMX --
+7x faster expert matmul. No amount of I/O, copy, or prefetch optimization will close this gap.
+
+**What we've exhausted**:
+- I/O optimizations (io_uring, posix_fadvise, registered buffers, hugepages) -- no measurable benefit
+- Expert GPU cache + sync skip -- already at ~100% hit rate after 32 tokens
+- Flash-moe async prefetch -- slower than cached path for DeepSeek (2.3 vs 4.1 t/s)
+- Slot buffer for GPU expert matmul -- shader can't handle remapped IDS, 3 attempts failed
+- Graph split reduction -- splits are from CPU<->GPU backend transitions, not optimizable
+
+---
+
+## Completed Investigations
+
+- **I11** - Expert GPU cache + sync skip: DeepSeek 4.1 t/s (2.3x baseline)
 - **I12** - ik_llama.cpp benchmark: Vulkan 2x faster for in-GTT models
-- **I14** - io_uring polish optimizations (SINGLE_ISSUER, MADV_HUGEPAGE)
-- **I10b** - GPU MoE expert matmul for in-GTT models (auto-detect)
+- **I14** - io_uring polish (SINGLE_ISSUER, MADV_HUGEPAGE): no measurable benefit
+- **I10b** - GPU MoE expert matmul: works for in-GTT (auto-detect), blocked for >GTT
 - **I17** - Prometheus metrics infrastructure
 - **I18** - Cache hit tracking fix
 
@@ -21,153 +38,96 @@
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
-| **I11** - Expert GPU Cache + Sync Skip | High | High | **COMPLETE** | 4.1 t/s (2.3x baseline) |
-| **I12** - ik_llama.cpp Benchmark | High | Medium | **COMPLETE** | See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md) |
-| **I14** - io_uring Polish | Medium | Low | **COMPLETE** | See [I14-iouring-polish.md](I14-iouring-polish.md) |
-| **Slot buffer GPU matmul** | High | High | Future | Shader mod needed for >GTT GPU path |
-| **I13** - BF16 CPU Matmul | Medium | Low | Not started | Optional |
-| **I7** - Context Scaling | Medium | Low | Not started | Needs TQ2 fix |
+| **Upstream rebase tracking** | High | Low | Ongoing | Track #20757, new llama.cpp releases |
+| **CPU kernel improvement** | High | High | Not started | Port ik_llama.cpp fused MoE FFN or wait for AMX |
+| **I13** - BF16 CPU Matmul | Medium | Low | Not started | Test if BF16 AVX-512 beats Q4_0 AVX2 |
+| **Slot buffer shader mod** | High | Very High | De-prioritized | Wait for upstream #20757 |
+| **I7** - Context Scaling | Low | Low | Not started | Not the bottleneck |
+| **I8** - Batch Size Tuning | Low | Low | Not started | Minor |
 
 ---
 
-## ⭐ TIER 1: Recommended Next Steps
+## TIER 1: Recommended Next Steps
 
-### 1. I14: io_uring Polish — 10-25% Performance Gain
+### 1. Track Upstream llama.cpp MoE Work
 
-**Goal**: Optimize existing io_uring background prefetch with minimal code changes.
+**Goal**: Monitor and rebase when upstream lands MoE improvements.
 
-**Three Improvements**:
-```cpp
-// 1. IORING_REGISTER_BUFFERS - skip pin_user_pages per read
-io_uring_register_buffers(&ring, iovecs, n_slots);
-// Eliminates ~752 page-pin ops per token (94 layers × 8 experts)
-// Expected: 5-15% reduction in read jitter
+**Key upstream items**:
+- **#20757** (two-tier expert cache): GPU expert matmul with proper shader support for >GTT models. Python PoC showed 14 t/s. Seeking C++ implementer. When merged, this would be the single biggest improvement for DeepSeek-class models (expected 10-15 t/s).
+- **Better CPU MoE kernels**: Any upstream improvement to Q2_K/Q4_K matmul with AVX-512 paths.
+- **Scheduler improvements**: Reduced graph splits for hybrid CPU/GPU compute.
 
-// 2. IORING_SETUP_SINGLE_ISSUER - kernel optimization
-io_uring_queue_init_params(entries, &ring, &params);
-params.flags |= IORING_SETUP_SINGLE_ISSUER;  // (kernel 6.0+)
-// Our prefetch thread is sole submitter - trivially applicable
-// Expected: 2-5% from reduced kernel overhead
+**Effort**: Low (monitoring + periodic rebase)
+**Impact**: High (potentially 3-4x for >GTT models)
 
-// 3. MADV_HUGEPAGE on staging pool - 512× TLB reduction
-madvise(staging_pool, size, MADV_HUGEPAGE | MADV_COLLAPSE);
-// One syscall, massive TLB pressure reduction
-// Expected: 3-8% for GTT access path
-```
+### 2. CPU Kernel Improvement
 
-**Effort**: ~50 lines of code, 1-2 days
-**Risk**: Low (additive improvements)
-**Evidence**: flash-moe saw +38% from trusting OS, these are OS-level optimizations
+**Goal**: Improve CPU expert matmul speed, which is the dominant bottleneck.
 
-**Files to modify**:
-- `src/llama-moe-flash.cpp` - io_uring ring setup
+**Options** (in order of feasibility):
+1. **I13 - BF16 AVX-512 matmul**: Test if BF16 `_mm512_dpbf16_ps` outperforms Q4_0 AVX2 on Zen 5. Low effort, unclear payoff due to 2x memory increase.
+2. **Port ik_llama.cpp fused MoE FFN**: Batched expert processing reduces overhead. High effort (ik_llama.cpp is a major fork), medium payoff.
+3. **Wait for hardware with AMX**: Intel AMX gives 7x expert matmul speedup. Requires hardware purchase.
+
+**Effort**: Medium to High
+**Impact**: 2-5x for >GTT models (depending on approach)
 
 ---
 
-### 2. I12: ik_llama.cpp Benchmark — COMPLETE
+## TIER 2: De-prioritized
 
-**Result**: Vulkan hybrid is 2x faster for in-GTT models. DeepSeek: moe-flash 2.05 t/s vs ik_llama 1.5 t/s.
+### Slot Buffer Shader Modification
 
-| Model | ik_llama.cpp | Stock Vulkan | moe-flash |
-|-------|-------------|-------------|-----------|
-| Qwen3-235B Q2_K (80 GB) | 11.5 t/s | 20.7 t/s | 20.0 t/s |
-| DeepSeek-R1 Q2_K (228 GB) | 1.5 t/s (no flash_attn) | N/A | 4.1 t/s (expert GPU cache + sync skip) |
+**Why de-prioritized**: Three attempts failed (I10b). The MUL_MAT_ID shader uses expert IDs
+for data addressing throughout -- remapping IDS requires deep shader modification that
+conflicts with graph shape inference, KV cache setup, and shared IDS tensors across
+gate/up/down projections. Upstream #20757 is better positioned to solve this correctly
+because it can modify the shader, scheduler, and allocator together.
 
-**Key finding**: ik_llama.cpp FlashMLA crashes on DeepSeek Q2_K over mmap (NaN logits).
-Standard attention path works but isn't faster than our hybrid.
+### Graph Split Reduction
 
-**Details**: See [I12-ik-llama-benchmark.md](I12-ik-llama-benchmark.md)
+**Why de-prioritized**: The 284 splits come from CPU<->GPU backend transitions for attention
+vs MoE layers, not from expert weight copying. Reducing splits requires changing how the
+scheduler assigns backends for hybrid compute -- fundamental architecture change, not an
+optimization target.
 
----
+### Flash-moe Async Prefetch Improvements
 
-### 3. Remaining Optimizations for DeepSeek (4.1 t/s -> higher)
-
-**Graph split reduction**: Current 284 graph splits could be reduced to ~61 by batching
-gate/up/down per layer. Potential 2-3x improvement from reduced dispatch overhead.
-
-**Cold miss prefetch**: Combine flash-moe async prefetch with expert cache for cold misses.
-Currently mutually exclusive -- flash-moe bypasses the scheduler's expert copy path entirely.
-
-**Thread count tuning**: DeepSeek CPU_MOE path may benefit from different thread count
-than the current default. Zen 5 UMA shares memory bandwidth between CPU and GPU.
-
-**Slot buffer GPU matmul** (future): Shader mod for >GTT GPU expert matmul.
-Patches 0015/0016/0019 preserved in repo. Potential further speedup but higher risk.
-
----
-
-## TIER 2: Optional/Future
-
-### 5. I13: BF16 Expert Weights for CPU Matmul
-
-**Hypothesis**: BF16 AVX-512 outperforms Q4_0 AVX2 even at 2× size.
-
-**Background**:
-- Zen 5 Strix Halo has half-width AVX-512 FPU
-- BF16 uses `_mm512_dpbf16_ps` (optimized)
-- Q4_0 uses AVX2 only (no AVX-512 path in ggml)
-
-**Test**:
-- Convert one expert file to BF16
-- Benchmark CPU matmul vs Q4_0
-
-**Effort**: 2-3 days
-**Risk**: May not fit in RAM (2× size)
-
----
-
-### 6. I7: Context Size Scaling with TQ2_KV
-
-**Goal**: Push context to 32K/64K with quantized KV cache.
-
-**Blocker**: TQ2_KV produces garbage output at 2.125 bpw
-
-**Options**:
-- Implement TQ3_KV (3-bit symmetric)
-- Use Q4_0 KV cache (tested, works)
-- Skip: context not our primary bottleneck
+**Why de-prioritized**: Flash-moe bypasses the scheduler's expert copy path entirely
+(reads from disk via io_uring). This defeats the expert GPU cache, which is the primary
+optimization delivering 4.1 t/s. The two approaches are mutually exclusive.
 
 ---
 
 ## Decision Framework
 
 ```
-Current state: Expert GPU cache + sync skip delivers 4.1 t/s (2.3x baseline). All models coherent.
+Current state: 4.1 t/s DeepSeek, 20-50 t/s for <=GTT models. All coherent.
 
-If we want further DeepSeek speedup (4.1 → ~8-12 t/s):
-    → Graph split reduction (284 → ~61) - highest leverage, 2-3x potential
-    → Thread count tuning - low effort
-    → Cold miss prefetch (combine flash-moe + cache) - medium effort
+The honest question: Is 4.1 t/s on DeepSeek acceptable?
 
-If we want incremental improvements:
-    → I13 (BF16 CPU matmul) or I7 (context scaling) - low effort
+If yes:
+    → Monitor upstream, rebase when beneficial improvements land
+    → Focus on deploying more <=GTT models (these are production-ready)
 
-If we want to explore new models:
-    → Deploy larger models and test with current stack
+If no:
+    → Upstream #20757 is the only realistic path to 10+ t/s on this hardware
+    → CPU kernel improvements (I13, fused MoE) might reach 8-12 t/s
+    → Hardware with Intel AMX would reach 28 t/s (KTransformers benchmark)
 ```
 
 ---
 
-## Recommended Next Steps
+## Comparison with Other Systems
 
-1. **Graph split reduction** (highest impact): Batch gate/up/down per layer to reduce
-   284 splits to ~61. Target: DeepSeek 4.1 -> ~8-12 t/s.
-
-2. **Thread count tuning** (low effort): Sweep thread counts for DeepSeek CPU_MOE path.
-
-3. **Cold miss prefetch** (medium effort): Combine flash-moe async prefetch with expert
-   cache for cold misses during warmup phase.
-
-4. **I13 - BF16 CPU matmul** (low effort): Test if BF16 AVX-512 outperforms
-   Q4_0 AVX2 for CPU expert matmul on Zen 5.
-
----
-
-## Lessons Learned
-
-- Flux YAML validation is critical: a duplicate `value:` key silently blocks reconciliation
-- gallocr flag changes (`ggml_set_input/output`) have global side effects -- test all models
-- Force-offload guards must check buffer type, not just backend assignment
+| System | DeepSeek t/s | Approach | vs Our 4.1 t/s |
+|--------|-------------|----------|-----------------|
+| **KTransformers** | 28 | Intel AMX CPU kernels | 7x faster |
+| **llama.cpp #20757 PoC** | 14 | Two-tier GPU cache (Python) | 3.4x faster |
+| **ik_llama.cpp** | 1.5 | CPU-only, no flash_attn | 2.7x slower |
+| **flash-moe** | 4.4 | Apple SSD + Metal (397B model) | ~comparable |
+| **Our moe-flash** | 4.1 | AVX-512 CPU MoE + expert cache | baseline |
 
 ---
 
