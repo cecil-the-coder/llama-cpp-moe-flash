@@ -1,6 +1,6 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: Per-layer buffer pool grouping in progress. Persistent buffer pool has 0% hit rate with per-projection design (282 tensors, 9 entries). Force-offload 1.4 t/s < CPU MoE 6-7 t/s. (2026-04-03)
+**Status**: Per-layer buffer pool grouping tested (363a6d9). Still 0% hit rate — 94 layers with 15 pool entries means no cross-token survival. Force-offload stuck at 1.4 t/s. (2026-04-03)
 
 **Production Image**: latest main on b8664
 
@@ -25,8 +25,7 @@ gate/up/down of the SAME layer all have different keys and evict each other.
 - Slot buffer for GPU expert matmul -- shader can't handle remapped IDS, 3 attempts failed
 - Graph split reduction -- splits are from CPU<->GPU backend transitions, not optimizable
 - Per-projection buffer pool -- 0% hit rate, 282 tensors overwhelm 9 entries
-
-**Active work**: Per-layer buffer pool grouping (reduce 282 entries to 94 layer entries)
+- Per-layer buffer pool grouping -- still 0% hit rate, 94 layers > 15 pool entries, LRU doesn't help with sequential execution
 
 ---
 
@@ -45,7 +44,7 @@ gate/up/down of the SAME layer all have different keys and evict each other.
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
-| **Per-layer pool grouping** | Medium | Medium | In progress | Group gate/up/down, reduce 282->94 entries |
+| **Per-layer pool grouping** | None | Medium | Complete | 0% hit rate: 94 layers > 15 entries, sequential execution defeats LRU |
 | **Upstream rebase tracking** | High | Low | Ongoing | Track #20757, new llama.cpp releases |
 | **CPU kernel improvement** | High | High | Not started | Port ik_llama.cpp fused MoE FFN or wait for AMX |
 | **I13** - BF16 CPU Matmul | Medium | Low | Not started | Test if BF16 AVX-512 beats Q4_0 AVX2 |
@@ -57,20 +56,15 @@ gate/up/down of the SAME layer all have different keys and evict each other.
 
 ## TIER 1: Recommended Next Steps
 
-### 0. Per-Layer Buffer Pool Grouping (IN PROGRESS)
+### 0. Per-Layer Buffer Pool Grouping (COMPLETE — no improvement)
 
 **Goal**: Fix the 0% cache hit rate by grouping gate/up/down projections into layer-level pool entries.
 
-**Problem**: Current pool keys by `input->data` (per-projection). 282 unique tensors with 9 entries = every projection evicts another. No caching benefit.
+**Implementation** (image `363a6d9`): Layer pool entries with 3 projection sub-entries. Same-layer detection via IDS tensor pointer. Pool size = `GGML_MOE_POOL_LAYERS` (default 15).
 
-**Solution**: A "layer pool entry" contains 3 projection sub-entries (gate, up, down). Detect same-layer by matching IDS tensor pointer (`ids_tensor == prev_ids_tensor` -- gate/up/down share the same selected_experts within a layer). Pool size = `GGML_MOE_POOL_LAYERS` (default 15).
+**Result**: Still 0% hit rate. With 94 MoE layers and 15 pool entries, the sequential execution pattern (layer 0,1,...,93) means the last 15 layers survive from one token but get immediately evicted when the next token starts at layer 0. Q4_K_M still 1.4 t/s.
 
-**Memory**: 15 layers x 3 projections x ~500 MB = ~22.5 GB. Feasible on 128 GB RAM.
-
-**Expected benefit**: 15/94 layers cached cross-token = 16% hit rate. Expert copies drop from 7.9 GB to ~6.6 GB per token. Expected ~2-3 t/s on force-offload (up from 1.4 t/s).
-
-**Effort**: Medium (pool data structure change in the patch)
-**Impact**: Medium (partial caching, not transformative)
+**Key insight**: Pool-based caching fundamentally cannot work with sequential layer execution unless P >= N_layers (94). That would require ~141 GB of GPU buffers — more than available RAM. The only viable path for GPU MoE on >GTT models is upstream #20757 (two-tier cache with shader support).
 
 ### 1. Track Upstream llama.cpp MoE Work
 

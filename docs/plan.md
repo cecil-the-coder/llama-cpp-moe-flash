@@ -480,11 +480,29 @@ Every projection evicts a different projection's entry.
 The overhead is dominated by expert copy bandwidth: 8 experts x 3 projections x 94 layers
 x 3.5 MB = 7.9 GB per token at ~15 GB/s = 527 ms (74% of the 714 ms token time).
 
-**Next step**: Per-layer pool grouping. Group gate/up/down into layer-level entries,
-reducing unique entries from 282 to 94. With 15 layer entries (~22.5 GB), 16% of layers
-persist cross-token. Expected to improve force-offload from 1.4 to ~2-3 t/s.
+#### Phase 3b: Per-Layer Pool Grouping (image `363a6d9`)
 
-**Status**: IN PROGRESS — per-layer grouping implementation
+**Mechanism**: Group gate/up/down projections into layer-level pool entries. Each
+`layer_pool_entry` holds 3 `proj_sub` entries. Same-layer detection via IDS tensor
+pointer (gate/up/down share the same `selected_experts` within a layer).
+
+**Result: Still 0% hit rate.** Layer grouping correctly reduces evictions from 282 to 94
+per forward pass, but with 15 layer entries and 94 layers, the last 15 layers from one
+token get immediately evicted when the next token starts at layer 0.
+
+Tested: Qwen3-235B Q4_K_M at **1.4 t/s** — no improvement over per-projection pool.
+Pool stats: `layer_hits=0, layer_misses=30926, evictions=30911, expert_hit_rate=0.0%`.
+
+**Root cause**: Sequential layer execution (0,1,...,93) means the "last N" LRU cache
+only preserves layers 79-93. Token 2 starts at layer 0, immediately evicting layer 79.
+No layer survives across tokens regardless of pool size < 94.
+
+**Key insight**: Pool-based caching fundamentally cannot help with 94 MoE layers and
+sequential execution. Would need P=94 (~141 GB) to cache everything, which exceeds
+available RAM. The only viable path for GPU MoE with >GTT models is upstream #20757
+(two-tier GPU+RAM cache with proper shader support).
+
+**Status**: COMPLETE — per-layer grouping verified, no performance improvement
 
 ### I12. ik_llama.cpp Benchmark — TIER 1
 

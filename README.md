@@ -35,8 +35,9 @@ not graph splits -- it is the CPU compute for expert weights.
 
 ### What didn't work as hoped
 
-- **Per-projection buffer pool**: 9 pool entries for 282 unique tensors = 0% hit rate.
-  Every projection evicts the previous one. Need per-layer grouping (282 -> 94 entries).
+- **Buffer pool (per-projection and per-layer)**: Both have 0% hit rate. Per-projection:
+  282 tensors with 9 entries. Per-layer: 94 layers with 15 entries. Sequential execution
+  (layer 0,1,...,93) defeats LRU — would need P=94 (~141 GB) to cache all layers.
 - **Force-offload at 1.4 t/s**: Slower than CPU MoE (6-7 t/s) due to pool thrashing.
   Expert copy bandwidth dominates: 8 experts x 3 projections x 94 layers x 3.5 MB = 7.9 GB/token.
 - **I11 slot buffer / dynamic expert import**: Infrastructure built but the Vulkan
@@ -50,9 +51,7 @@ not graph splits -- it is the CPU compute for expert weights.
 
 ### What would actually help
 
-1. **Per-layer buffer pool grouping**: Group gate/up/down into layer-level pool entries.
-   With 15 layer entries (~22.5 GB), cache 16% of layers cross-token. Expected ~2 t/s improvement on force-offload.
-2. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul for >GTT models with shader support. Expected 10-15 t/s.
+1. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul for >GTT models with shader support. Expected 10-15 t/s.
 3. **Better CPU kernels**: ik_llama.cpp's FlashMLA + fused MoE FFN, or Intel AMX support. Could give 3-5x CPU speedup.
 4. **Rebase to newer llama.cpp**: As upstream MoE work lands (expert caching, better CPU kernels).
 5. **Hardware**: Faster NVMe (Gen5), more RAM, or a system with AMX support.
@@ -140,9 +139,9 @@ Force-offload with per-projection pool is slower than CPU MoE due to 0% cache hi
 | 0014 | Applied | Vec-path runtime byte-range overlap check |
 | 0017 | Applied | Disable upstream -fit + auto-detect CPU_MOE |
 
-**Key finding**: The persistent buffer pool has 0% hit rate with 9 entries and 282
-unique weight tensors. Force-offload (1.4 t/s) is slower than CPU MoE (6-7 t/s).
-Next step: per-layer pool grouping to reduce unique entries from 282 to 94.
+**Key finding**: Buffer pool has 0% hit rate regardless of grouping strategy. Per-projection
+(282 tensors, 9 entries) and per-layer (94 layers, 15 entries) both fail because sequential
+execution defeats LRU. Force-offload (1.4 t/s) is slower than CPU MoE (6-7 t/s).
 
 ## Documents
 
