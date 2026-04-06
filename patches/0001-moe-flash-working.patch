@@ -130,7 +130,7 @@ index 22c6569..77df25d 100644
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-@@ -1450,6 +1477,36 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1450,6 +1477,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -154,6 +154,19 @@ index 22c6569..77df25d 100644
 +    // sharing the same IDS tensor must use the original expert IDs for slot assignment.
 +    static std::unordered_map<const ggml_tensor *, std::vector<int32_t>> original_ids_cache;
 +
++    // Persistent GPU slot buffers: keyed by source weight data pointer.
++    // Each buffer holds N_SLOTS * expert_size bytes on the GPU.
++    static std::unordered_map<const void *, ggml_backend_buffer_t> persistent_slot_buffers;
++
++    // Track tensor overrides for slot_remap_mode so we can restore after graph compute.
++    struct slot_tensor_override {
++        ggml_tensor * tensor;
++        int64_t orig_ne2;
++        ggml_backend_buffer_t orig_buffer;
++        void * orig_data;
++    };
++    std::vector<slot_tensor_override> slot_overrides;
++
 +    // Invalidate expert cache when graph shape changes (prefill vs generation)
 +    static int prev_n_nodes = 0;
 +    if (sched->graph.n_nodes != prev_n_nodes) {
@@ -165,9 +178,10 @@ index 22c6569..77df25d 100644
 +    }
 +
      for (int split_id = 0; split_id < sched->n_splits; split_id++) {
++        slot_overrides.clear();
          struct ggml_backend_sched_split * split = &splits[split_id];
          int split_backend_id = split->backend_id;
-@@ -1489,7 +1546,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1489,7 +1560,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                      const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                      const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
  
@@ -177,7 +191,7 @@ index 22c6569..77df25d 100644
  
                      // get the ids
                      ggml_tensor * ids_tensor = node->src[2];
-@@ -1505,11 +1563,62 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1505,11 +1577,62 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -240,7 +254,7 @@ index 22c6569..77df25d 100644
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,46 +1631,122 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1645,144 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -259,6 +273,28 @@ index 22c6569..77df25d 100644
 -                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 +                    if (slot_remap_mode) {
 +                        const int n_slots = GGML_MOE_SLOT_BUFFER_SLOTS;
++
++                        // Lazy-allocate persistent GPU slot buffer for this weight tensor
++                        auto & slot_buf = persistent_slot_buffers[input->data];
++                        if (!slot_buf) {
++                            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
++                            slot_buf = ggml_backend_buft_alloc_buffer(buft, (size_t)n_slots * expert_size);
++                            fprintf(stderr, "[SLOT-BUF] Allocated persistent slot buffer: %zu MB for %s\n",
++                                    ((size_t)n_slots * expert_size) / (1024*1024), input->name);
++                        }
++
++                        // Override input_cpy to point at persistent slot buffer.
++                        // Expert copies below write to this buffer via input_cpy.
++                        slot_tensor_override ovr;
++                        ovr.tensor = input_cpy;
++                        ovr.orig_ne2 = input_cpy->ne[2];
++                        ovr.orig_buffer = input_cpy->buffer;
++                        ovr.orig_data = input_cpy->data;
++
++                        input_cpy->buffer = slot_buf;
++                        input_cpy->data = ggml_backend_buffer_get_base(slot_buf);
++
++                        slot_overrides.push_back(ovr);
 +
 +                        auto & sc = slot_caches[input_cpy];
 +                        if (sc.n_slots == 0) {
@@ -392,7 +428,32 @@ index 22c6569..77df25d 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1824,6 +2009,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1579,4 +1800,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+
++        // Apply persistent slot buffer overrides: set ne[2]=N_SLOTS before dispatch
++        for (auto & ovr : slot_overrides) {
++            ovr.tensor->ne[2] = GGML_MOE_SLOT_BUFFER_SLOTS;
++            fprintf(stderr, "[SLOT-BUF] Override tensor %s: ne[2] %ld -> %d, buffer=%p -> %p\n",
++                    ovr.tensor->name, (long)ovr.orig_ne2, GGML_MOE_SLOT_BUFFER_SLOTS,
++                    (void*)ovr.orig_buffer, (void*)ovr.tensor->buffer);
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+@@ -1618,4 +1847,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+
++        // Restore slot buffer overrides so graph builder sees original ne[2]
++        for (auto & ovr : slot_overrides) {
++            ovr.tensor->ne[2] = ovr.orig_ne2;
++            ovr.tensor->buffer = ovr.orig_buffer;
++            ovr.tensor->data = ovr.orig_data;
++        }
++
+         // record the event of this copy
+         if (split->n_inputs > 0) {
+@@ -1824,6 +2063,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
