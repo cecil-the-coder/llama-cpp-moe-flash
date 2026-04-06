@@ -256,7 +256,7 @@ index 22c6569..77df25d 100644
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,46 +1645,144 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1645,150 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -345,13 +345,19 @@ index 22c6569..77df25d 100644
 +                                expert_size + padding);
 +                        }
 +
-+                        // Rewrite IDS: replace expert IDs with slot indices
-+                        for (size_t i = 0; i < ids.size(); i++) {
-+                            int32_t eid = ids[i];
-+                            GGML_ASSERT(eid >= 0 && eid < n_expert && sc.expert_to_slot[eid] >= 0);
-+                            ids[i] = sc.expert_to_slot[eid];
++                        // Rewrite IDS: replace expert IDs with slot indices.
++                        // Use stride-based indexing matching the used_ids computation
++                        // to avoid accessing padding bytes in the IDS tensor.
++                        for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
++                            for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
++                                size_t idx = i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t);
++                                int32_t eid = ids[idx];
++                                GGML_ASSERT(eid >= 0 && eid < n_expert && sc.expert_to_slot[eid] >= 0);
++                                ids[idx] = sc.expert_to_slot[eid];
++                            }
 +                        }
-+                        fprintf(stderr, "[I11-DEBUG] Rewrote %zu IDS entries, writing to GPU\n", ids.size());
++                        fprintf(stderr, "[I11-DEBUG] Rewrote IDS (%ldx%ld), writing to GPU\n",
++                                (long)ids_tensor->ne[0], (long)ids_tensor->ne[1]);
  
 +                        // Write rewritten IDS to GPU
 +                        ggml_tensor * ids_gpu = node->src[2];
