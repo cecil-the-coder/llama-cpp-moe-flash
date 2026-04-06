@@ -62,7 +62,7 @@ index 7885330..57c591a 100644
  if (MATH_LIBRARY)
      if (NOT WIN32 OR NOT DEFINED ENV{ONEAPI_ROOT})
 diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
-index 22c6569..b80c29d 100644
+index 22c6569..ad83c38 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
 @@ -20,6 +20,7 @@
@@ -130,7 +130,27 @@ index 22c6569..b80c29d 100644
                              if (sched->n_copies > 1) {
                                  ggml_set_input(tensor_copy);
                                  ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
-@@ -1450,7 +1477,130 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1442,6 +1469,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     return true;
+ }
+ 
++static int get_moe_n_slots() {
++    static int n = 0;
++    if (!n) {
++        const char * env = getenv("GGML_MOE_N_SLOTS");
++        n = env ? atoi(env) : 32;
++        if (n < 8) n = 8;
++        if (n > 256) n = 256;
++        fprintf(stderr, "[MOE-SLOT] N_SLOTS=%d (set GGML_MOE_N_SLOTS to override)\n", n);
++    }
++    return n;
++}
++#define N_SLOTS get_moe_n_slots()
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1450,7 +1490,117 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
      std::vector<int32_t> ids;
      std::vector<ggml_bitset_t> used_ids;
  
@@ -143,19 +163,6 @@ index 22c6569..b80c29d 100644
 +    // Memory: 94 layers x 3 projections x N slots x ~125 MB avg
 +    // N_SLOTS=32 ~35 GB, N_SLOTS=64 ~60 GB, N_SLOTS=128 ~123 GB
 +    // (vs ~128+ GB for full n_expert buffers)
-+
-+    static int get_moe_n_slots() {
-+        static int n = 0;
-+        if (!n) {
-+            const char * env = getenv("GGML_MOE_N_SLOTS");
-+            n = env ? atoi(env) : 32;
-+            if (n < 8) n = 8;
-+            if (n > 256) n = 256;
-+            fprintf(stderr, "[MOE-SLOT] N_SLOTS=%d (set GGML_MOE_N_SLOTS to override)\n", n);
-+        }
-+        return n;
-+    }
-+    #define N_SLOTS get_moe_n_slots()
 +
 +    struct proj_sub {
 +        ggml_backend_buffer_t buffer = nullptr;
@@ -380,7 +387,7 @@ index 22c6569..b80c29d 100644
 +                        } else {
 +                            // All 3 slots used but different key — reuse slot 2 (rare edge case)
 +                            psub = &layer_entry->projections[2];
-                         }
++                        }
 +                        psub->weight_key = input->data;
 +                        psub->expert_size = expert_size;
 +                        psub->n_expert = n_expert;
@@ -403,7 +410,7 @@ index 22c6569..b80c29d 100644
 +                            psub->alloc_size = needed;
 +                            fprintf(stderr, "[MOE-SLOT] Allocated %zu MB (%d slots) for %s (proj %d)\n",
 +                                    needed / (1024*1024), N_SLOTS, input->name, layer_entry->proj_count - 1);
-+                        }
+                         }
 +                    }
 +
 +                    // Step 3: Cache original IDS to prevent gate/up/down cross-contamination
@@ -467,7 +474,9 @@ index 22c6569..b80c29d 100644
 +                            if (old >= 0) psub->expert_to_slot[old] = -1;
 +                            pool.slot_evictions++;
 +                        }
-+
+ 
+-                        first_id = id;
+-                        last_id = id;
 +                        // Assign and copy expert to slot
 +                        psub->expert_to_slot[id] = slot;
 +                        psub->slot_to_expert[slot] = id;
@@ -494,9 +503,7 @@ index 22c6569..b80c29d 100644
 +                            }
 +                        }
 +                    }
- 
--                        first_id = id;
--                        last_id = id;
++
 +                    // Defer the IDS write — scheduler's input copy loop will copy original IDS
 +                    // to GPU first, then we overwrite with slot-remapped version
 +                    deferred_writes.push_back({split_backend, ids_gpu, rewritten_ids});
