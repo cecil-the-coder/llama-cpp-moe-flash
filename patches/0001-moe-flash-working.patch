@@ -194,7 +194,7 @@ index 22c6569..77df25d 100644
  
                      // get the ids
                      ggml_tensor * ids_tensor = node->src[2];
-@@ -1505,11 +1578,62 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1505,11 +1578,61 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
                      }
  
@@ -204,8 +204,7 @@ index 22c6569..77df25d 100644
 +                    // but only the first K*expert_size bytes of the GPU buffer are accessed.
 +                    // The descriptor binding is clamped to maxStorageBufferRange by the Vulkan
 +                    // backend; the shader early-exits for experts with 0 token count.
-+                    const int max_slots_4gib = (int)std::min<size_t>(n_expert, ((size_t)4 * 1024 * 1024 * 1024) / expert_size);
-+                    const bool slot_remap_mode = ((size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024) || ggml_backend_buffer_is_host(input->buffer);
++                    const bool slot_remap_mode = ((size_t)n_expert * expert_size > (size_t)4 * 1024 * 1024 * 1024);
 +                    // DEBUG: Log slot buffer condition
 +                    fprintf(stderr, "[I11-DEBUG] MUL_MAT_ID: tensor=%s, n_expert=%ld, expert_size=%zu, total=%zu MB, slot_remap_mode=%d\n",
 +                            input->name, (long)n_expert, expert_size, ((size_t)n_expert * expert_size) / (1024*1024), slot_remap_mode);
@@ -257,7 +256,7 @@ index 22c6569..77df25d 100644
                          // find the used experts
                          used_ids.clear();
                          used_ids.resize(ggml_bitset_size(n_expert));
-@@ -1522,46 +1646,155 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1522,46 +1645,155 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                          }
  
                          prev_ids_tensor = ids_tensor;
@@ -275,7 +274,7 @@ index 22c6569..77df25d 100644
 -                        const size_t padding = std::min<size_t>(expert_size, 512);
 -                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 +                    if (slot_remap_mode) {
-+                        const int n_slots = max_slots_4gib;
++                        const int n_slots = (int)std::min<size_t>(n_expert, ((size_t)4 * 1024 * 1024 * 1024) / expert_size);
 +
 +                        // Flush pending async operations before allocating/writing to
 +                        // persistent slot buffer. Prevents Vulkan queue overflow.
@@ -442,7 +441,7 @@ index 22c6569..77df25d 100644
                  } else {
                      // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                      // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-@@ -1579,4 +1812,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1579,4 +1811,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          }
 
 +        // Apply persistent slot buffer overrides: set ne[2]=N_SLOTS before dispatch
@@ -455,7 +454,7 @@ index 22c6569..77df25d 100644
 +
          if (!sched->callback_eval) {
              enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
-@@ -1618,4 +1859,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+@@ -1618,4 +1858,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
          }
 
 +        // Restore slot buffer overrides so graph builder sees original ne[2]
@@ -467,7 +466,7 @@ index 22c6569..77df25d 100644
 +
          // record the event of this copy
          if (split->n_inputs > 0) {
-@@ -1824,6 +2075,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
+@@ -1824,6 +2074,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
      sched->callback_eval_user_data = user_data;
  }
  
