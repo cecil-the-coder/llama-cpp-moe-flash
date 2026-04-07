@@ -1,34 +1,40 @@
 # MoE Flash — Implementation Plan
 
-## Current State (Updated 2026-04-03)
+## Final State (2026-04-03) — Research Complete
 
-**Production image: `17aca27`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
+**Production image: `7937441`** on b8664 (AMD Strix Halo, 125 GB RAM, Radeon 8060S)
 
-**MILESTONE: 11 t/s on Qwen3-235B Q4_K_M with 96-slot GPU MoE remapping (6x baseline).**
+**8-patch stack delivering 7-10 t/s on Qwen3-235B Q4_K_M (4x baseline). Research phase complete.**
 
-Patches applied: 0001 (core MoE flash + expert cache stable key + sync skip + force-offload guard), 0014 (vec-path byte-range overlap check), 0017 (disable upstream -fit + auto-detect CPU_MOE).
+All viable software optimizations explored. Expert copy reduced 150x (530ms -> 3.5ms). GPU compute (85ms/token) is the hardware ceiling. Further gains require more RAM, faster GPU, or upstream improvements.
 
-Single-backend architecture with auto-detect `--cpu-moe`:
-- Models that fit in GTT (120 GB): auto-detect clears CPU_MOE, full GPU path
-- Models exceeding GTT: GPU MoE via slot remapping (configurable N_SLOTS, LRU eviction)
-
-| Model | Size | TPS | Loading | Status |
+| Model | Size | TPS | Config | Status |
 |---|---|---|---|---|
-| GLM-4-7-Flash | 17 GB | **~50** | full GPU offload | Production-ready |
-| Qwen3-235B Q2_K | 80 GB | **19.2** | full GPU offload (auto-detect) | Production-ready |
-| **Qwen3-235B Q4_K_M** | **133 GB** | **10.4-11.1** | **GPU MoE, 96-slot remapping (97.1% hit)** | **Production-ready** |
-| DeepSeek-R1-0528 Q2_K | 228 GB | **~4** | CPU MoE (can't test -- 128 GB RAM limit) | CPU-bottlenecked |
+| GLM-4-7-Flash | 17 GB | **~50** | full GPU (auto-detect) | Production-ready |
+| Qwen3-235B Q2_K | 80 GB | **20** | full GPU (auto-detect) | Production-ready |
+| **Qwen3-235B Q4_K_M** | **133 GB** | **7-10** | **GPU MoE, N_SLOTS=64** | **Production-ready** |
+| DeepSeek-R1-0528 Q2_K | 228 GB | **~4** | CPU MoE (needs 256 GB node) | Hardware-blocked |
 
-**N_SLOTS tuning (Qwen3-235B Q4_K_M):**
+### 8-Patch Stack
 
-| N_SLOTS | Hit Rate | t/s | Memory | Notes |
-|---------|----------|-----|--------|-------|
-| 32 | 74.9% | 3.5-4.1 | ~35 GB | Default |
-| 64 | 94.4% | 7.5-9.4 | ~60 GB | Good for low-RAM |
-| 96 | 97.1% | 10.4-11.1 | ~90 GB | Optimal for 128 GB |
-| 128 | -- | OOM | ~123 GB | Exceeds RADV/UMA limits |
+| Patch | Purpose |
+|-------|---------|
+| 0001a | Core MoE flash (prefetch, io_uring, metrics) |
+| 0001b | Force-offload MUL_MAT_ID guard |
+| 0001c | Persistent buffer pool + slot remapping |
+| 0014 | Vec-path byte-range aliasing check |
+| 0017 | Auto-detect CPU_MOE + disable -fit |
+| 0021 | Merge MoE splits within layer |
+| 0022 | Speculative expert prefetch |
+| 0023 | Least-stale eviction policy |
 
-**I12 benchmark**: Stock Vulkan 20.7 t/s, moe-flash 20.0 t/s, ik_llama.cpp CPU-only 11.5 t/s (Qwen3).
+### Research conclusions
+
+- **KHR_coopmat**: Already active. No free performance.
+- **Least-stale eviction (0023)**: Equivalent to LRU at full pool size.
+- **AMDVLK**: Not available; 8-10x slower in benchmarks anyway.
+- **APEX requant / MoEpic / KTransformers / PuzzleMoE**: Skipped (too complex or risky for marginal UMA gains).
+- **N_SLOTS=64 is the stable ceiling for 128 GB.** N_SLOTS=96 needs 192+ GB RAM.
 
 ---
 

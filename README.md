@@ -3,21 +3,26 @@
 Implementing "LLM in a Flash" style SSD-streaming inference for MoE models in llama.cpp,
 targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
-## Status (2026-04-03)
+## Status (2026-04-03) — Research Complete
 
-**Production image: `7937441`** on b8664 -- 5-patch stack delivering **4x baseline** on >GTT MoE models.
+**Production image: `7937441`** on b8664 -- 8-patch stack delivering **4x baseline** on >GTT MoE models.
 
 **MILESTONE: 7-10 t/s on Qwen3-235B Q4_K_M (133 GB) with GPU MoE slot remapping (N_SLOTS=64).**
 
-### Patch Stack (5 patches, each separate for upstream potential)
+**Research phase complete.** At N_SLOTS=64 on 128 GB UMA, expert copy is 3.5ms/token (optimized from 530ms -- 150x reduction) while GPU compute is 85ms/token (hardware-limited). 7-10 t/s is near the hardware ceiling. Further gains require more RAM (N_SLOTS=96 for 11 t/s), faster GPU, or upstream improvements.
+
+### Patch Stack (8 patches, each separate for upstream potential)
 
 | Patch | Lines | Purpose |
 |-------|-------|---------|
-| 0001 | ~2700 | Core MoE flash + persistent buffer pool + slot remapping + LRU cache |
+| 0001a | ~2700 | Core MoE flash (prefetch, io_uring, metrics) |
+| 0001b | ~50 | Force-offload MUL_MAT_ID guard |
+| 0001c | ~400 | Persistent buffer pool + slot remapping |
 | 0014 | ~30 | Vec-path byte-range aliasing check (safety net) |
 | 0017 | ~60 | Auto-detect CPU_MOE + disable upstream -fit hang |
 | 0021 | ~33 | Merge MoE splits within layer (282->96 splits) |
 | 0022 | ~226 | Speculative expert prefetch (pre-seed next layer's slots) |
+| 0023 | ~80 | Least-stale eviction policy |
 
 ### What works well (models that fit in GTT)
 
@@ -65,22 +70,24 @@ clears CPU_MOE, no special configuration needed. These are production-ready.
 | Speculative prefetch (0022) | 7-10 | marginal |
 | **N_SLOTS=96 (unstable)** | **10.4-11.1** | **+17% (needs 192+ GB RAM)** |
 
-### Optimization Status (A-J)
+### Research Conclusions
 
-| ID | Investigation | Status | Outcome |
-|----|---------------|--------|---------|
-| A | DeepSeek on slot remapping | Blocked | Needs 256 GB node |
-| B | Upstream #20757 contribution | Deferred | Focus on production first |
-| C | imatrix pre-seeding | Deferred | Only saves ~3s cold start |
-| D | Graph split reduction | **DONE** | Patch 0021, 282->96 splits, marginal t/s |
-| E | Speculative expert prefetch | **DONE** | Patch 0022, marginal t/s |
-| F | Adaptive N_SLOTS per layer | **SKIP** | Homogeneous experts; upgrade RAM instead |
-| G | Expert routing prediction | **DEFER** | <0.1 t/s gain, GPU-compute-limited |
-| H | Rebase tracking (upstream) | Ongoing | Track #20757, upstream releases |
-| I | Patch surface reduction | Not started | Maintenance quality |
-| J | Multi-model expert pool | Not started | Multiple MoE models on one GPU |
+All viable software optimizations for this hardware have been explored:
 
-At 94.6% hit rate, GPU compute (~85ms) dominates over expert copy (~3.5ms) and sync (~7ms). Further gains require more RAM, upstream improvements, or better hardware.
+| Investigation | Status | Outcome |
+|---------------|--------|---------|
+| KHR_coopmat | Already active | No free performance available |
+| Least-stale eviction (0023) | **DONE** | Equivalent to LRU at full pool size |
+| AMDVLK driver | Not available | Would need separate build image |
+| APEX requant | Skipped | Too risky for marginal gain |
+| MoEpic / KTransformers / PuzzleMoE | Skipped | Too complex for marginal gains on UMA |
+| D: Graph split reduction | **DONE** | Patch 0021, 282->96 splits, marginal t/s |
+| E: Speculative expert prefetch | **DONE** | Patch 0022, marginal t/s |
+| F: Adaptive N_SLOTS per layer | **SKIP** | Homogeneous experts; upgrade RAM instead |
+| G: Expert routing prediction | **DEFER** | <0.1 t/s gain, GPU-compute-limited |
+| A: DeepSeek on slot remapping | Blocked | Needs 256 GB node |
+
+At 94.6% hit rate, GPU compute (~85ms) dominates over expert copy (~3.5ms) and sync (~7ms). The 8-patch stack is production-ready. Further gains require hardware changes.
 
 ### Previous approaches that didn't work
 
@@ -93,13 +100,12 @@ At 94.6% hit rate, GPU compute (~85ms) dominates over expert copy (~3.5ms) and s
 - **Flash-moe async prefetch for DeepSeek**: Reads from disk each token instead of
   using cached GPU buffers. Slower than standard path with expert cache (2.3 vs 4.1 t/s).
 
-### What would further improve performance
+### Remaining paths (all hardware-dependent)
 
-1. **Cross-layer expert prediction**: Prefetch likely experts based on routing patterns across layers. Could reduce the remaining 2.9% miss rate further.
-2. **imatrix-based slot pre-seeding**: Pre-load frequently-used experts from importance matrix data (from #20757 discussion). Reduces warmup time.
-3. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul with shader support. 14 t/s PoC.
-4. **Better CPU kernels**: ik_llama.cpp's FlashMLA + fused MoE FFN, or Intel AMX support.
-5. **Rebase to newer llama.cpp**: As upstream MoE work lands.
+1. **More RAM (192+ GB)**: Enables N_SLOTS=96 for 10.4-11.1 t/s (+17%)
+2. **Upstream two-tier expert cache (#20757)**: Proper GPU expert matmul with shader support. 14 t/s PoC.
+3. **Newer llama.cpp**: Upstream Vulkan shader optimizations reduce the 85ms GPU compute
+4. **Better hardware**: Intel AMX (28 t/s per KTransformers), faster discrete GPU
 
 ---
 
@@ -180,16 +186,19 @@ N_SLOTS=64 (~60 GB pool) is the stable production config for 128 GB nodes.
 
 | Patch | Status | Purpose |
 |---|---|---|
-| 0001 | Applied | Core MoE flash + persistent buffer pool + slot remapping + LRU cache |
+| 0001a | Applied | Core MoE flash (prefetch, io_uring, metrics) |
+| 0001b | Applied | Force-offload MUL_MAT_ID guard |
+| 0001c | Applied | Persistent buffer pool + slot remapping |
 | 0014 | Applied | Vec-path byte-range aliasing check (safety net) |
 | 0017 | Applied | Auto-detect CPU_MOE + disable upstream -fit hang |
 | 0021 | Applied | Merge MoE splits within layer (282->96 splits) |
 | 0022 | Applied | Speculative expert prefetch (pre-seed next layer's slots) |
+| 0023 | Applied | Least-stale eviction policy |
 
-**Production COMPLETE**: Image `7937441` delivers **7-10 t/s** on Qwen3 Q4_K_M
+**Research COMPLETE**: Image `7937441` delivers **7-10 t/s** on Qwen3 Q4_K_M
 with 64-slot remapping (94.6% expert hit rate with speculative prefetch). 4x speedup
-over baseline CPU MoE. No shader modifications needed. `ne[2]=N_SLOTS` override on
-persistent pool tensors outside gallocr flows correctly through all three shaders.
+over baseline CPU MoE. 8-patch stack is production-ready. All viable software
+optimizations explored -- GPU compute (85ms) is the hardware ceiling.
 Configurable via `GGML_MOE_N_SLOTS` env var. N_SLOTS=64 is the stable production
 config for 128 GB nodes (~60 GB buffer memory).
 
