@@ -58,21 +58,21 @@
 **Status**: COMPLETE as patch 0022. Deployed in image `7937441`. Improves hit rate from 94.4% to 94.6% with N_SLOTS=64. Marginal t/s improvement -- the LRU cache already captures most reuse.
 **Patch**: `patches/0022-speculative-expert-prefetch.patch`
 
-#### F: Adaptive N_SLOTS per Layer (Reduce Pool Memory 20-30%)
+#### F: Adaptive N_SLOTS per Layer (Reduce Pool Memory 20-30%) -- INVESTIGATED, SKIP
 **Goal**: Instead of a fixed N_SLOTS=96 for all layers, use fewer slots for layers with lower expert diversity.
 **How**: Profile expert activation patterns across layers. Layers where fewer unique experts are used can have smaller pools. E.g., early layers might need only 64 slots while later layers need 96.
-**Challenge**: Requires per-layer pool sizing and more complex memory management.
+**Finding**: Expert activation is homogeneous across layers -- all layers use roughly the same number of unique experts. Per-layer tuning yields negligible memory savings. Better to upgrade RAM to enable N_SLOTS=96 globally.
 **Effort**: Medium
-**Impact**: Medium (20-30% memory reduction could allow higher N_SLOTS for hot layers, or free memory for larger batch sizes)
+**Impact**: SKIP -- homogeneous experts make per-layer tuning pointless; upgrade RAM instead
 
 ### Tier 3: Research/Exploration
 
-#### G: Expert Routing Prediction (Layer N -> N+1)
+#### G: Expert Routing Prediction (Layer N -> N+1) -- INVESTIGATED, DEFER
 **Goal**: Predict which experts will be activated in layer N+1 based on layer N's routing decisions.
 **How**: Build a lightweight prediction model (e.g., frequency table or small MLP) from routing statistics. Pre-load predicted experts before they are needed.
-**Challenge**: Prediction accuracy must be very high (>95%) to avoid wasted copies. MoE routing can be unpredictable across layers.
+**Finding**: At 94.6% hit rate, expert copy is ~3.5ms per miss. Even perfect prediction eliminating all misses saves <0.1 t/s. The bottleneck is GPU compute (~85ms per token), not expert loading. Not worth the complexity.
 **Effort**: High
-**Impact**: Low-Medium (only helps the 2.9% miss rate, which is already small)
+**Impact**: DEFER -- <0.1 t/s gain, GPU-compute-limited
 
 #### H: Rebase Tracking (llama.cpp Upstream)
 **Goal**: Stay current with upstream llama.cpp developments, especially MoE-related changes.
@@ -102,6 +102,8 @@
 
 ## Completed Investigations
 
+- **F** - **Adaptive N_SLOTS INVESTIGATED, SKIP**: Homogeneous expert activation across layers -- per-layer tuning yields negligible savings. Better to upgrade RAM.
+- **G** - **Routing prediction INVESTIGATED, DEFER**: <0.1 t/s gain. At 94.6% hit rate, GPU compute (~85ms) dominates over expert copy (~3.5ms). Not worth the complexity.
 - **I10b** - **Slot remapping COMPLETE**: 7-10 t/s GPU MoE on Qwen3 Q4_K_M (133 GB, >GTT) with N_SLOTS=64. 94.6% hit rate with speculative prefetch. Stable on 128 GB. Configurable via `GGML_MOE_N_SLOTS`.
 - **D** - **Split merging COMPLETE** (patch 0021): 282->96 splits. Marginal t/s improvement.
 - **E** - **Speculative prefetch COMPLETE** (patch 0022): Pre-seed next layer's slots. Marginal t/s improvement.
@@ -121,12 +123,31 @@
 | **E: Speculative prefetch** | Marginal | Medium | **DONE (patch 0022)** | Pre-seed next layer's slots |
 | **A: DeepSeek slot remap** | Very High | Low | Blocked (needs 256 GB) | 3-5x expected once hardware available |
 | **C: imatrix pre-seeding** | Low | Medium | Deferred | Only saves ~3s cold start |
-| **F: Adaptive N_SLOTS** | Medium | Medium | Not started | Reduce pool memory 20-30% |
-| **G: Routing prediction** | Low-Med | High | Not started | Only helps 2.9% miss rate |
+| **F: Adaptive N_SLOTS** | Medium | Medium | **INVESTIGATED, SKIP** | Homogeneous experts; upgrade RAM instead |
+| **G: Routing prediction** | Low-Med | High | **INVESTIGATED, DEFER** | <0.1 t/s gain, GPU-compute-limited |
 | **H: Rebase tracking** | High | Low | Ongoing | Track #20757, upstream releases |
 | **I: Patch surface reduction** | Low | Low-Med | Not started | Maintenance quality |
 | **J: Multi-model pool** | Medium | High | Not started | Multiple MoE models on one GPU |
 | **B: Upstream #20757** | Medium | High | Deferred | Focus on production first |
+
+---
+
+## Diminishing Returns
+
+At 94.6% expert hit rate with N_SLOTS=64, the per-token cost breakdown is:
+
+| Phase | Time | % of Token |
+|-------|------|------------|
+| **GPU compute** | ~85 ms | ~89% |
+| Sync overhead | ~7 ms | ~7% |
+| Expert copy (misses) | ~3.5 ms | ~4% |
+
+GPU compute dominates. Optimizations targeting expert copy or miss rate (F, G) yield <0.1 t/s improvement because they only affect the ~4% copy slice. The remaining viable paths to faster inference are:
+
+1. **More RAM (192+ GB)**: Enables N_SLOTS=96 for 10.4-11.1 t/s (+17%)
+2. **Upstream #20757**: Proper two-tier GPU cache with SLRU eviction and shader-level expert matmul
+3. **Newer llama.cpp**: Upstream Vulkan shader optimizations reduce the 85ms GPU compute
+4. **Better hardware**: Intel AMX (28 t/s per KTransformers), faster GPU
 
 ---
 

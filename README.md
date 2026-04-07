@@ -65,6 +65,23 @@ clears CPU_MOE, no special configuration needed. These are production-ready.
 | Speculative prefetch (0022) | 7-10 | marginal |
 | **N_SLOTS=96 (unstable)** | **10.4-11.1** | **+17% (needs 192+ GB RAM)** |
 
+### Optimization Status (A-J)
+
+| ID | Investigation | Status | Outcome |
+|----|---------------|--------|---------|
+| A | DeepSeek on slot remapping | Blocked | Needs 256 GB node |
+| B | Upstream #20757 contribution | Deferred | Focus on production first |
+| C | imatrix pre-seeding | Deferred | Only saves ~3s cold start |
+| D | Graph split reduction | **DONE** | Patch 0021, 282->96 splits, marginal t/s |
+| E | Speculative expert prefetch | **DONE** | Patch 0022, marginal t/s |
+| F | Adaptive N_SLOTS per layer | **SKIP** | Homogeneous experts; upgrade RAM instead |
+| G | Expert routing prediction | **DEFER** | <0.1 t/s gain, GPU-compute-limited |
+| H | Rebase tracking (upstream) | Ongoing | Track #20757, upstream releases |
+| I | Patch surface reduction | Not started | Maintenance quality |
+| J | Multi-model expert pool | Not started | Multiple MoE models on one GPU |
+
+At 94.6% hit rate, GPU compute (~85ms) dominates over expert copy (~3.5ms) and sync (~7ms). Further gains require more RAM, upstream improvements, or better hardware.
+
 ### Previous approaches that didn't work
 
 - **Buffer pool (per-projection and per-layer)**: Both have 0% hit rate. Per-projection:
