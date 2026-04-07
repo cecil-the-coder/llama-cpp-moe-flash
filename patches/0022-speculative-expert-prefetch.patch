@@ -1,0 +1,226 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index c7de9a9..668667e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1546,6 +1546,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int64_t expert_hits = 0;
+         int64_t expert_misses = 0;
+         int64_t slot_evictions = 0;
++        int64_t prefetch_copies = 0;
++        int64_t prefetch_hits = 0;
+     } pool;
+ 
+     static int prev_graph_nodes = 0;
+@@ -1610,12 +1612,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     };
+     std::vector<deferred_ids_write> deferred_writes;
+ 
++    // Speculative prefetch: track active expert IDs from current MoE split
++    // to pre-seed the next MoE split's slot cache while GPU computes.
++    struct prefetch_record {
++        const void * weight_key;    // input->data for weight matching
++        size_t expert_size;
++        int n_expert;
++        const void * src_data;      // host weight data pointer
++        std::vector<int32_t> active_experts;  // expert IDs used this layer
++    };
++    static std::vector<prefetch_record> prev_moe_experts;
++
+     // Clear per-computation IDS cache (pointers may be reused across calls)
+     original_ids_cache.clear();
+ 
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
+         pool_overrides.clear();
+         deferred_writes.clear();
++        // Track MoE projections processed in this split for speculative prefetch
++        std::vector<prefetch_record> this_split_moe;
++        bool this_split_is_moe = false;
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+@@ -1870,6 +1886,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         pool.expert_misses++;
+                     }
+ 
++                    // Record active experts for speculative prefetch of next MoE split
++                    {
++                        prefetch_record rec;
++                        rec.weight_key = input->data;
++                        rec.expert_size = expert_size;
++                        rec.n_expert = n_expert;
++                        rec.src_data = input->data;
++                        for (int64_t eid = 0; eid < n_expert; ++eid) {
++                            if (ggml_bitset_get(used_ids.data(), eid)) {
++                                rec.active_experts.push_back(eid);
++                            }
++                        }
++                        this_split_moe.push_back(std::move(rec));
++                        this_split_is_moe = true;
++                    }
++
+                     // Step 6: Rewrite IDS: expert_id -> slot_idx
+                     // Use stride-based indexing (learned from previous IDS stride bug)
+                     std::vector<int32_t> rewritten_ids = ids;
+@@ -1965,6 +1997,140 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // Speculative expert prefetch: while GPU computes current MoE split,
++        // pre-copy this layer's active experts into the NEXT MoE split's slot
++        // buffers. Adjacent MoE layers have ~60-80% expert overlap, so most
++        // speculative copies become cache hits when the next split starts.
++        //
++        // This overlaps CPU memcpy with GPU compute because
++        // ggml_backend_graph_compute_async returns immediately on Vulkan.
++        if (this_split_is_moe && !this_split_moe.empty()) {
++            // Save for the next MoE split to use
++            prev_moe_experts = std::move(this_split_moe);
++        }
++        if (!prev_moe_experts.empty() && !this_split_is_moe) {
++            // Current split is NOT MoE (e.g. attention split) — GPU is busy.
++            // Peek ahead: if the next split is MoE, speculatively pre-copy
++            // the previous MoE layer's experts into its slot buffers NOW.
++            int next_id = split_id + 1;
++            if (next_id < sched->n_splits) {
++                struct ggml_backend_sched_split * next_split = &splits[next_id];
++                int next_backend_id = next_split->backend_id;
++                ggml_backend_t next_backend = sched->backends[next_backend_id];
++
++                // Check if next split has MoE weight inputs
++                for (int ni = 0; ni < next_split->n_inputs; ni++) {
++                    struct ggml_tensor * next_input = next_split->inputs[ni];
++                    if (!(ggml_backend_buffer_get_usage(next_input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                          ggml_backend_buffer_is_host(next_input->buffer))) {
++                        continue;
++                    }
++
++                    // Verify this input feeds a MUL_MAT_ID node
++                    bool is_moe_weight = false;
++                    for (int nni = 0; nni < next_split->graph.n_nodes; nni++) {
++                        ggml_tensor * candidate = next_split->graph.nodes[nni];
++                        struct ggml_tensor * next_input_cpy = tensor_copy(next_input, next_backend_id, sched->cur_copy);
++                        if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] == next_input_cpy) {
++                            is_moe_weight = true;
++                            break;
++                        }
++                    }
++                    if (!is_moe_weight) continue;
++
++                    const size_t next_expert_size = next_input->nb[2];
++                    const int next_n_expert = next_input->ne[2];
++
++                    // Find matching projection from previous MoE layer by expert geometry
++                    // (gate matches gate, up matches up, down matches down — same expert_size)
++                    for (auto & prev : prev_moe_experts) {
++                        if (prev.expert_size != next_expert_size) continue;
++                        if (prev.n_expert != next_n_expert) continue;
++
++                        // Find the pool entry for this weight by matching weight_key
++                        layer_pool_entry * target_layer = nullptr;
++                        for (auto & le : pool.entries) {
++                            for (int p = 0; p < le.proj_count; p++) {
++                                if (le.projections[p].weight_key == next_input->data) {
++                                    target_layer = &le;
++                                    break;
++                                }
++                            }
++                            if (target_layer) break;
++                        }
++
++                        // If no pool entry exists yet for this weight, skip —
++                        // first token hasn't warmed up this layer yet.
++                        if (!target_layer) break;
++
++                        // Find the matching projection sub-entry
++                        proj_sub * target_psub = nullptr;
++                        for (int p = 0; p < target_layer->proj_count; p++) {
++                            if (target_layer->projections[p].weight_key == next_input->data) {
++                                target_psub = &target_layer->projections[p];
++                                break;
++                            }
++                        }
++                        if (!target_psub) break;
++
++                        // Speculatively pre-copy experts that are active in current
++                        // layer but not yet cached in the next layer's slots.
++                        struct ggml_tensor * next_input_cpy = tensor_copy(next_input, next_backend_id, sched->cur_copy);
++                        for (int32_t eid : prev.active_experts) {
++                            if (eid >= target_psub->n_expert) continue;
++                            if (target_psub->expert_to_slot[eid] >= 0) {
++                                // Already cached — speculative hit
++                                pool.prefetch_hits++;
++                                continue;
++                            }
++
++                            // Cache miss — speculatively copy to a free/LRU slot
++                            int slot = -1;
++                            for (int s = 0; s < N_SLOTS; s++) {
++                                if (target_psub->slot_to_expert[s] == -1) { slot = s; break; }
++                            }
++                            if (slot == -1) {
++                                // Evict LRU slot
++                                int64_t min_lru = INT64_MAX;
++                                for (int s = 0; s < N_SLOTS; s++) {
++                                    if (target_psub->slot_lru[s] < min_lru) {
++                                        min_lru = target_psub->slot_lru[s]; slot = s;
++                                    }
++                                }
++                                int old = target_psub->slot_to_expert[slot];
++                                if (old >= 0) target_psub->expert_to_slot[old] = -1;
++                            }
++
++                            target_psub->expert_to_slot[eid] = slot;
++                            target_psub->slot_to_expert[slot] = eid;
++                            target_psub->slot_lru[slot] = ++target_psub->slot_clock;
++
++                            // Copy expert data from host weight to GPU slot buffer.
++                            // Temporarily override input_cpy to point at the target
++                            // pool buffer for the tensor_set_async call.
++                            ggml_backend_buffer_t save_buf = next_input_cpy->buffer;
++                            void * save_data = next_input_cpy->data;
++                            next_input_cpy->buffer = target_psub->buffer;
++                            next_input_cpy->data = target_psub->base_ptr;
++
++                            const size_t src_offset = (size_t)eid * next_expert_size;
++                            const size_t dst_offset = (size_t)slot * next_expert_size;
++                            ggml_backend_tensor_set_async(next_backend, next_input_cpy,
++                                (const uint8_t *)next_input->data + src_offset,
++                                dst_offset, next_expert_size);
++
++                            next_input_cpy->buffer = save_buf;
++                            next_input_cpy->data = save_data;
++
++                            pool.prefetch_copies++;
++                        }
++
++                        break;  // matched this projection, move to next input
++                    }
++                }
++            }
++        }
++
+         // Restore pool buffer overrides so graph builder sees original tensors
+         for (auto & ovr : pool_overrides) {
+             ovr.tensor->buffer = ovr.orig_buffer;
+@@ -1980,6 +2146,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+     }
+ 
++    // Log speculative prefetch stats periodically
++    {
++        static int64_t prefetch_log_counter = 0;
++        if (pool.prefetch_copies > 0 && (++prefetch_log_counter % 50 == 1)) {
++            fprintf(stderr, "[MOE-PREFETCH] speculative copies=%ld hits=%ld (overlap=%.1f%%) expert_hit=%.1f%%\n",
++                    (long)pool.prefetch_copies, (long)pool.prefetch_hits,
++                    pool.prefetch_copies + pool.prefetch_hits > 0
++                        ? 100.0 * pool.prefetch_hits / (pool.prefetch_copies + pool.prefetch_hits)
++                        : 0.0,
++                    pool.expert_hits + pool.expert_misses > 0
++                        ? 100.0 * pool.expert_hits / (pool.expert_hits + pool.expert_misses)
++                        : 0.0);
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
