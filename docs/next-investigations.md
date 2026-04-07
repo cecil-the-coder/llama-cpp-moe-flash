@@ -1,6 +1,6 @@
 # Research Phase: Complete
 
-**Status**: RESEARCH COMPLETE -- 9-patch stack on b8664. 7 MoE models validated: 13-50 t/s for in-GTT models (auto-detect, no config), 7-10 t/s for >GTT (N_SLOTS=64, 4x baseline). All viable software optimizations explored. GPU compute (85ms/token) is the hardware ceiling. (2026-04-03)
+**Status**: RESEARCH COMPLETE -- 9-patch stack on b8664. 8 MoE models validated: 13-50 t/s for in-GTT models (auto-detect, no config), 7-10 t/s for >GTT (N_SLOTS=64, 4x baseline). All viable software optimizations explored. GPU compute (85ms/token) is the hardware ceiling. (2026-04-03)
 
 **Production Image**: `7937441` on b8664
 
@@ -21,6 +21,7 @@ Expert copy: **3.5ms/token** (optimized from 530ms -- 150x reduction). GPU compu
 | Nemotron-3-Super-120B | 85 GB | ? | ? | **13.2** | Full GPU (auto-detect) |
 | Qwen3-235B Q4_K_M | 133 GB | 128 | 8 | **7-10** | GPU MoE slot remap (N_SLOTS=64) |
 | DeepSeek-R1-0528 | 228 GB | 256 | 8 | ~4 | CPU MoE |
+| GLM-5.1 UD-Q2_K_XL | 252 GB | 256 | 8 | 1.6-2.9 | CPU MoE (GPU pending driver fix) |
 
 ### Key findings
 

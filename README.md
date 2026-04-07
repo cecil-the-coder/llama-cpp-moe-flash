@@ -7,7 +7,7 @@ targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
 **Production image: `7937441`** on b8664 -- 9-patch stack delivering **4x baseline** on >GTT MoE models.
 
-**MILESTONE: 7 MoE models validated across full performance spectrum (13-50 t/s for in-GTT, 7-10 t/s for >GTT).**
+**MILESTONE: 8 MoE models validated across full performance spectrum (13-50 t/s for in-GTT, 7-10 t/s for >GTT, 1.6-2.9 t/s CPU-only for 744B).**
 
 **Research phase complete.** Auto-detect works for all models that fit in GTT -- no manual configuration needed. Slot remapping (N_SLOTS=64) only benefits >GTT models. At N_SLOTS=64 on 128 GB UMA, expert copy is 3.5ms/token (optimized from 530ms -- 150x reduction) while GPU compute is 85ms/token (hardware-limited). 7-10 t/s is near the hardware ceiling for >GTT models.
 
@@ -39,6 +39,7 @@ configuration needed. Slot remapping only benefits models exceeding GTT (120 GB)
 | Nemotron-3-Super-120B | 85 GB | ? | ? | **13.2** | Full GPU (auto-detect) |
 | Qwen3-235B Q4_K_M | 133 GB | 128 | 8 | **7-10** | GPU MoE slot remap (N_SLOTS=64) |
 | DeepSeek-R1-0528 | 228 GB | 256 | 8 | ~4 | CPU MoE |
+| GLM-5.1 UD-Q2_K_XL | 252 GB | 256 | 8 | 1.6-2.9 | CPU MoE (GPU pending driver fix) |
 
 ### Key findings
 
@@ -193,6 +194,7 @@ territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB
 | Nemotron-3-Super-120B | 85 GB | Yes | Full GPU (auto-detect) | **13.2** | Production-ready |
 | **Qwen3-235B Q4_K_M** | **133 GB** | **No** | **GPU MoE, N_SLOTS=64** | **7-10** | **Production-ready** |
 | DeepSeek-R1-0528 Q2_K | 228 GB | No | CPU MoE (can't test -- 128 GB RAM limit) | **~4** | CPU-bottlenecked |
+| GLM-5.1 UD-Q2_K_XL | 252 GB | No | CPU MoE (Vulkan driver error) | **1.6-2.9** | Warming up, ~4 expected w/ GPU attn |
 
 **Key insight**: Auto-detect works for all <=GTT models (no configuration needed).
 Slot remapping with N_SLOTS=64 delivers **4x speedup** over baseline CPU MoE
@@ -217,7 +219,7 @@ for 128 GB nodes.
 | 0023 | Applied | Least-stale eviction policy |
 | 0024 | Applied | Batch pool allocation (one sync, all buffers) |
 
-**Research COMPLETE**: 9-patch stack validated across 7 MoE models (13-50 t/s for
+**Research COMPLETE**: 9-patch stack validated across 8 MoE models (13-50 t/s for
 in-GTT, 7-10 t/s for >GTT). Auto-detect works for all <=GTT models. Slot remapping
 only needed for >GTT. Batch allocation (0024) fixes N_SLOTS startup stall.
 GPU compute (85ms) is the hardware ceiling. N_SLOTS=64 is the stable production
