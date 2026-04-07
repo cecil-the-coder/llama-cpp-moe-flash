@@ -1,0 +1,481 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 1a6b2e3..4cced1e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -728,6 +728,9 @@ struct ggml_backend_sched {
+     ggml_backend_sched_expert_copy_callback callback_expert_copy;
+     void * callback_expert_copy_user_data;
+ 
++    // MoE cache warm flag: when true, skip weight-triggered splits for MUL_MAT_ID
++    bool moe_cache_warm;
++
+     char * context_buffer;
+     size_t context_buffer_size;
+ 
+@@ -1209,7 +1212,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     // check if a weight is on a different and incompatible backend
+                     // by starting a new split, the memory of the previously offloaded weights can be reused
+                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+-                        int src_backend_id = tensor_backend_id(src);
++                        const int src_backend_id = tensor_backend_id(src);
+                         if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                             need_new_split = true;
+                             break;
+@@ -1285,6 +1288,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         for (int c = 0; c < sched->n_copies; c++) {
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
++
+                             if (sched->n_copies > 1) {
+                                 ggml_set_input(tensor_copy);
+                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+@@ -1462,6 +1466,19 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+     return true;
+ }
+ 
++static int get_moe_n_slots() {
++    static int n = 0;
++    if (!n) {
++        const char * env = getenv("GGML_MOE_N_SLOTS");
++        n = env ? atoi(env) : 32;
++        if (n < 8) n = 8;
++        if (n > 256) n = 256;
++        fprintf(stderr, "[MOE-SLOT] N_SLOTS=%d (set GGML_MOE_N_SLOTS to override)\n", n);
++    }
++    return n;
++}
++#define N_SLOTS get_moe_n_slots()
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1470,7 +1487,117 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+     std::vector<int32_t> ids;
+     std::vector<ggml_bitset_t> used_ids;
+ 
++    // Persistent GPU buffer pool with SLOT REMAPPING for MoE expert caching.
++    // Each projection gets N_SLOTS slots instead of n_expert (128/256) slots.
++    // Active experts are copied into LRU-managed slots, IDS tensor is rewritten
++    // to map expert_id -> slot_idx, and ne[2] is overridden to N_SLOTS so the
++    // shader dispatches with n_as=N_SLOTS workgroups.
++    //
++    // Memory: 94 layers x 3 projections x N slots x ~125 MB avg
++    // N_SLOTS=32 ~35 GB, N_SLOTS=64 ~60 GB, N_SLOTS=128 ~123 GB
++    // (vs ~128+ GB for full n_expert buffers)
++
++    struct proj_sub {
++        ggml_backend_buffer_t buffer = nullptr;
++        void * base_ptr = nullptr;
++        size_t alloc_size = 0;
++        const void * weight_key = nullptr;  // input->data for this projection
++        size_t expert_size = 0;
++        int n_expert = 0;
++        // Slot LRU cache
++        std::vector<int32_t> expert_to_slot;  // [n_expert] -> slot or -1
++        std::vector<int32_t> slot_to_expert;  // [N_SLOTS] -> expert or -1
++        std::vector<int64_t> slot_lru;        // [N_SLOTS] -> timestamp
++        int64_t slot_clock = 0;
++    };
++
++    struct layer_pool_entry {
++        proj_sub projections[3];  // gate, up, down
++        int64_t last_used = 0;
++        int proj_count = 0;       // how many projections filled (0-3)
++        const ggml_tensor * ids_key = nullptr;  // IDS tensor for layer identification
++    };
++
++    static struct {
++        std::vector<layer_pool_entry> entries;
++        int64_t clock = 0;
++        bool initialized = false;
++        int64_t layer_hits = 0;
++        int64_t layer_misses = 0;
++        int64_t layer_evictions = 0;
++        int64_t expert_hits = 0;
++        int64_t expert_misses = 0;
++        int64_t slot_evictions = 0;
++    } pool;
++
++    static int prev_graph_nodes = 0;
++
++    // Track current layer's pool entry for same-IDS grouping
++    static const ggml_tensor * current_layer_ids = nullptr;
++    static layer_pool_entry * current_layer_entry = nullptr;
++
++    // Cache original IDS per tensor to prevent gate/up/down cross-contamination.
++    // Gate rewrites IDS with gate's slot mapping; up/down must use original expert IDs.
++    static std::unordered_map<const ggml_tensor *, std::vector<int32_t>> original_ids_cache;
++
++    // Invalidate pool on graph shape change (prefill vs generation)
++    if (sched->graph.n_nodes != prev_graph_nodes) {
++        for (auto & le : pool.entries) {
++            for (int p = 0; p < 3; p++) {
++                auto & ps = le.projections[p];
++                ps.weight_key = nullptr;
++                std::fill(ps.expert_to_slot.begin(), ps.expert_to_slot.end(), -1);
++                std::fill(ps.slot_to_expert.begin(), ps.slot_to_expert.end(), -1);
++                std::fill(ps.slot_lru.begin(), ps.slot_lru.end(), 0);
++                ps.slot_clock = 0;
++            }
++            le.proj_count = 0;
++            le.ids_key = nullptr;
++        }
++        current_layer_ids = nullptr;
++        current_layer_entry = nullptr;
++        original_ids_cache.clear();
++        prev_graph_nodes = sched->graph.n_nodes;
++    }
++
++    // Initialize pool on first use
++    if (!pool.initialized) {
++        int pool_layers = 94;  // default: 94 layers = all MoE layers (~35 GB with N_SLOTS=32)
++        const char * env = getenv("GGML_MOE_POOL_LAYERS");
++        if (env) pool_layers = atoi(env);
++        // Also support old env var for backward compat
++        const char * env_old = getenv("GGML_MOE_POOL_ENTRIES");
++        if (env_old) pool_layers = (atoi(env_old) + 2) / 3;  // convert entries to layers
++        pool.entries.resize(pool_layers);
++        pool.initialized = true;
++        fprintf(stderr, "[MOE-POOL] Slot remapping: %d layer entries x 3 proj x %d slots\n",
++                pool_layers, N_SLOTS);
++    }
++
++    // Track tensor overrides for pool buffers so we can restore after graph compute.
++    struct pool_tensor_override {
++        ggml_tensor * tensor;
++        ggml_backend_buffer_t orig_buffer;
++        void * orig_data;
++        int64_t orig_ne2;
++    };
++    std::vector<pool_tensor_override> pool_overrides;
++
++    // Deferred IDS writes: must happen AFTER the scheduler's input copy loop
++    // (which copies original IDS from CPU to GPU, overwriting our rewrite).
++    struct deferred_ids_write {
++        ggml_backend_t backend;
++        ggml_tensor * tensor;
++        std::vector<int32_t> data;
++    };
++    std::vector<deferred_ids_write> deferred_writes;
++
++    // Clear per-computation IDS cache (pointers may be reused across calls)
++    original_ids_cache.clear();
++
+     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
++        pool_overrides.clear();
++        deferred_writes.clear();
+         struct ggml_backend_sched_split * split = &splits[split_id];
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+@@ -1498,18 +1625,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                 }
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+-                ggml_tensor * node = split->graph.nodes[0];
++                // With merged MoE splits, multiple MUL_MAT_ID nodes share one split,
++                // so check ALL nodes (not just nodes[0]) for a matching weight input.
++                ggml_tensor * node = nullptr;
+                 if (split->graph.n_nodes > 0 &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-                    ggml_backend_buffer_is_host(input->buffer) && (
+-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+-                    //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
+-                    )) {
++                    ggml_backend_buffer_is_host(input->buffer)) {
++                    for (int ni = 0; ni < split->graph.n_nodes; ni++) {
++                        ggml_tensor * candidate = split->graph.nodes[ni];
++                        if (candidate->op == GGML_OP_MUL_MAT_ID && candidate->src[0] == input_cpy) {
++                            node = candidate;
++                            break;
++                        }
++                    }
++                }
++                if (node != nullptr) {
+ 
+                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+ 
+-                    ggml_backend_synchronize(input_backend);
++                    // NOTE: input_backend sync moved below early-exit cache check
++                    // to avoid wasting ~50-100us per MoE split when cache is 100% warm.
+ 
+                     // get the ids
+                     ggml_tensor * ids_tensor = node->src[2];
+@@ -1525,6 +1661,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+                     }
+ 
++                    // Sync input_backend before copying experts.
++                    ggml_backend_synchronize(input_backend);
++
+                     if (ids_tensor != prev_ids_tensor) {
+                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
+                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
+@@ -1542,46 +1681,208 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         }
+ 
+                         prev_ids_tensor = ids_tensor;
++
++                        if (sched->callback_expert_copy) {
++                            sched->callback_expert_copy(node, used_ids.data(), n_expert, sched->callback_expert_copy_user_data);
++                        }
++                    }
++
++                    // --- Slot-remapped GPU buffer pool ---
++                    // Step 1: Find or create layer entry using IDS tensor grouping
++                    layer_pool_entry * layer_entry = nullptr;
++
++                    // Same IDS tensor = same MoE layer (gate/up/down share selected_experts)
++                    if (ids_tensor == current_layer_ids && current_layer_entry) {
++                        layer_entry = current_layer_entry;
++                        layer_entry->last_used = ++pool.clock;
++                    } else {
++                        // New layer — search pool for existing entry with this IDS
++                        for (auto & le : pool.entries) {
++                            if (le.ids_key == ids_tensor && le.proj_count > 0) {
++                                layer_entry = &le;
++                                layer_entry->last_used = ++pool.clock;
++                                break;
++                            }
++                        }
++
++                        // Pool miss: find LRU layer entry or unallocated slot
++                        if (!layer_entry) {
++                            layer_entry = &pool.entries[0];
++                            for (auto & le : pool.entries) {
++                                if (le.proj_count == 0) { layer_entry = &le; break; }
++                                if (le.last_used < layer_entry->last_used) layer_entry = &le;
++                            }
++
++                            // Evict old layer entry if occupied
++                            if (layer_entry->proj_count > 0) {
++                                pool.layer_evictions++;
++                                for (int p = 0; p < 3; p++) {
++                                    auto & ps = layer_entry->projections[p];
++                                    ps.weight_key = nullptr;
++                                    std::fill(ps.expert_to_slot.begin(), ps.expert_to_slot.end(), -1);
++                                    std::fill(ps.slot_to_expert.begin(), ps.slot_to_expert.end(), -1);
++                                    std::fill(ps.slot_lru.begin(), ps.slot_lru.end(), 0);
++                                    ps.slot_clock = 0;
++                                }
++                            }
++                            layer_entry->ids_key = ids_tensor;
++                            layer_entry->proj_count = 0;
++                            layer_entry->last_used = ++pool.clock;
++                            pool.layer_misses++;
++                        } else {
++                            pool.layer_hits++;
++                        }
++
++                        current_layer_ids = ids_tensor;
++                        current_layer_entry = layer_entry;
+                     }
+ 
+-                    // group consecutive experts and copy them together
+-                    auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+-                        const size_t expert_offset = first_id * expert_size;
+-                        const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+-                        const size_t padding = std::min<size_t>(expert_size, 512);
+-                        const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+-
+-                        ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
+-                    };
+-
+-                    int id = 0;
+-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+-                        id++;
++                    // Step 2: Find projection sub-entry within layer
++                    proj_sub * psub = nullptr;
++                    for (int p = 0; p < layer_entry->proj_count; p++) {
++                        if (layer_entry->projections[p].weight_key == input->data) {
++                            psub = &layer_entry->projections[p];
++                            break;
++                        }
+                     }
+-                    int32_t first_id = id;
+-                    int32_t last_id = first_id;
+ 
+-                    for (++id; id < n_expert; ++id) {
+-                        if (!ggml_bitset_get(used_ids.data(), id)) {
+-                            continue;
++                    // New projection in this layer
++                    if (!psub) {
++                        if (layer_entry->proj_count < 3) {
++                            psub = &layer_entry->projections[layer_entry->proj_count++];
++                        } else {
++                            // All 3 slots used but different key — reuse slot 2 (rare edge case)
++                            psub = &layer_entry->projections[2];
+                         }
++                        psub->weight_key = input->data;
++                        psub->expert_size = expert_size;
++                        psub->n_expert = n_expert;
++                        // Initialize slot tracking
++                        psub->expert_to_slot.assign(n_expert, -1);
++                        psub->slot_to_expert.assign(N_SLOTS, -1);
++                        psub->slot_lru.assign(N_SLOTS, 0);
++                        psub->slot_clock = 0;
++
++                        // Synchronize before allocation to prevent Vulkan DeviceLost
++                        ggml_backend_synchronize(split_backend);
++
++                        // Allocate N_SLOTS * expert_size (not n_expert * expert_size!)
++                        size_t needed = (size_t)N_SLOTS * expert_size;
++                        if (!psub->buffer || psub->alloc_size < needed) {
++                            if (psub->buffer) ggml_backend_buffer_free(psub->buffer);
++                            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
++                            psub->buffer = ggml_backend_buft_alloc_buffer(buft, needed);
++                            psub->base_ptr = ggml_backend_buffer_get_base(psub->buffer);
++                            psub->alloc_size = needed;
++                            fprintf(stderr, "[MOE-SLOT] Allocated %zu MB (%d slots) for %s (proj %d)\n",
++                                    needed / (1024*1024), N_SLOTS, input->name, layer_entry->proj_count - 1);
++                        }
++                    }
+ 
+-                        if (id == last_id + 1) {
+-                            last_id = id;
++                    // Step 3: Cache original IDS to prevent gate/up/down cross-contamination
++                    // Gate rewrites IDS with gate's slot mapping; up/down must use original expert IDs.
++                    // We need the GPU IDS tensor for the deferred write
++                    ggml_tensor * ids_gpu = node->src[2];  // The actual GPU-side IDS tensor
++
++                    // Cache original IDS when first seen, restore for subsequent projections
++                    auto it = original_ids_cache.find(ids_tensor);
++                    if (it == original_ids_cache.end()) {
++                        // First time seeing this IDS tensor — cache original expert IDs
++                        original_ids_cache[ids_tensor] = ids;
++                    } else {
++                        // Same IDS tensor as previous projection (up/down after gate)
++                        // Restore original expert IDs so slot mapping is correct
++                        ids = it->second;
++                    }
++
++                    // Step 4: Override input_cpy buffer/data to point at pool BEFORE expert copy.
++                    // tensor_set_async uses tensor->buffer to route the write, so this must
++                    // happen before step 5 copies experts into slots.
++                    pool_tensor_override ovr;
++                    ovr.tensor = input_cpy;
++                    ovr.orig_buffer = input_cpy->buffer;
++                    ovr.orig_data = input_cpy->data;
++                    ovr.orig_ne2 = input_cpy->ne[2];
++                    input_cpy->data = psub->base_ptr;
++                    input_cpy->buffer = psub->buffer;
++                    // ne[2] override happens after expert copy (step 7)
++                    pool_overrides.push_back(ovr);
++
++                    // Step 5: Copy cache-miss experts to slots, assign slots
++                    int hits = 0, misses = 0;
++                    for (int64_t id = 0; id < n_expert; ++id) {
++                        if (!ggml_bitset_get(used_ids.data(), id)) continue;
++
++                        int slot = psub->expert_to_slot[id];
++                        if (slot >= 0) {
++                            // Cache hit: update LRU
++                            psub->slot_lru[slot] = ++psub->slot_clock;
++                            hits++;
++                            pool.expert_hits++;
+                             continue;
+                         }
+ 
+-                        copy_experts(first_id, last_id);
++                        // Cache miss: find free or LRU slot
++                        slot = -1;
++                        for (int s = 0; s < N_SLOTS; s++) {
++                            if (psub->slot_to_expert[s] == -1) { slot = s; break; }
++                        }
++                        if (slot == -1) {
++                            // Evict LRU slot
++                            int64_t min_lru = INT64_MAX;
++                            for (int s = 0; s < N_SLOTS; s++) {
++                                if (psub->slot_lru[s] < min_lru) { min_lru = psub->slot_lru[s]; slot = s; }
++                            }
++                            int old = psub->slot_to_expert[slot];
++                            if (old >= 0) psub->expert_to_slot[old] = -1;
++                            pool.slot_evictions++;
++                        }
++
++                        // Assign and copy expert to slot
++                        psub->expert_to_slot[id] = slot;
++                        psub->slot_to_expert[slot] = id;
++                        psub->slot_lru[slot] = ++psub->slot_clock;
++
++                        const size_t src_offset = (size_t)id * expert_size;
++                        const size_t dst_offset = (size_t)slot * expert_size;
++                        ggml_backend_tensor_set_async(split_backend, input_cpy,
++                            (const uint8_t *)input->data + src_offset, dst_offset, expert_size);
++
++                        misses++;
++                        pool.expert_misses++;
++                    }
++
++                    // Step 6: Rewrite IDS: expert_id -> slot_idx
++                    // Use stride-based indexing (learned from previous IDS stride bug)
++                    std::vector<int32_t> rewritten_ids = ids;
++                    for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
++                        for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
++                            size_t idx = i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t);
++                            int32_t eid = ids[idx];
++                            if (eid >= 0 && eid < n_expert && psub->expert_to_slot[eid] >= 0) {
++                                rewritten_ids[idx] = psub->expert_to_slot[eid];
++                            }
++                        }
++                    }
+ 
+-                        first_id = id;
+-                        last_id = id;
++                    // Defer the IDS write — scheduler's input copy loop will copy original IDS
++                    // to GPU first, then we overwrite with slot-remapped version
++                    deferred_writes.push_back({split_backend, ids_gpu, rewritten_ids});
++
++                    // Step 7: Override ne[2] for shader dispatch with n_as=32
++                    input_cpy->ne[2] = N_SLOTS;
++                    // nb[2] stays as expert_size (stride between slots = stride between experts)
++
++                    static int pool_log_count = 0;
++                    if (pool_log_count++ < 200 || misses > 0) {
++                        fprintf(stderr, "[MOE-SLOT] %s: hits=%d misses=%d slot_evict=%ld ne[2]=%d (layer_hits=%ld misses=%ld expert_hit=%.1f%%)\n",
++                                input->name, hits, misses,
++                                (long)pool.slot_evictions, N_SLOTS,
++                                (long)pool.layer_hits, (long)pool.layer_misses,
++                                pool.expert_hits + pool.expert_misses > 0
++                                    ? 100.0 * pool.expert_hits / (pool.expert_hits + pool.expert_misses)
++                                    : 0.0);
+                     }
+-                    copy_experts(first_id, last_id);
+                 } else {
+                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
+                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
+@@ -1598,6 +1899,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // Apply deferred IDS writes AFTER the input copy loop.
++        // The scheduler's input copy loop copies original IDS from CPU to GPU,
++        // which would overwrite our slot-remapped IDS. So we write after.
++        for (auto & dw : deferred_writes) {
++            ggml_backend_tensor_set_async(dw.backend, dw.tensor,
++                dw.data.data(), 0, dw.data.size() * sizeof(int32_t));
++            ggml_backend_synchronize(dw.backend);
++        }
++
+         if (!sched->callback_eval) {
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+@@ -1637,6 +1947,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+         }
+ 
++        // Restore pool buffer overrides so graph builder sees original tensors
++        for (auto & ovr : pool_overrides) {
++            ovr.tensor->buffer = ovr.orig_buffer;
++            ovr.tensor->data = ovr.orig_data;
++            ovr.tensor->ne[2] = ovr.orig_ne2;
++        }
++
+         // record the event of this copy
+         if (split->n_inputs > 0) {
+             if (sched->events[split_backend_id][sched->cur_copy] != NULL) {

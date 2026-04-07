@@ -1,0 +1,27 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 7137b5b..1a6b2e3 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -838,6 +838,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+                         return b;
+                     }
+                 }
++                // Force-offload MUL_MAT_ID to GPU. Expert weights may be on CPU
++                // (--cpu-moe) but the persistent slot buffer handles GPU-side copies
++                // via slot_remap_mode. Bypasses offload_op which rejects bs=1.
++                if (tensor->op == GGML_OP_MUL_MAT_ID) {
++                    for (int b = 0; b < src_backend_id; b++) {
++                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
++                            static int moe_log_count = 0;
++                            if (moe_log_count++ < 20) {
++                                fprintf(stderr, "[MOE-OFFLOAD] %s -> backend %d (src_backend=%d, host=%d)\n",
++                                        tensor->name, b, src_backend_id, ggml_backend_buffer_is_host(src->buffer));
++                            }
++                            SET_CAUSE(tensor, "1.moe");
++                            return b;
++                        }
++                    }
++                }
+             }
+             SET_CAUSE(tensor, "1.wgt%d", i);
+             return src_backend_id;
