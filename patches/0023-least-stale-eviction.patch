@@ -1,0 +1,123 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 668667e..f48265c 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1534,6 +1534,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int64_t last_used = 0;
+         int proj_count = 0;       // how many projections filled (0-3)
+         const ggml_tensor * ids_key = nullptr;  // IDS tensor for layer identification
++        int layer_id = -1;        // MoE layer index (0..n_moe_layers-1) for least-stale eviction
+     };
+ 
+     static struct {
+@@ -1548,6 +1549,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int64_t slot_evictions = 0;
+         int64_t prefetch_copies = 0;
+         int64_t prefetch_hits = 0;
++        // Least-stale eviction: track MoE layer progression
++        int n_moe_layers = 94;    // total MoE layers (auto-detected or default)
++        int moe_layer_counter = 0; // current MoE layer index in this forward pass
++        int64_t stale_evictions = 0;
+     } pool;
+ 
+     static int prev_graph_nodes = 0;
+@@ -1573,6 +1578,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+             }
+             le.proj_count = 0;
+             le.ids_key = nullptr;
++            le.layer_id = -1;
+         }
+         current_layer_ids = nullptr;
+         current_layer_entry = nullptr;
+@@ -1588,12 +1594,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         // Also support old env var for backward compat
+         const char * env_old = getenv("GGML_MOE_POOL_ENTRIES");
+         if (env_old) pool_layers = (atoi(env_old) + 2) / 3;  // convert entries to layers
++        // Total MoE layers for least-stale circular distance computation
++        const char * env_nmoe = getenv("GGML_MOE_N_LAYERS");
++        if (env_nmoe) pool.n_moe_layers = atoi(env_nmoe);
+         pool.entries.resize(pool_layers);
+         pool.initialized = true;
+-        fprintf(stderr, "[MOE-POOL] Slot remapping: %d layer entries x 3 proj x %d slots\n",
+-                pool_layers, N_SLOTS);
++        fprintf(stderr, "[MOE-POOL] Slot remapping: %d layer entries x 3 proj x %d slots (least-stale, n_moe=%d)\n",
++                pool_layers, N_SLOTS, pool.n_moe_layers);
+     }
+ 
++    // Reset MoE layer counter at start of each forward pass
++    pool.moe_layer_counter = 0;
++
+     // Track tensor overrides for pool buffers so we can restore after graph compute.
+     struct pool_tensor_override {
+         ggml_tensor * tensor;
+@@ -1730,26 +1742,44 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         layer_entry = current_layer_entry;
+                         layer_entry->last_used = ++pool.clock;
+                     } else {
+-                        // New layer — search pool for existing entry with this IDS
++                        // New MoE layer — increment the layer counter
++                        int cur_moe_layer = pool.moe_layer_counter++;
++
++                        // Search pool for existing entry with this IDS
+                         for (auto & le : pool.entries) {
+                             if (le.ids_key == ids_tensor && le.proj_count > 0) {
+                                 layer_entry = &le;
+                                 layer_entry->last_used = ++pool.clock;
++                                layer_entry->layer_id = cur_moe_layer;
+                                 break;
+                             }
+                         }
+ 
+-                        // Pool miss: find LRU layer entry or unallocated slot
++                        // Pool miss: find least-stale layer entry or unallocated slot.
++                        // Least-stale eviction (SpecMD): exploit deterministic layer order
++                        // 0->1->...->93->0->1->... to evict the entry furthest behind
++                        // the current layer in forward-pass order (circular distance).
++                        // staleness(entry) = (cur_layer - entry.layer_id + n_moe) % n_moe
++                        // Evict HIGHEST staleness = just-computed layer = won't be needed
++                        // for the longest time. This prevents LRU's pathological case of
++                        // evicting layer 0 (about to be needed) when at layer 93.
+                         if (!layer_entry) {
+-                            layer_entry = &pool.entries[0];
++                            layer_pool_entry * victim = nullptr;
++                            int max_staleness = -1;
+                             for (auto & le : pool.entries) {
+-                                if (le.proj_count == 0) { layer_entry = &le; break; }
+-                                if (le.last_used < layer_entry->last_used) layer_entry = &le;
++                                if (le.proj_count == 0) { victim = &le; break; }  // prefer empty
++                                int staleness = (cur_moe_layer - le.layer_id + pool.n_moe_layers) % pool.n_moe_layers;
++                                if (staleness > max_staleness) {
++                                    max_staleness = staleness;
++                                    victim = &le;
++                                }
+                             }
++                            layer_entry = victim;
+ 
+                             // Evict old layer entry if occupied
+                             if (layer_entry->proj_count > 0) {
+                                 pool.layer_evictions++;
++                                pool.stale_evictions++;
+                                 for (int p = 0; p < 3; p++) {
+                                     auto & ps = layer_entry->projections[p];
+                                     ps.weight_key = nullptr;
+@@ -1762,6 +1792,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                             layer_entry->ids_key = ids_tensor;
+                             layer_entry->proj_count = 0;
+                             layer_entry->last_used = ++pool.clock;
++                            layer_entry->layer_id = cur_moe_layer;
+                             pool.layer_misses++;
+                         } else {
+                             pool.layer_hits++;
+@@ -1925,10 +1956,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+ 
+                     static int pool_log_count = 0;
+                     if (pool_log_count++ < 200 || misses > 0) {
+-                        fprintf(stderr, "[MOE-SLOT] %s: hits=%d misses=%d slot_evict=%ld ne[2]=%d (layer_hits=%ld misses=%ld expert_hit=%.1f%%)\n",
++                        fprintf(stderr, "[MOE-SLOT] %s: hits=%d misses=%d slot_evict=%ld ne[2]=%d (layer_hits=%ld misses=%ld stale_evict=%ld moe_layer=%d expert_hit=%.1f%%)\n",
+                                 input->name, hits, misses,
+                                 (long)pool.slot_evictions, N_SLOTS,
+                                 (long)pool.layer_hits, (long)pool.layer_misses,
++                                (long)pool.stale_evictions, layer_entry->layer_id,
+                                 pool.expert_hits + pool.expert_misses > 0
+                                     ? 100.0 * pool.expert_hits / (pool.expert_hits + pool.expert_misses)
+                                     : 0.0);
