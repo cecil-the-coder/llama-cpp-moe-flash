@@ -2,14 +2,15 @@ diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
 index 7137b5b..1a6b2e3 100644
 --- a/ggml/src/ggml-backend.cpp
 +++ b/ggml/src/ggml-backend.cpp
-@@ -838,6 +838,22 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
+@@ -838,6 +838,23 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                          return b;
                      }
                  }
-+                // Force-offload MUL_MAT_ID to GPU. Expert weights may be on CPU
-+                // (--cpu-moe) but the persistent slot buffer handles GPU-side copies
-+                // via slot_remap_mode. Bypasses offload_op which rejects bs=1.
-+                if (tensor->op == GGML_OP_MUL_MAT_ID) {
++                // Force-offload MUL_MAT_ID to GPU when slot remapping is configured
++                // (GGML_MOE_N_SLOTS env var set). The persistent slot buffer handles
++                // GPU-side copies. Without slot remapping, force-offload produces
++                // garbage because gallocr frees expert buffers between tokens.
++                if (tensor->op == GGML_OP_MUL_MAT_ID && getenv("GGML_MOE_N_SLOTS")) {
 +                    for (int b = 0; b < src_backend_id; b++) {
 +                        if (ggml_backend_supports_op(sched->backends[b], tensor)) {
 +                            static int moe_log_count = 0;
