@@ -25,6 +25,7 @@ COPY patches/0017-disable-fit-auto-detect-cpu-moe.patch /build/
 COPY patches/0021-merge-moe-splits-within-layer.patch /build/
 COPY patches/0022-speculative-expert-prefetch.patch /build/
 COPY patches/0023-least-stale-eviction.patch /build/
+COPY patches/0024-batch-pool-allocation.patch /build/
 RUN cd /build/llama.cpp && \
     git apply /build/0001a-moe-flash-core.patch && \
     git apply /build/0001b-force-offload-guard.patch && \
@@ -33,7 +34,8 @@ RUN cd /build/llama.cpp && \
     git apply /build/0017-disable-fit-auto-detect-cpu-moe.patch && \
     git apply /build/0021-merge-moe-splits-within-layer.patch && \
     git apply /build/0022-speculative-expert-prefetch.patch && \
-    git apply /build/0023-least-stale-eviction.patch
+    git apply /build/0023-least-stale-eviction.patch && \
+    git apply /build/0024-batch-pool-allocation.patch
 
 # Build with Vulkan + io_uring
 # Enable AVX512 + extensions for Strix Halo (Zen 5).

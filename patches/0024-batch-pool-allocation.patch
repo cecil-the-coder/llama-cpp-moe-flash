@@ -1,0 +1,73 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f48265c..a35bade 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1553,6 +1553,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         int n_moe_layers = 94;    // total MoE layers (auto-detected or default)
+         int moe_layer_counter = 0; // current MoE layer index in this forward pass
+         int64_t stale_evictions = 0;
++        // Batch preallocation state
++        bool buffers_preallocated = false;
+     } pool;
+ 
+     static int prev_graph_nodes = 0;
+@@ -1690,6 +1692,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
+                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+ 
++                    // Batch pre-allocate ALL pool buffers on first MoE weight encounter.
++                    // This replaces 180+ individual sync+alloc pairs with ONE sync + tight alloc loop.
++                    // We use max(expert_size seen so far) so any projection fits in any buffer.
++                    if (!pool.buffers_preallocated) {
++                        ggml_backend_synchronize(split_backend);  // ONE sync while GPU is idle
++                        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
++                        size_t alloc_size = (size_t)N_SLOTS * expert_size;
++                        int allocated = 0;
++                        for (auto & entry : pool.entries) {
++                            for (int p = 0; p < 3; p++) {
++                                entry.projections[p].buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
++                                if (entry.projections[p].buffer) {
++                                    entry.projections[p].base_ptr = ggml_backend_buffer_get_base(entry.projections[p].buffer);
++                                    entry.projections[p].alloc_size = alloc_size;
++                                    allocated++;
++                                } else {
++                                    fprintf(stderr, "[MOE-POOL] OOM after %d buffers, %zu MB each\n",
++                                            allocated, alloc_size / (1024*1024));
++                                    goto done_prealloc;
++                                }
++                            }
++                        }
++                        done_prealloc:
++                        pool.buffers_preallocated = true;
++                        fprintf(stderr, "[MOE-POOL] Pre-allocated %d buffers (%zu MB each, %zu MB total)\n",
++                                allocated, alloc_size / (1024*1024),
++                                (size_t)allocated * alloc_size / (1024*1024));
++                    }
++
+                     // NOTE: input_backend sync moved below early-exit cache check
+                     // to avoid wasting ~50-100us per MoE split when cache is 100% warm.
+ 
+@@ -1828,18 +1859,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         psub->slot_lru.assign(N_SLOTS, 0);
+                         psub->slot_clock = 0;
+ 
+-                        // Synchronize before allocation to prevent Vulkan DeviceLost
+-                        ggml_backend_synchronize(split_backend);
+-
+-                        // Allocate N_SLOTS * expert_size (not n_expert * expert_size!)
++                        // Buffers were batch pre-allocated above. Only re-allocate if
++                        // this projection needs a larger buffer (gate/up vs down differ).
+                         size_t needed = (size_t)N_SLOTS * expert_size;
+                         if (!psub->buffer || psub->alloc_size < needed) {
+                             if (psub->buffer) ggml_backend_buffer_free(psub->buffer);
++                            // Sync only for this fallback path (batch prealloc missed or undersized)
++                            ggml_backend_synchronize(split_backend);
+                             ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
+                             psub->buffer = ggml_backend_buft_alloc_buffer(buft, needed);
+                             psub->base_ptr = ggml_backend_buffer_get_base(psub->buffer);
+                             psub->alloc_size = needed;
+-                            fprintf(stderr, "[MOE-SLOT] Allocated %zu MB (%d slots) for %s (proj %d)\n",
++                            fprintf(stderr, "[MOE-SLOT] Fallback alloc %zu MB (%d slots) for %s (proj %d)\n",
+                                     needed / (1024*1024), N_SLOTS, input->name, layer_entry->proj_count - 1);
+                         }
+                     }
