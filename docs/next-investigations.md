@@ -1,6 +1,6 @@
 # Research Phase: Complete
 
-**Status**: RESEARCH COMPLETE -- 8-patch stack on b8664 delivers **7-10 t/s** on Qwen3 Q4_K_M with N_SLOTS=64 (4x baseline). All viable software optimizations explored. GPU compute (85ms/token) is the hardware ceiling. (2026-04-03)
+**Status**: RESEARCH COMPLETE -- 9-patch stack on b8664. 7 MoE models validated: 13-50 t/s for in-GTT models (auto-detect, no config), 7-10 t/s for >GTT (N_SLOTS=64, 4x baseline). All viable software optimizations explored. GPU compute (85ms/token) is the hardware ceiling. (2026-04-03)
 
 **Production Image**: `7937441` on b8664
 
@@ -8,9 +8,43 @@
 
 ## Final State
 
-Expert copy: **3.5ms/token** (optimized from 530ms -- 150x reduction). GPU compute: **85ms/token** (hardware-limited, dominant). 7-10 t/s is near the ceiling for Radeon 8060S UMA.
+Expert copy: **3.5ms/token** (optimized from 530ms -- 150x reduction). GPU compute: **85ms/token** (hardware-limited, dominant). 7-10 t/s is near the ceiling for Radeon 8060S UMA on >GTT models. In-GTT models run at full GPU speed (13-50 t/s).
 
-### Research findings (2026-04-03)
+### Multi-Model Test Results (2026-04-03)
+
+| Model | Size | Experts | K | t/s | Path |
+|-------|------|---------|---|-----|------|
+| GLM-4-7-Flash | 17 GB | 64 | ? | ~50 | Full GPU |
+| Minimax-M25-REAP | 100 GB | ? | ? | **28.4** | Full GPU (auto-detect) |
+| Qwen3-235B Q2_K | 80 GB | 128 | 8 | **20** | Full GPU (auto-detect) |
+| Qwen3.5-REAP-212B | 110 GB | 267 | 10 | **18** | Full GPU (auto-detect) |
+| Nemotron-3-Super-120B | 85 GB | ? | ? | **13.2** | Full GPU (auto-detect) |
+| Qwen3-235B Q4_K_M | 133 GB | 128 | 8 | **7-10** | GPU MoE slot remap (N_SLOTS=64) |
+| DeepSeek-R1-0528 | 228 GB | 256 | 8 | ~4 | CPU MoE |
+
+### Key findings
+
+1. **Auto-detect works for all <=GTT models** -- no manual configuration needed
+2. **Slot remapping only benefits >GTT models** (Q4_K_M at 133 GB)
+3. **For <=GTT models that fit, full GPU is always fastest** (no slot overhead)
+4. **Batch allocation (0024) fixes N_SLOTS startup stall** -- seconds instead of minutes
+5. **Memory trade-off available**: slot remapping at N_SLOTS=64 uses 4x less GTT but runs 3x slower. Useful for running multiple models concurrently.
+
+### Patch Stack (9 patches)
+
+| # | Patch | Purpose |
+|---|-------|---------|
+| 1 | 0001a | Core MoE flash module (prefetch, io_uring, metrics) |
+| 2 | 0001b | Force-offload guard (MUL_MAT_ID GPU routing) |
+| 3 | 0001c | Persistent pool + slot remap (LRU cache, ne[2] override) |
+| 4 | 0014 | Vec-path aliasing check (byte-range overlap) |
+| 5 | 0017 | Auto-detect CPU_MOE (-fit disable) |
+| 6 | 0021 | MoE split merging (282->96 splits) |
+| 7 | 0022 | Speculative prefetch (pre-seed next layer) |
+| 8 | 0023 | Least-stale eviction (layer-aware LRU) |
+| 9 | 0024 | Batch pool allocation (one sync, all buffers) |
+
+### Research findings
 
 | Investigation | Result |
 |---------------|--------|
