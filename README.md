@@ -5,25 +5,33 @@ targeting AMD Ryzen AI 365 (Strix Halo) on Linux with Vulkan.
 
 ## Status (2026-04-03)
 
-**Production image: `17aca27`** on b8664 -- Slot remapping with N_SLOTS=96 delivers **6x speedup** for >GTT MoE models.
+**Production image: `7937441`** on b8664 -- 5-patch stack delivering **4x baseline** on >GTT MoE models.
 
-**MILESTONE: 11 t/s on Qwen3-235B Q4_K_M (133 GB) with GPU MoE slot remapping.**
+**MILESTONE: 7-10 t/s on Qwen3-235B Q4_K_M (133 GB) with GPU MoE slot remapping (N_SLOTS=64).**
 
-Patches applied: 0001 (core MoE flash + persistent buffer pool + sync skip + force-offload guard), 0014 (vec-path aliasing check), 0017 (auto-detect + fit disable).
+### Patch Stack (5 patches, each separate for upstream potential)
+
+| Patch | Lines | Purpose |
+|-------|-------|---------|
+| 0001 | ~2700 | Core MoE flash + persistent buffer pool + slot remapping + LRU cache |
+| 0014 | ~30 | Vec-path byte-range aliasing check (safety net) |
+| 0017 | ~60 | Auto-detect CPU_MOE + disable upstream -fit hang |
+| 0021 | ~33 | Merge MoE splits within layer (282->96 splits) |
+| 0022 | ~226 | Speculative expert prefetch (pre-seed next layer's slots) |
 
 ### What works well (models that fit in GTT)
 
 All MoE models up to 120 GB (the GTT limit) run at full GPU speed. Auto-detect
 clears CPU_MOE, no special configuration needed. These are production-ready.
 
-- Qwen3-235B Q2_K (80 GB): **19.2 t/s**, coherent, full GPU (regression pass)
+- Qwen3-235B Q2_K (80 GB): **20 t/s**, coherent, full GPU (regression pass)
 - GLM-4-7-Flash (17 GB): **~50 t/s**, coherent, full GPU
 
 ### Slot remapping breakthrough (models exceeding GTT)
 
-- Qwen3-235B Q4_K_M (133 GB, >GTT): **10.4-11.1 t/s** with GPU MoE via 96-slot remapping
-- Expert hit rate: **97.1%** with 96 slots for 128 experts (K=8)
-- ~90 GB persistent GPU buffers (feasible on 128 GB UMA)
+- Qwen3-235B Q4_K_M (133 GB, >GTT): **7-10 t/s** with GPU MoE via 64-slot remapping
+- Expert hit rate: **94.6%** with speculative prefetch (64 slots for 128 experts, K=8)
+- ~60 GB persistent GPU buffers, stable on 128 GB node
 - Configurable via `GGML_MOE_N_SLOTS` environment variable
 
 **What makes slot remapping work:**
@@ -34,16 +42,28 @@ clears CPU_MOE, no special configuration needed. These are production-ready.
 - Original IDS cache -- prevents gate/up/down cross-contamination
 - No shader modifications needed
 
+**N_SLOTS=64 is the stable production config for 128 GB node.** N_SLOTS=96 delivers higher throughput but crashes on 128 GB (90 GB pool + mmap exceeds RAM).
+
 **N_SLOTS tuning results (Qwen3-235B Q4_K_M, 128 experts, K=8):**
 
 | N_SLOTS | Hit Rate | t/s | Memory | Notes |
 |---------|----------|-----|--------|-------|
 | 32 | 74.9% | 3.5-4.1 | ~35 GB | Default |
-| 64 | 94.4% | 7.5-9.4 | ~60 GB | Good for low-RAM |
-| 96 | 97.1% | 10.4-11.1 | ~90 GB | **Optimal for 128 GB** |
+| 64 | 94.6% | 7-10 | ~60 GB | **Stable production (128 GB)** |
+| 96 | 97.1% | 10.4-11.1 | ~90 GB | Unstable (needs 192+ GB RAM) |
 | 128 | -- | OOM | ~123 GB | Exceeds RADV/UMA limits |
 
-**6x speedup** from N_SLOTS=32 (3.5 t/s) to N_SLOTS=96 (11.1 t/s). The remaining 2.9% miss rate contributes only ~25ms copy overhead per token -- GPU compute (~90ms) is now the dominant cost.
+**Optimization journey (Q4_K_M 133 GB):**
+
+| Step | t/s | Improvement |
+|------|-----|-------------|
+| Baseline CPU MoE | 1.8 | -- |
+| b8664 rebase | 2.75 | +53% |
+| Slot remapping (N=32) | 3.5-4.1 | +49% |
+| N_SLOTS=64 | 7.5-9.4 | +100% |
+| Split merging (0021) | ~same | marginal |
+| Speculative prefetch (0022) | 7-10 | marginal |
+| **N_SLOTS=96 (unstable)** | **10.4-11.1** | **+17% (needs 192+ GB RAM)** |
 
 ### Previous approaches that didn't work
 
@@ -128,13 +148,14 @@ territory — viable but not fast. This matches flash-moe's 4.4 tok/s on 17.5 GB
 | Model | Size | Fits GTT? | Config | Gen t/s | Status |
 |---|---|---|---|---|---|
 | GLM-4-7-Flash | 17 GB | Yes | Full GPU (auto-detect) | **~50** | Production-ready |
-| Qwen3-235B Q2_K | 80 GB | Yes | Full GPU (auto-detect) | **19.2** | Production-ready |
-| **Qwen3-235B Q4_K_M** | **133 GB** | **No** | **GPU MoE, 96-slot remapping** | **10.4-11.1** | **Production-ready** |
+| Qwen3-235B Q2_K | 80 GB | Yes | Full GPU (auto-detect) | **20** | Production-ready |
+| **Qwen3-235B Q4_K_M** | **133 GB** | **No** | **GPU MoE, N_SLOTS=64** | **7-10** | **Production-ready** |
 | DeepSeek-R1-0528 Q2_K | 228 GB | No | CPU MoE (can't test -- 128 GB RAM limit) | **~4** | CPU-bottlenecked |
 
-**Key insight**: Slot remapping with N_SLOTS=96 delivers **6x speedup** over the initial 32-slot
-baseline (3.5 -> 11.1 t/s) with 97.1% expert hit rate. GPU compute is now the dominant cost,
-not expert copy bandwidth. Configurable via `GGML_MOE_N_SLOTS` env var.
+**Key insight**: Slot remapping with N_SLOTS=64 delivers **4x speedup** over baseline CPU MoE
+(1.8 -> 7-10 t/s) with 94.6% expert hit rate + speculative prefetch. GPU compute is now the
+dominant cost, not expert copy bandwidth. Configurable via `GGML_MOE_N_SLOTS` env var.
+N_SLOTS=64 (~60 GB pool) is the stable production config for 128 GB nodes.
 
 ---
 
@@ -142,15 +163,18 @@ not expert copy bandwidth. Configurable via `GGML_MOE_N_SLOTS` env var.
 
 | Patch | Status | Purpose |
 |---|---|---|
-| 0001 | Applied | Core MoE flash + persistent buffer pool + sync skip + force-offload guard |
-| 0014 | Applied | Vec-path runtime byte-range overlap check |
-| 0017 | Applied | Disable upstream -fit + auto-detect CPU_MOE |
+| 0001 | Applied | Core MoE flash + persistent buffer pool + slot remapping + LRU cache |
+| 0014 | Applied | Vec-path byte-range aliasing check (safety net) |
+| 0017 | Applied | Auto-detect CPU_MOE + disable upstream -fit hang |
+| 0021 | Applied | Merge MoE splits within layer (282->96 splits) |
+| 0022 | Applied | Speculative expert prefetch (pre-seed next layer's slots) |
 
-**Slot remapping COMPLETE**: Image `17aca27` delivers **10.4-11.1 t/s** on Qwen3 Q4_K_M
-with 96-slot remapping (97.1% expert hit rate). 6x speedup over initial 32-slot baseline.
-No shader modifications needed. `ne[2]=N_SLOTS` override on persistent pool tensors
-outside gallocr flows correctly through all three shaders. Configurable via
-`GGML_MOE_N_SLOTS` env var. N_SLOTS=96 is optimal for 128 GB UMA (~90 GB buffer memory).
+**Production COMPLETE**: Image `7937441` delivers **7-10 t/s** on Qwen3 Q4_K_M
+with 64-slot remapping (94.6% expert hit rate with speculative prefetch). 4x speedup
+over baseline CPU MoE. No shader modifications needed. `ne[2]=N_SLOTS` override on
+persistent pool tensors outside gallocr flows correctly through all three shaders.
+Configurable via `GGML_MOE_N_SLOTS` env var. N_SLOTS=64 is the stable production
+config for 128 GB nodes (~60 GB buffer memory).
 
 ## Documents
 

@@ -1,8 +1,8 @@
 # Next Investigations: Roadmap 2026-Q2
 
-**Status**: ACTIVE -- Slot remapping with N_SLOTS=96 delivers **10.4-11.1 t/s** on Qwen3 Q4_K_M (6x baseline). 97.1% expert hit rate. GPU compute is now the dominant cost. Next: graph split reduction (D, patch 0021) to save ~14ms/token. (2026-04-03)
+**Status**: COMPLETE -- 5-patch stack on b8664 delivers **7-10 t/s** on Qwen3 Q4_K_M with N_SLOTS=64 (4x baseline). 94.6% expert hit rate with speculative prefetch. GPU compute is now the dominant cost. (2026-04-03)
 
-**Production Image**: `17aca27` on b8664
+**Production Image**: `7937441` on b8664
 
 ---
 
@@ -11,9 +11,9 @@
 **Models that fit in GTT (<=120 GB)**: Production-ready. 19-50 t/s, full GPU, no issues.
 
 **Models exceeding GTT (>120 GB) -- COMPLETE**:
-- Qwen3-235B Q4_K_M (133 GB): **10.4-11.1 t/s** GPU MoE via 96-slot remapping (6x over 32-slot baseline)
-- Expert hit rate: **97.1%** with 96 slots for 128 experts (K=8)
-- ~90 GB persistent GPU buffers, configurable via `GGML_MOE_N_SLOTS` env var
+- Qwen3-235B Q4_K_M (133 GB): **7-10 t/s** GPU MoE via 64-slot remapping (4x over baseline)
+- Expert hit rate: **94.6%** with speculative prefetch (64 slots for 128 experts, K=8)
+- ~60 GB persistent GPU buffers, stable on 128 GB node
 - DeepSeek-R1-0528 Q2_K (228 GB): ~4 t/s CPU MoE (can't test slot remapping -- 128 GB RAM limit)
 
 **N_SLOTS tuning results:**
@@ -21,11 +21,11 @@
 | N_SLOTS | Hit Rate | t/s | Memory | Notes |
 |---------|----------|-----|--------|-------|
 | 32 | 74.9% | 3.5-4.1 | ~35 GB | Default |
-| 64 | 94.4% | 7.5-9.4 | ~60 GB | Good for low-RAM |
-| 96 | 97.1% | 10.4-11.1 | ~90 GB | Optimal for 128 GB |
+| 64 | 94.6% | 7-10 | ~60 GB | **Stable production (128 GB)** |
+| 96 | 97.1% | 10.4-11.1 | ~90 GB | Unstable (needs 192+ GB RAM) |
 | 128 | -- | OOM | ~123 GB | Exceeds RADV/UMA limits |
 
-**Current state**: At N_SLOTS=96, GPU compute (~90ms/token) is the dominant cost. The 2.9% miss rate adds only ~25ms copy overhead. Further improvement requires faster GPU compute, reduced sync overhead, or upstream shader optimizations.
+**Current state**: At N_SLOTS=64, GPU compute is the dominant cost. The 5.4% miss rate adds modest copy overhead. N_SLOTS=96 delivers +17% but crashes on 128 GB nodes (90 GB pool + mmap exceeds RAM). Further improvement requires faster GPU compute, more RAM, or upstream shader optimizations.
 
 ---
 
@@ -46,22 +46,17 @@
 **Effort**: Medium
 **Impact**: Low (only affects first ~5 tokens)
 
-#### D: Graph Split Reduction (282 -> ~94 splits)
-**Goal**: Merge gate/up/down MoE projections within each layer into a single graph split. Reduces per-token sync overhead from ~21ms (282 splits x 75us) to ~7ms (94 splits x 75us), saving ~14ms/token.
-**How**: In `split_graph`, when a MUL_MAT_ID node would trigger a new split due to incompatible weight backend, check if the current split already has a MUL_MAT_ID with the same IDS tensor (same MoE layer). If so, merge into the existing split instead of starting a new one. Also update the selective expert copy logic to scan all nodes in a merged split (not just `nodes[0]`).
-**Status**: IMPLEMENTED as separate patch 0021 (not in 0001). Awaiting CI build and production validation.
-**Effort**: Low-Medium (implemented)
-**Impact**: High (~14ms/token savings, ~15% improvement from 11 to ~12.5 t/s)
+#### D: Graph Split Reduction (282 -> 96 splits) -- DONE
+**Goal**: Merge gate/up/down MoE projections within each layer into a single graph split.
+**Status**: COMPLETE as patch 0021. Deployed in image `7937441`. Marginal t/s improvement in practice -- GPU compute dominates, not sync overhead.
 **Patch**: `patches/0021-merge-moe-splits-within-layer.patch`
 
 ### Tier 2: Medium Impact, Medium Effort
 
-#### E: Async Expert Prefetch (Overlap Copies with GPU Compute)
-**Goal**: While the GPU is computing layer N, start copying layer N+1's experts in the background.
-**How**: Use the expert copy callback to identify which experts are needed, then issue async copies that overlap with GPU compute.
-**Challenge**: Requires careful synchronization to avoid data races. Previous I11 async prefetch attempt was slower than cached path for DeepSeek (2.3 vs 4.1 t/s) because it bypassed the GPU cache.
-**Effort**: Medium
-**Impact**: Medium (could hide the remaining ~25ms copy overhead from 2.9% miss rate)
+#### E: Speculative Expert Prefetch -- DONE
+**Goal**: While the GPU is computing layer N, pre-seed layer N+1's slots with predicted experts.
+**Status**: COMPLETE as patch 0022. Deployed in image `7937441`. Improves hit rate from 94.4% to 94.6% with N_SLOTS=64. Marginal t/s improvement -- the LRU cache already captures most reuse.
+**Patch**: `patches/0022-speculative-expert-prefetch.patch`
 
 #### F: Adaptive N_SLOTS per Layer (Reduce Pool Memory 20-30%)
 **Goal**: Instead of a fixed N_SLOTS=96 for all layers, use fewer slots for layers with lower expert diversity.
@@ -107,7 +102,9 @@
 
 ## Completed Investigations
 
-- **I10b** - **Slot remapping COMPLETE**: 10.4-11.1 t/s GPU MoE on Qwen3 Q4_K_M (133 GB, >GTT). 97.1% hit rate with 96 slots. N_SLOTS tuning: 32->64->96 (6x speedup). Configurable via `GGML_MOE_N_SLOTS`.
+- **I10b** - **Slot remapping COMPLETE**: 7-10 t/s GPU MoE on Qwen3 Q4_K_M (133 GB, >GTT) with N_SLOTS=64. 94.6% hit rate with speculative prefetch. Stable on 128 GB. Configurable via `GGML_MOE_N_SLOTS`.
+- **D** - **Split merging COMPLETE** (patch 0021): 282->96 splits. Marginal t/s improvement.
+- **E** - **Speculative prefetch COMPLETE** (patch 0022): Pre-seed next layer's slots. Marginal t/s improvement.
 - **I11** - Expert GPU cache + sync skip: DeepSeek 4.1 t/s (2.3x baseline)
 - **I12** - ik_llama.cpp benchmark: Vulkan 2x faster for in-GTT models
 - **I14** - io_uring polish (SINGLE_ISSUER, MADV_HUGEPAGE): no measurable benefit
@@ -120,10 +117,10 @@
 
 | Investigation | Impact | Effort | Status | Recommendation |
 |---------------|--------|--------|--------|----------------|
-| **D: Split reduction** | High | Low-Med | **IMPLEMENTED (patch 0021)** | 282->94 splits, ~14ms/token savings |
+| **D: Split reduction** | Marginal | Low-Med | **DONE (patch 0021)** | 282->96 splits, marginal t/s gain |
+| **E: Speculative prefetch** | Marginal | Medium | **DONE (patch 0022)** | Pre-seed next layer's slots |
 | **A: DeepSeek slot remap** | Very High | Low | Blocked (needs 256 GB) | 3-5x expected once hardware available |
 | **C: imatrix pre-seeding** | Low | Medium | Deferred | Only saves ~3s cold start |
-| **E: Async expert prefetch** | Medium | Medium | Not started | Overlap copies with GPU compute |
 | **F: Adaptive N_SLOTS** | Medium | Medium | Not started | Reduce pool memory 20-30% |
 | **G: Routing prediction** | Low-Med | High | Not started | Only helps 2.9% miss rate |
 | **H: Rebase tracking** | High | Low | Ongoing | Track #20757, upstream releases |
@@ -136,16 +133,15 @@
 ## Decision Framework
 
 ```
-Current state: 10.4-11.1 t/s Qwen3 Q4_K_M (GPU MoE, 96-slot remapping), 19-50 t/s for <=GTT models.
+Current state: 7-10 t/s Qwen3 Q4_K_M (GPU MoE, 64-slot remapping), 20-50 t/s for <=GTT models.
 
-Slot remapping COMPLETE. N_SLOTS=96 is optimal for 128 GB UMA.
-GPU compute (~90ms/token) is now the dominant cost, not expert copy bandwidth.
-Graph split reduction (D) targets the second-largest overhead: sync cost.
+5-patch stack COMPLETE. N_SLOTS=64 is the stable production config for 128 GB.
+GPU compute is now the dominant cost, not expert copy bandwidth.
+Split merging (D) and speculative prefetch (E) delivered marginal gains.
 
 Further optimization paths:
-    -> D: Split reduction (282->94): ~14ms/token savings (IMPLEMENTED, patch 0021)
     -> A: DeepSeek on slot remap: needs 256 GB node
-    -> E: Async expert prefetch: overlap copies with GPU compute
+    -> More RAM (192+ GB): enables N_SLOTS=96 for 10.4-11.1 t/s
     -> H: Upstream #20757 when merged: proper two-tier cache with SLRU
     -> Hardware with Intel AMX: 28 t/s (KTransformers benchmark)
 ```
@@ -154,14 +150,15 @@ Further optimization paths:
 
 ## Comparison with Other Systems
 
-| System | >GTT t/s | Approach | vs Our 10.4-11.1 t/s |
+| System | >GTT t/s | Approach | vs Our 7-10 t/s |
 |--------|----------|----------|---------------------|
-| **KTransformers** | 28 | Intel AMX CPU kernels | 2.5x faster |
-| **llama.cpp #20757 PoC** | 14 | Two-tier GPU cache (Python) | 1.3x faster |
-| **Our moe-flash (96-slot remap)** | **10.4-11.1** | **GPU MoE, 96 slots, LRU eviction** | **baseline** |
-| **flash-moe** | 4.4 | Apple SSD + Metal (397B model) | 2.5x slower |
-| **Our moe-flash (CPU MoE)** | 4.1 | AVX-512 CPU MoE (DeepSeek) | 2.7x slower |
-| **ik_llama.cpp** | 1.5 | CPU-only, no flash_attn | 7x slower |
+| **KTransformers** | 28 | Intel AMX CPU kernels | 3-4x faster |
+| **llama.cpp #20757 PoC** | 14 | Two-tier GPU cache (Python) | 1.4-2x faster |
+| **Our moe-flash (96-slot, unstable)** | 10.4-11.1 | GPU MoE, 96 slots (needs 192+ GB) | +17% (unstable) |
+| **Our moe-flash (64-slot, production)** | **7-10** | **GPU MoE, 64 slots, LRU + prefetch** | **baseline** |
+| **flash-moe** | 4.4 | Apple SSD + Metal (397B model) | ~2x slower |
+| **Our moe-flash (CPU MoE)** | 4.1 | AVX-512 CPU MoE (DeepSeek) | ~2x slower |
+| **ik_llama.cpp** | 1.5 | CPU-only, no flash_attn | 5-7x slower |
 
 ---
 
